@@ -27,6 +27,18 @@ CREATE TABLE IF NOT EXISTS market_state (
 );
 CREATE INDEX IF NOT EXISTS idx_symbol_timeframe_ts
     ON market_state (symbol, timeframe, timestamp DESC);
+
+CREATE TABLE IF NOT EXISTS agent_opinions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    timeframe TEXT NOT NULL,
+    timestamp TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    opinion_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_symbol_timeframe_ts
+    ON agent_opinions (agent, symbol, timeframe, timestamp DESC);
 """
 
 
@@ -103,5 +115,37 @@ def get_recent(symbol: str, timeframe: str, limit: int = 20) -> list[dict]:
             (symbol, timeframe, limit),
         ).fetchall()
         return [json.loads(r["payload_json"]) for r in rows]
+    finally:
+        conn.close()
+
+
+def save_opinion(agent: str, symbol: str, timeframe: str, timestamp: str, opinion: dict) -> None:
+    conn = get_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO agent_opinions (agent, symbol, timeframe, timestamp, opinion_json)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (agent, symbol, timeframe, timestamp, json.dumps(opinion)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_latest_opinion(agent: str, symbol: str, timeframe: str) -> Optional[dict]:
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            """
+            SELECT opinion_json FROM agent_opinions
+            WHERE agent = ? AND symbol = ? AND timeframe = ?
+            ORDER BY timestamp DESC, id DESC
+            LIMIT 1
+            """,
+            (agent, symbol, timeframe),
+        ).fetchone()
+        return json.loads(row["opinion_json"]) if row else None
     finally:
         conn.close()

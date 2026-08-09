@@ -8,6 +8,11 @@ that runs on every webhook and decides whether the bar falls inside
 a session worth analyzing. This is the gate described in the roadmap:
 before any expensive LLM agent runs, Timing decides go/no-go.
 
+Sprint 3: added the Analysis Agent — the first LLM-backed agent. It
+reads recent market_state bars and asks Claude for a technical
+direction/confidence/reasoning read, stored as an "opinion" for the
+future Coordinator to consume.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -18,8 +23,16 @@ from datetime import datetime, timezone
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import JSONResponse
 
+from app.analysis_agent import AnalysisAgentError, run_analysis
 from app.models import MarketStateOut, MarketStatePayload, WebhookAck
-from app.storage import get_latest, get_recent, init_db, save_event
+from app.storage import (
+    get_latest,
+    get_latest_opinion,
+    get_recent,
+    init_db,
+    save_event,
+    save_opinion,
+)
 from app.timing_agent import evaluate_timing, should_run_analysis
 
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
@@ -97,6 +110,58 @@ def timing_at(timestamp: str = Query(..., description="ISO-8601 UTC, e.g. 2026-0
         **timing.to_dict(),
         "analysis_would_run": should_run_analysis(timing),
     }
+
+
+@app.post("/agents/analysis/run")
+def trigger_analysis(
+    symbol: str = Query(...),
+    timeframe: str = Query(...),
+    bars: int = Query(default=10, le=50, description="how many recent bars to feed the model"),
+    ignore_timing_gate: bool = Query(
+        default=False,
+        description="For manual testing only. In normal operation the Timing gate decides whether this runs.",
+    ),
+) -> dict:
+    latest = get_latest(symbol=symbol, timeframe=timeframe)
+    if latest is None:
+        raise HTTPException(status_code=404, detail="no market data yet for that symbol/timeframe")
+
+    if not ignore_timing_gate:
+        timing = evaluate_timing(latest["timestamp"])
+        if not should_run_analysis(timing):
+            return {
+                "skipped": True,
+                "reason": "outside London/NY session",
+                "timing": timing.to_dict(),
+            }
+
+    recent_bars = get_recent(symbol=symbol, timeframe=timeframe, limit=bars)
+    recent_bars.reverse()  # oldest -> newest, matches the prompt's expectation
+
+    try:
+        opinion = run_analysis(symbol=symbol, timeframe=timeframe, bars=recent_bars)
+    except AnalysisAgentError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    save_opinion(
+        agent="analysis",
+        symbol=symbol,
+        timeframe=timeframe,
+        timestamp=opinion.timestamp,
+        opinion=opinion.to_dict(),
+    )
+    return {"skipped": False, "opinion": opinion.to_dict()}
+
+
+@app.get("/agents/analysis/latest")
+def read_latest_analysis(
+    symbol: str = Query(...),
+    timeframe: str = Query(...),
+) -> dict:
+    opinion = get_latest_opinion(agent="analysis", symbol=symbol, timeframe=timeframe)
+    if opinion is None:
+        raise HTTPException(status_code=404, detail="no analysis opinion stored yet")
+    return opinion
 
 
 @app.get("/market-state/latest", response_model=MarketStateOut)
