@@ -236,3 +236,21 @@ def get_recent_decisions(symbol: str, timeframe: str, limit: int = 20) -> list[d
         return [json.loads(r["decision_json"]) for r in rows]
     finally:
         conn.close()
+
+
+def wipe_all_data() -> dict:
+    """Deletes every row from market_state, agent_opinions, and
+    coordinator_decisions. Irreversible — used once to clear test/
+    synthetic data before a real trading session starts. Returns the
+    number of rows removed from each table."""
+    conn = get_connection()
+    try:
+        counts = {}
+        for table in ("market_state", "agent_opinions", "coordinator_decisions"):
+            cur = conn.execute(f"SELECT COUNT(*) as c FROM {table}")
+            counts[table] = cur.fetchone()["c"]
+            conn.execute(f"DELETE FROM {table}")
+        conn.commit()
+        return counts
+    finally:
+        conn.close()

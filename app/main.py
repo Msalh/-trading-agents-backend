@@ -42,6 +42,9 @@ Sprint 10: added /system/status (server time, scheduler config, last
 webhook/agent-run timestamps) plus a tests/ suite for the Coordinator
 and Risk Agent and an API_REFERENCE.md.
 
+Sprint 11: added /admin/wipe-all-data — a one-time, secret-protected
+reset for clearing test/synthetic data before a real trading session.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -79,6 +82,7 @@ from app.storage import (
     save_decision,
     save_event,
     save_opinion,
+    wipe_all_data,
 )
 from app.timing_agent import evaluate_timing, should_run_analysis
 
@@ -157,6 +161,21 @@ def system_status(symbol: str = Query(default=NEWS_SYMBOL)) -> dict:
         "minutes_since_last_webhook": _minutes_since(last_webhook),
         "agents": agents,
     }
+
+
+@app.post("/admin/wipe-all-data")
+def admin_wipe_all_data(
+    x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret"),
+) -> dict:
+    """Irreversible. Wipes every stored bar, agent opinion, and
+    Coordinator decision. Intended for a one-time reset before a real
+    trading session starts, clearing out test/synthetic data. Guarded
+    by the same secret as the TradingView webhook — not a general-
+    purpose admin surface."""
+    if not x_webhook_secret or x_webhook_secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="invalid or missing secret")
+    counts = wipe_all_data()
+    return {"wiped": True, "rows_deleted": counts}
 
 
 @app.get("/")
