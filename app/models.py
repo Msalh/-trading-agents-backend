@@ -120,3 +120,5 @@ class MarketStateOut(BaseModel):
 class WebhookAck(BaseModel):
     status: Literal["stored", "duplicate"]
     event_id: str
+    timing: dict
+    analysis_would_run: bool
