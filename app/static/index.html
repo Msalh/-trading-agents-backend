@@ -585,7 +585,7 @@ async function refreshAgentCard(agent) {
   const badgeConfBlock = agent.pureLogic
     ? `<div class="badge-conf-row">
          <span class="badge ${dirClass(direction)}">${escapeHtml(direction)}</span>
-         <div class="static-note">منطق مباشر — بدون LLM</div>
+         <div class="static-note">Pure logic — no LLM</div>
        </div>`
     : `<div class="badge-conf-row">
          <span class="badge ${dirClass(direction)}">${escapeHtml(direction)}</span>
@@ -730,6 +730,12 @@ let candleSeries = null;
 let keyLevelLines = [];
 let currentKeyLevelPrices = [];
 let lastAnalysisKeyLevels = [];
+let lastClosePrice = null;
+// If a level sits within this fraction of the currently visible price
+// range from the last close, its custom label is skipped — right where
+// the built-in last-price label already lives, so drawing our own there
+// too would just stack two labels on top of each other.
+const KEY_LEVEL_PROXIMITY_THRESHOLD = 0.04;
 
 function initChart() {
   const container = $('chartContainer');
@@ -768,11 +774,23 @@ function renderKeyLevelLabels() {
   if (!candleSeries || !labelsContainer || !chartContainer) return;
   const height = chartContainer.clientHeight;
   labelsContainer.innerHTML = '';
+
+  // Visible price range, derived from the two edges of the pane, so
+  // "too close to the current price" scales with how zoomed-in the
+  // chart currently is rather than a fixed dollar amount.
+  const topPrice = candleSeries.coordinateToPrice(0);
+  const bottomPrice = candleSeries.coordinateToPrice(height);
+  const visibleRange = (topPrice !== null && bottomPrice !== null) ? Math.abs(topPrice - bottomPrice) : null;
+
   currentKeyLevelPrices.forEach(price => {
     const y = candleSeries.priceToCoordinate(price);
     // Skip levels the chart hasn't scrolled/scaled into view — the price
     // line itself still exists on the series, just off-screen for now.
     if (y === null || y === undefined || y < 0 || y > height) return;
+    if (lastClosePrice !== null && visibleRange) {
+      const proximity = Math.abs(price - lastClosePrice) / visibleRange;
+      if (proximity < KEY_LEVEL_PROXIMITY_THRESHOLD) return; // too close to the last-price label
+    }
     const label = document.createElement('div');
     label.className = 'key-level-label';
     label.style.top = y + 'px';
@@ -829,6 +847,7 @@ async function refreshChart() {
     open: b.open, high: b.high, low: b.low, close: b.close,
   }));
   candleSeries.setData(candles);
+  lastClosePrice = candles.length ? candles[candles.length - 1].close : null;
   updateKeyLevelLines(lastAnalysisKeyLevels);
   $('chartTime').textContent = `${candles.length} bars · last ${fmtAgo(bars[bars.length - 1].timestamp)}`;
 }
