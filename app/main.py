@@ -34,6 +34,10 @@ Sprint 8: added CORS support so the dashboard (a browser-based page,
 running on a different origin than this API) can call these
 endpoints directly.
 
+Sprint 9: added the dashboard itself — a single static HTML page
+(app/static/index.html) served from this same FastAPI app at
+/dashboard, reading every agent/coordinator/risk endpoint above.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -44,6 +48,7 @@ from datetime import datetime, timezone
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from app.analysis_agent import AnalysisAgentError, run_analysis
 from app.coordinator import compute_decision
@@ -87,6 +92,10 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+# Dashboard: a single static page, same-origin (no CORS needed to view
+# it here — CORS above is for anyone hosting/opening it elsewhere).
+app.mount("/dashboard", StaticFiles(directory="app/static", html=True), name="dashboard")
 
 
 @app.on_event("startup")

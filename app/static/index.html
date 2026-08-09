@@ -1,0 +1,532 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trading Agents Dashboard</title>
+<style>
+  :root {
+    --bg: #0b0f14;
+    --panel: #121821;
+    --panel-2: #171f2a;
+    --border: #232d3a;
+    --text: #e6edf3;
+    --muted: #8b98a8;
+    --bull: #22c55e;
+    --bull-bg: rgba(34,197,94,0.12);
+    --bear: #ef4444;
+    --bear-bg: rgba(239,68,68,0.12);
+    --neutral: #94a3b8;
+    --neutral-bg: rgba(148,163,184,0.12);
+    --accent: #3b82f6;
+    --warn: #f59e0b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+  }
+  .wrap { max-width: 1200px; margin: 0 auto; padding: 20px 16px 60px; }
+
+  /* header */
+  header {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+    margin-bottom: 18px;
+  }
+  header h1 { font-size: 18px; margin: 0; margin-right: auto; white-space: nowrap; }
+  header h1 span { color: var(--muted); font-weight: 400; }
+  .field { display: flex; flex-direction: column; gap: 2px; }
+  .field label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  .field input {
+    background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
+    border-radius: 6px; padding: 6px 8px; font-size: 13px; width: 90px;
+  }
+  .field input.wide { width: 260px; }
+  button {
+    background: var(--accent); color: white; border: none; border-radius: 6px;
+    padding: 8px 12px; font-size: 13px; cursor: pointer; font-weight: 500;
+  }
+  button:hover { filter: brightness(1.1); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  button.secondary { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); }
+  button.small { padding: 5px 9px; font-size: 12px; }
+  .toggle { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+  #lastUpdated { font-size: 11px; color: var(--muted); white-space: nowrap; }
+
+  /* decision banner */
+  .banner {
+    border-radius: 12px; border: 1px solid var(--border); background: var(--panel);
+    padding: 18px 20px; margin-bottom: 16px;
+    display: flex; flex-wrap: wrap; align-items: center; gap: 20px;
+  }
+  .banner.bull { border-color: var(--bull); box-shadow: 0 0 0 1px var(--bull) inset; }
+  .banner.bear { border-color: var(--bear); box-shadow: 0 0 0 1px var(--bear) inset; }
+  .decision-main { min-width: 200px; }
+  .decision-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; margin-bottom: 4px; }
+  .decision-value { font-size: 26px; font-weight: 700; }
+  .decision-value.enter_long { color: var(--bull); }
+  .decision-value.enter_short { color: var(--bear); }
+  .decision-value.no_trade { color: var(--neutral); }
+  .decision-value.insufficient_data { color: var(--warn); }
+  .score-bar-wrap { flex: 1; min-width: 220px; }
+  .score-bar-track {
+    position: relative; height: 10px; background: var(--panel-2); border-radius: 5px; overflow: visible;
+    margin: 8px 0 4px;
+  }
+  .score-bar-fill { position: absolute; top: 0; bottom: 0; border-radius: 5px; }
+  .score-bar-mid { position: absolute; left: 50%; top: -3px; bottom: -3px; width: 1px; background: var(--border); }
+  .score-thresh { position: absolute; top: -3px; bottom: -3px; width: 1px; background: var(--warn); }
+  .score-labels { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip {
+    font-size: 11px; padding: 3px 8px; border-radius: 999px; background: var(--panel-2);
+    border: 1px solid var(--border); color: var(--muted);
+  }
+  .chip.warn { color: var(--warn); border-color: var(--warn); }
+  .banner-actions { display: flex; flex-direction: column; gap: 6px; align-items: flex-end; }
+
+  /* grid of agent cards */
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; margin-bottom: 16px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; min-height: 160px;
+  }
+  .card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .card-title { font-weight: 600; font-size: 13px; display: flex; align-items: center; gap: 6px; }
+  .card-time { font-size: 10px; color: var(--muted); }
+  .badge {
+    font-size: 11px; font-weight: 700; padding: 3px 9px; border-radius: 999px; text-transform: uppercase; letter-spacing: .03em;
+  }
+  .badge.bullish, .badge.approve { background: var(--bull-bg); color: var(--bull); }
+  .badge.bearish, .badge.reject { background: var(--bear-bg); color: var(--bear); }
+  .badge.neutral, .badge.no_action { background: var(--neutral-bg); color: var(--neutral); }
+  .badge.modify { background: rgba(245,158,11,0.12); color: var(--warn); }
+  .conf-row { display: flex; align-items: center; gap: 8px; }
+  .conf-track { flex: 1; height: 6px; background: var(--panel-2); border-radius: 3px; overflow: hidden; }
+  .conf-fill { height: 100%; background: var(--accent); }
+  .conf-num { font-size: 11px; color: var(--muted); width: 32px; text-align: right; }
+  .reasoning { font-size: 12.5px; color: #c3ccd6; flex: 1; }
+  .kv { display: flex; flex-direction: column; gap: 3px; font-size: 11.5px; }
+  .kv div { display: flex; justify-content: space-between; gap: 8px; color: var(--muted); }
+  .kv div b { color: var(--text); font-weight: 500; text-align: right; }
+  .card-foot { display: flex; align-items: center; justify-content: space-between; margin-top: auto; padding-top: 8px; border-top: 1px solid var(--border); }
+  .empty { color: var(--muted); font-size: 12.5px; font-style: italic; flex: 1; }
+  .err { color: var(--bear); font-size: 12px; }
+  .spin {
+    width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--border);
+    border-top-color: var(--accent); display: inline-block; animation: spin .7s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* history */
+  .section-title { font-size: 13px; font-weight: 600; margin: 20px 0 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: .03em; }
+  tbody tr:hover { background: var(--panel-2); }
+  .history-wrap { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+  .history-wrap .scroll { max-height: 320px; overflow-y: auto; }
+
+  footer { margin-top: 30px; font-size: 11px; color: var(--muted); text-align: center; }
+  footer a { color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>Trading Agents Dashboard <span id="symTfLabel"></span></h1>
+    <div class="field">
+      <label>API Base</label>
+      <input id="apiBase" class="wide" value="https://web-production-c67aa.up.railway.app" spellcheck="false">
+    </div>
+    <div class="field">
+      <label>Symbol</label>
+      <input id="symbol" value="MNQ1!" spellcheck="false">
+    </div>
+    <div class="field">
+      <label>Timeframe</label>
+      <input id="timeframe" value="5m" spellcheck="false">
+    </div>
+    <button class="secondary" id="refreshBtn">↻ Refresh</button>
+    <label class="toggle"><input type="checkbox" id="autoRefresh" checked> Auto (30s)</label>
+    <span id="lastUpdated">—</span>
+  </header>
+
+  <div class="banner" id="banner">
+    <div class="decision-main">
+      <div class="decision-label">Coordinator Decision</div>
+      <div class="decision-value" id="decisionValue">—</div>
+    </div>
+    <div class="score-bar-wrap">
+      <div class="score-labels"><span>-100</span><span>score</span><span>+100</span></div>
+      <div class="score-bar-track">
+        <div class="score-bar-mid"></div>
+        <div class="score-bar-fill" id="scoreFill"></div>
+        <div class="score-thresh" id="threshPos1"></div>
+        <div class="score-thresh" id="threshPos2"></div>
+      </div>
+      <div class="chips" id="decisionChips"></div>
+    </div>
+    <div class="banner-actions">
+      <button id="decideBtn" class="small">Compute &amp; Save Decision</button>
+      <button id="runAllBtn" class="secondary small">▶ Run All Agents</button>
+    </div>
+  </div>
+
+  <div class="grid" id="agentGrid"></div>
+
+  <div class="section-title">Decision History</div>
+  <div class="history-wrap">
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Time (UTC)</th><th>Decision</th><th>Direction</th><th>Score</th><th>Missing</th><th>Conflicts</th></tr></thead>
+        <tbody id="historyBody"><tr><td colspan="6" class="empty">No history yet.</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <footer>
+    Reads-only dashboard for the <code>-trading-agents-backend</code> API · agent "Run" actions call the LLM/web-search endpoints directly, costs apply.
+  </footer>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const apiBaseEl = $('apiBase'), symbolEl = $('symbol'), timeframeEl = $('timeframe');
+
+function apiBase() { return apiBaseEl.value.replace(/\/+$/, ''); }
+
+async function api(method, path) {
+  const url = apiBase() + path;
+  try {
+    const res = await fetch(url, { method });
+    let data = null;
+    try { data = await res.json(); } catch (_) {}
+    return { ok: res.ok, status: res.status, data };
+  } catch (e) {
+    return { ok: false, status: 0, data: { detail: 'network error: ' + e.message } };
+  }
+}
+
+function fmtAgo(iso) {
+  if (!iso) return '';
+  const t = new Date(iso.replace(' ', 'T'));
+  if (isNaN(t)) return iso;
+  const secs = Math.round((Date.now() - t.getTime()) / 1000);
+  if (secs < 5) return 'just now';
+  if (secs < 60) return secs + 's ago';
+  const mins = Math.round(secs / 60);
+  if (mins < 60) return mins + 'm ago';
+  const hrs = Math.round(mins / 60);
+  if (hrs < 48) return hrs + 'h ago';
+  return Math.round(hrs / 24) + 'd ago';
+}
+
+function dirClass(direction) {
+  if (direction === 'bullish') return 'bullish';
+  if (direction === 'bearish') return 'bearish';
+  return 'neutral';
+}
+
+function confColor(conf) {
+  return conf >= 60 ? 'var(--accent)' : (conf >= 30 ? 'var(--warn)' : 'var(--muted)');
+}
+
+function renderKeyData(obj) {
+  if (!obj || typeof obj !== 'object') return '';
+  const rows = Object.entries(obj)
+    .filter(([k, v]) => v !== null && v !== undefined && !(Array.isArray(v) && v.length === 0))
+    .slice(0, 6)
+    .map(([k, v]) => {
+      const val = Array.isArray(v) ? v.join(', ') : (typeof v === 'object' ? JSON.stringify(v) : String(v));
+      return `<div><span>${escapeHtml(k)}</span><b>${escapeHtml(val)}</b></div>`;
+    }).join('');
+  return `<div class="kv">${rows}</div>`;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function renderFlags(flags) {
+  if (!flags || !flags.length) return '';
+  return `<div class="chips">${flags.map(f => `<span class="chip warn">${escapeHtml(f)}</span>`).join('')}</div>`;
+}
+
+// ---- Agent card definitions ----
+const AGENT_CARDS = [
+  {
+    key: 'analysis', title: 'Analysis', icon: '📊',
+    fetchPath: () => `/agents/analysis/latest?symbol=${encodeURIComponent(symbolEl.value)}&timeframe=${encodeURIComponent(timeframeEl.value)}`,
+    runLabel: 'Run', run: async () => api('POST', `/agents/analysis/run?symbol=${encodeURIComponent(symbolEl.value)}&timeframe=${encodeURIComponent(timeframeEl.value)}&ignore_timing_gate=true`),
+    unwrap: (d) => d,
+  },
+  {
+    key: 'news', title: 'News', icon: '📰',
+    fetchPath: () => `/agents/news/latest?symbol=${encodeURIComponent(symbolEl.value)}`,
+    runLabel: 'Run', run: async () => api('POST', `/agents/news/run?symbol=${encodeURIComponent(symbolEl.value)}`),
+    unwrap: (d) => d,
+  },
+  {
+    key: 'macro', title: 'Macro', icon: '🌐',
+    fetchPath: () => `/agents/macro/latest?symbol=${encodeURIComponent(symbolEl.value)}`,
+    runLabel: 'Run', run: async () => api('POST', `/agents/macro/run?symbol=${encodeURIComponent(symbolEl.value)}`),
+    unwrap: (d) => d,
+  },
+  {
+    key: 'timing', title: 'Timing', icon: '⏱',
+    fetchPath: () => `/timing/now`,
+    runLabel: null, run: null,
+    unwrap: (d) => d,
+  },
+];
+
+function agentCardSkeleton(agent) {
+  return `
+    <div class="card" id="card-${agent.key}">
+      <div class="card-head">
+        <div class="card-title">${agent.icon} ${agent.title}</div>
+        <span class="card-time" id="time-${agent.key}"></span>
+      </div>
+      <div id="body-${agent.key}"><span class="empty">Loading…</span></div>
+      <div class="card-foot">
+        <span id="badge-${agent.key}"></span>
+        ${agent.run ? `<button class="secondary small" id="run-${agent.key}">${agent.runLabel}</button>` : '<span></span>'}
+      </div>
+    </div>`;
+}
+
+function initGrid() {
+  $('agentGrid').innerHTML = AGENT_CARDS.map(agentCardSkeleton).join('');
+  AGENT_CARDS.forEach(agent => {
+    if (agent.run) {
+      $('run-' + agent.key).addEventListener('click', async () => {
+        const btn = $('run-' + agent.key);
+        btn.disabled = true;
+        const orig = btn.textContent;
+        btn.innerHTML = '<span class="spin"></span>';
+        const res = await agent.run();
+        btn.disabled = false;
+        btn.textContent = orig;
+        if (!res.ok) {
+          $('body-' + agent.key).innerHTML = `<div class="err">${escapeHtml((res.data && res.data.detail) || 'request failed')}</div>`;
+        } else {
+          await refreshAgentCard(agent);
+          await refreshDecisionLive();
+        }
+      });
+    }
+  });
+}
+
+async function refreshAgentCard(agent) {
+  const res = await api('GET', agent.fetchPath());
+  const bodyEl = $('body-' + agent.key);
+  const badgeEl = $('badge-' + agent.key);
+  const timeEl = $('time-' + agent.key);
+  if (!res.ok) {
+    bodyEl.innerHTML = res.status === 404
+      ? `<span class="empty">No opinion stored yet — click Run.</span>`
+      : `<div class="err">${escapeHtml((res.data && res.data.detail) || ('error ' + res.status))}</div>`;
+    badgeEl.innerHTML = '';
+    timeEl.textContent = '';
+    return;
+  }
+  const d = agent.unwrap(res.data);
+  timeEl.textContent = fmtAgo(d.timestamp);
+  const direction = d.direction || 'neutral';
+  const confidence = d.confidence ?? 0;
+  badgeEl.innerHTML = `<span class="badge ${dirClass(direction)}">${escapeHtml(direction)}</span>`;
+  bodyEl.innerHTML = `
+    <div class="conf-row">
+      <div class="conf-track"><div class="conf-fill" style="width:${confidence}%; background:${confColor(confidence)}"></div></div>
+      <div class="conf-num">${confidence}%</div>
+    </div>
+    <div class="reasoning">${escapeHtml(d.reasoning || d.key_data && d.key_data.session_label || '')}</div>
+    ${renderKeyData(d.key_data)}
+    ${renderFlags(d.flags)}
+  `;
+}
+
+async function refreshAllAgentCards() {
+  await Promise.all(AGENT_CARDS.map(refreshAgentCard));
+}
+
+// ---- Decision banner ----
+function setScoreBar(score, threshold) {
+  score = Math.max(-100, Math.min(100, score));
+  const pct = (score + 100) / 2; // 0..100
+  const fill = $('scoreFill');
+  fill.style.background = score > threshold ? 'var(--bull)' : (score < -threshold ? 'var(--bear)' : 'var(--muted)');
+  if (score >= 0) {
+    fill.style.left = '50%';
+    fill.style.width = (pct - 50) + '%';
+  } else {
+    fill.style.left = pct + '%';
+    fill.style.width = (50 - pct) + '%';
+  }
+  const tpct1 = ((threshold) + 100) / 2;
+  const tpct2 = ((-threshold) + 100) / 2;
+  $('threshPos1').style.left = tpct1 + '%';
+  $('threshPos2').style.left = tpct2 + '%';
+}
+
+async function refreshDecisionLive() {
+  const symbol = symbolEl.value, timeframe = timeframeEl.value;
+  $('symTfLabel').textContent = `— ${symbol} / ${timeframe}`;
+  const res = await api('GET', `/coordinator/decide?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&persist=false`);
+  const banner = $('banner');
+  banner.classList.remove('bull', 'bear');
+  if (!res.ok) {
+    $('decisionValue').textContent = 'error';
+    $('decisionValue').className = 'decision-value';
+    $('decisionChips').innerHTML = `<span class="chip warn">${escapeHtml((res.data && res.data.detail) || 'failed')}</span>`;
+    setScoreBar(0, 25);
+    return;
+  }
+  const d = res.data;
+  $('decisionValue').textContent = d.decision;
+  $('decisionValue').className = 'decision-value ' + d.decision;
+  if (d.decision === 'enter_long') banner.classList.add('bull');
+  if (d.decision === 'enter_short') banner.classList.add('bear');
+  setScoreBar(d.score, d.threshold);
+  const chips = [];
+  chips.push(`<span class="chip">score ${d.score}</span>`);
+  chips.push(`<span class="chip">threshold ±${d.threshold}</span>`);
+  (d.missing_agents || []).forEach(a => chips.push(`<span class="chip warn">missing: ${escapeHtml(a)}</span>`));
+  (d.conflict_flags || []).forEach(f => chips.push(`<span class="chip warn">${escapeHtml(f)}</span>`));
+  $('decisionChips').innerHTML = chips.join('');
+  return d;
+}
+
+async function refreshRisk() {
+  const symbol = symbolEl.value, timeframe = timeframeEl.value;
+  const res = await api('GET', `/agents/risk/evaluate?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}`);
+  const el = document.getElementById('riskCardBody');
+  if (!el) return;
+  if (!res.ok) {
+    document.getElementById('riskBadge').innerHTML = '';
+    el.innerHTML = res.status === 404
+      ? `<span class="empty">No saved decision yet — click "Compute &amp; Save Decision" first.</span>`
+      : `<div class="err">${escapeHtml((res.data && res.data.detail) || ('error ' + res.status))}</div>`;
+    return;
+  }
+  const risk = res.data.risk_opinion;
+  const basedOn = res.data.coordinator_decision;
+  document.getElementById('riskTime').textContent = fmtAgo(risk.timestamp);
+  document.getElementById('riskBadge').innerHTML = `<span class="badge ${risk.decision}">${escapeHtml(risk.decision)}</span>`;
+  el.innerHTML = `
+    <div class="reasoning">${escapeHtml(risk.reasoning)}</div>
+    <div class="kv">
+      <div><span>size</span><b>${risk.original_size} → ${risk.suggested_size ?? '—'}</b></div>
+      <div><span>based on decision</span><b>${escapeHtml(basedOn.decision)} @ ${fmtAgo(basedOn.timestamp)}</b></div>
+    </div>
+    ${renderKeyData(risk.key_data)}
+    ${renderFlags(risk.flags)}
+  `;
+}
+
+async function refreshHistory() {
+  const symbol = symbolEl.value, timeframe = timeframeEl.value;
+  const res = await api('GET', `/coordinator/history?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&limit=20`);
+  const body = $('historyBody');
+  if (!res.ok || !res.data || !res.data.length) {
+    body.innerHTML = `<tr><td colspan="6" class="empty">No history yet.</td></tr>`;
+    return;
+  }
+  body.innerHTML = res.data.map(d => `
+    <tr>
+      <td>${escapeHtml(d.timestamp)}</td>
+      <td><span class="badge ${d.decision === 'enter_long' ? 'bullish' : d.decision === 'enter_short' ? 'bearish' : 'neutral'}">${escapeHtml(d.decision)}</span></td>
+      <td>${escapeHtml(d.direction)}</td>
+      <td>${d.score}</td>
+      <td>${(d.missing_agents || []).join(', ') || '—'}</td>
+      <td>${(d.conflict_flags || []).join(', ') || '—'}</td>
+    </tr>
+  `).join('');
+}
+
+// Inject Risk card as a 5th card in the grid (kept separate from AGENT_CARDS
+// since its data model — decision/size/reasoning — differs from the four
+// opinion agents above).
+function injectRiskCard() {
+  const grid = $('agentGrid');
+  const div = document.createElement('div');
+  div.className = 'card';
+  div.innerHTML = `
+    <div class="card-head">
+      <div class="card-title">🛡 Risk</div>
+      <span class="card-time" id="riskTime"></span>
+    </div>
+    <div id="riskCardBody"><span class="empty">Loading…</span></div>
+    <div class="card-foot">
+      <span id="riskBadge"></span>
+      <button class="secondary small" id="runRisk">Evaluate</button>
+    </div>
+  `;
+  grid.appendChild(div);
+  document.getElementById('runRisk').addEventListener('click', async () => {
+    const btn = document.getElementById('runRisk');
+    btn.disabled = true;
+    await refreshRisk();
+    btn.disabled = false;
+  });
+}
+
+async function refreshAll() {
+  await Promise.all([refreshAllAgentCards(), refreshDecisionLive(), refreshRisk(), refreshHistory()]);
+  $('lastUpdated').textContent = 'updated ' + new Date().toLocaleTimeString();
+}
+
+// ---- top-level actions ----
+$('refreshBtn').addEventListener('click', refreshAll);
+
+$('decideBtn').addEventListener('click', async () => {
+  const btn = $('decideBtn');
+  btn.disabled = true;
+  const symbol = symbolEl.value, timeframe = timeframeEl.value;
+  await api('GET', `/coordinator/decide?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&persist=true`);
+  await Promise.all([refreshDecisionLive(), refreshHistory()]);
+  btn.disabled = false;
+});
+
+$('runAllBtn').addEventListener('click', async () => {
+  const btn = $('runAllBtn');
+  btn.disabled = true;
+  const orig = btn.textContent;
+  for (const agent of AGENT_CARDS) {
+    if (!agent.run) continue;
+    btn.textContent = `Running ${agent.title}…`;
+    await agent.run();
+    await refreshAgentCard(agent);
+  }
+  btn.textContent = 'Deciding…';
+  await refreshDecisionLive();
+  btn.textContent = orig;
+  btn.disabled = false;
+});
+
+[symbolEl, timeframeEl, apiBaseEl].forEach(el => el.addEventListener('change', refreshAll));
+
+let autoTimer = null;
+function setupAutoRefresh() {
+  if (autoTimer) clearInterval(autoTimer);
+  if ($('autoRefresh').checked) {
+    autoTimer = setInterval(refreshAll, 30000);
+  }
+}
+$('autoRefresh').addEventListener('change', setupAutoRefresh);
+
+// ---- boot ----
+initGrid();
+injectRiskCard();
+refreshAll();
+setupAutoRefresh();
+</script>
+</body>
+</html>
