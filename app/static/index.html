@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Trading Agents Dashboard</title>
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 <style>
   :root {
     --bg: #0b0f14;
@@ -88,6 +89,20 @@
   }
   .chip.warn { color: var(--warn); border-color: var(--warn); }
   .banner-actions { display: flex; flex-direction: column; gap: 6px; align-items: flex-end; }
+
+  /* candlestick chart */
+  .chart-card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 12px 14px 6px; margin-bottom: 16px;
+  }
+  .chart-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+  .chart-head .card-title { font-weight: 600; font-size: 13px; }
+  .chart-head .card-time { font-size: 10px; color: var(--muted); }
+  #chartContainer { height: 340px; position: relative; }
+  #chartEmpty {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    color: var(--muted); font-size: 12.5px; font-style: italic; pointer-events: none;
+  }
 
   /* grid of agent cards */
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; margin-bottom: 16px; }
@@ -176,6 +191,14 @@
       <button id="decideBtn" class="small">Compute &amp; Save Decision</button>
       <button id="runAllBtn" class="secondary small">▶ Run All Agents</button>
     </div>
+  </div>
+
+  <div class="chart-card">
+    <div class="chart-head">
+      <div class="card-title">🕯 MNQ1! · 5m</div>
+      <span class="card-time" id="chartTime"></span>
+    </div>
+    <div id="chartContainer"><span id="chartEmpty">Loading candles…</span></div>
   </div>
 
   <div class="grid" id="agentGrid"></div>
@@ -351,10 +374,88 @@ async function refreshAgentCard(agent) {
     ${renderKeyData(d.key_data)}
     ${renderFlags(d.flags)}
   `;
+  if (agent.key === 'analysis') {
+    lastAnalysisKeyLevels = (d.key_data && Array.isArray(d.key_data.key_levels)) ? d.key_data.key_levels : [];
+  }
 }
 
 async function refreshAllAgentCards() {
   await Promise.all(AGENT_CARDS.map(refreshAgentCard));
+}
+
+// ---- Candlestick chart (5m only, per lightweight-charts) ----
+const CHART_TIMEFRAME = '5m';
+let candleChart = null;
+let candleSeries = null;
+let keyLevelLines = [];
+let lastAnalysisKeyLevels = [];
+
+function initChart() {
+  const container = $('chartContainer');
+  candleChart = LightweightCharts.createChart(container, {
+    width: container.clientWidth,
+    height: 340,
+    layout: { background: { color: 'transparent' }, textColor: '#8b98a8' },
+    grid: {
+      vertLines: { color: 'rgba(35,45,58,0.6)' },
+      horzLines: { color: 'rgba(35,45,58,0.6)' },
+    },
+    rightPriceScale: { borderColor: '#232d3a' },
+    timeScale: { borderColor: '#232d3a', timeVisible: true, secondsVisible: false },
+    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+  });
+  candleSeries = candleChart.addCandlestickSeries({
+    upColor: '#22c55e', downColor: '#ef4444', borderVisible: false,
+    wickUpColor: '#22c55e', wickDownColor: '#ef4444',
+  });
+  window.addEventListener('resize', () => {
+    candleChart.applyOptions({ width: container.clientWidth });
+  });
+}
+
+function updateKeyLevelLines(levels) {
+  keyLevelLines.forEach(line => candleSeries.removePriceLine(line));
+  keyLevelLines = [];
+  if (!levels || !levels.length) return;
+  // Dedupe near-identical levels so the chart isn't cluttered with
+  // overlapping labels for prices that round to the same line.
+  const seen = new Set();
+  levels.forEach(level => {
+    const key = Number(level).toFixed(2);
+    if (seen.has(key)) return;
+    seen.add(key);
+    keyLevelLines.push(candleSeries.createPriceLine({
+      price: Number(level),
+      color: 'rgba(148,163,184,0.55)',
+      lineWidth: 1,
+      lineStyle: LightweightCharts.LineStyle.Dashed,
+      axisLabelVisible: true,
+      title: key,
+    }));
+  });
+}
+
+async function refreshChart() {
+  const symbol = symbolEl.value;
+  const res = await api('GET', `/market-state/recent?symbol=${encodeURIComponent(symbol)}&timeframe=${CHART_TIMEFRAME}&limit=100`);
+  const emptyEl = $('chartEmpty');
+  if (!res.ok || !res.data || !res.data.length) {
+    if (emptyEl) emptyEl.textContent = res.status === 404 ? 'No 5m bars yet for this symbol.' : 'Failed to load candles.';
+    else $('chartContainer').insertAdjacentHTML('beforeend', '<span id="chartEmpty">No 5m bars yet.</span>');
+    $('chartTime').textContent = '';
+    return;
+  }
+  if (emptyEl) emptyEl.remove();
+
+  // API returns newest-first; the chart wants ascending time.
+  const bars = [...res.data].reverse();
+  const candles = bars.map(b => ({
+    time: Math.floor(new Date(b.timestamp.replace(' ', 'T')).getTime() / 1000),
+    open: b.open, high: b.high, low: b.low, close: b.close,
+  }));
+  candleSeries.setData(candles);
+  updateKeyLevelLines(lastAnalysisKeyLevels);
+  $('chartTime').textContent = `${candles.length} bars · last ${fmtAgo(bars[bars.length - 1].timestamp)}`;
 }
 
 // ---- Decision banner ----
@@ -479,7 +580,10 @@ function injectRiskCard() {
 }
 
 async function refreshAll() {
-  await Promise.all([refreshAllAgentCards(), refreshDecisionLive(), refreshRisk(), refreshHistory()]);
+  // Agent cards first: refreshChart reads lastAnalysisKeyLevels, which
+  // the analysis card's fetch sets as a side effect.
+  await refreshAllAgentCards();
+  await Promise.all([refreshDecisionLive(), refreshRisk(), refreshHistory(), refreshChart()]);
   $('lastUpdated').textContent = 'updated ' + new Date().toLocaleTimeString();
 }
 
@@ -523,6 +627,7 @@ function setupAutoRefresh() {
 $('autoRefresh').addEventListener('change', setupAutoRefresh);
 
 // ---- boot ----
+initChart();
 initGrid();
 injectRiskCard();
 refreshAll();
