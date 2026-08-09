@@ -13,6 +13,11 @@ reads recent market_state bars and asks Claude for a technical
 direction/confidence/reasoning read, stored as an "opinion" for the
 future Coordinator to consume.
 
+Sprint 4: added the News Agent (uses Claude's hosted web_search tool
+— no separate news API needed) and an independent background
+scheduler (APScheduler, in-process) that runs it on its own clock,
+decoupled from the webhook that drives Analysis.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -25,6 +30,8 @@ from fastapi.responses import JSONResponse
 
 from app.analysis_agent import AnalysisAgentError, run_analysis
 from app.models import MarketStateOut, MarketStatePayload, WebhookAck
+from app.news_agent import NewsAgentError, run_news
+from app.scheduler import NEWS_SYMBOL, NEWS_TIMEFRAME, start_scheduler, stop_scheduler
 from app.storage import (
     get_latest,
     get_latest_opinion,
@@ -50,6 +57,12 @@ def _startup() -> None:
             "Set it before starting the server."
         )
     init_db()
+    start_scheduler()
+
+
+@app.on_event("shutdown")
+def _shutdown() -> None:
+    stop_scheduler()
 
 
 @app.get("/")
@@ -161,6 +174,35 @@ def read_latest_analysis(
     opinion = get_latest_opinion(agent="analysis", symbol=symbol, timeframe=timeframe)
     if opinion is None:
         raise HTTPException(status_code=404, detail="no analysis opinion stored yet")
+    return opinion
+
+
+@app.post("/agents/news/run")
+def trigger_news(
+    symbol: str = Query(default=NEWS_SYMBOL),
+) -> dict:
+    try:
+        opinion = run_news(symbol=symbol)
+    except NewsAgentError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    save_opinion(
+        agent="news",
+        symbol=symbol,
+        timeframe=NEWS_TIMEFRAME,
+        timestamp=opinion.timestamp,
+        opinion=opinion.to_dict(),
+    )
+    return {"opinion": opinion.to_dict()}
+
+
+@app.get("/agents/news/latest")
+def read_latest_news(
+    symbol: str = Query(default=NEWS_SYMBOL),
+) -> dict:
+    opinion = get_latest_opinion(agent="news", symbol=symbol, timeframe=NEWS_TIMEFRAME)
+    if opinion is None:
+        raise HTTPException(status_code=404, detail="no news opinion stored yet")
     return opinion
 
 
