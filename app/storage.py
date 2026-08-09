@@ -5,16 +5,23 @@ Deliberately simple for Sprint 1: one table, one index, idempotent
 inserts keyed on event_id (the Pine script already guarantees this is
 deterministic per symbol+timeframe+bar-close, so INSERT OR IGNORE is
 enough to dedupe retried/duplicate webhook deliveries).
+
+Sprint 3.5: DB_PATH is now overridable via the DB_PATH environment
+variable, so it can point at a Railway Volume mount (e.g. /data) —
+without a persistent volume, Railway wipes the local filesystem on
+every redeploy, taking the SQLite file with it.
 """
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 from typing import Optional
 
 from app.models import MarketStatePayload
 
-DB_PATH = Path(__file__).resolve().parent.parent / "data" / "market_state.db"
+_DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "market_state.db"
+DB_PATH = Path(os.environ.get("DB_PATH", str(_DEFAULT_DB_PATH)))
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS market_state (
