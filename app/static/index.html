@@ -4,174 +4,227 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Trading Agents Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 <style>
   :root {
-    --bg: #0b0f14;
-    --panel: #121821;
-    --panel-2: #171f2a;
-    --border: #232d3a;
-    --text: #e6edf3;
-    --muted: #8b98a8;
-    --bull: #22c55e;
-    --bull-bg: rgba(34,197,94,0.12);
-    --bear: #ef4444;
-    --bear-bg: rgba(239,68,68,0.12);
-    --neutral: #94a3b8;
-    --neutral-bg: rgba(148,163,184,0.12);
-    --accent: #3b82f6;
-    --warn: #f59e0b;
+    --bg: #0B0E14;
+    --panel: #151A24;
+    --panel-2: #1B2230;
+    --border: #262F40;
+    --text: #E8EAED;
+    --muted: #8B93A7;
+    --bull: #5FBF8F;
+    --bull-bg: rgba(95,191,143,0.14);
+    --bear: #E0785C;
+    --bear-bg: rgba(224,120,92,0.14);
+    --neutral: #8B93A7;
+    --neutral-bg: rgba(139,147,167,0.14);
+    --accent: #D4A857;
+    --accent-bg: rgba(212,168,87,0.14);
+    --ny: #5B8FD4;
+    --ny-bg: rgba(91,143,212,0.16);
+    --font-head: 'Space Grotesk', sans-serif;
+    --font-mono: 'JetBrains Mono', monospace;
   }
   * { box-sizing: border-box; }
   body {
     margin: 0;
     background: var(--bg);
     color: var(--text);
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-family: var(--font-head);
     font-size: 14px;
     line-height: 1.5;
   }
-  .wrap { max-width: 1200px; margin: 0 auto; padding: 20px 16px 60px; }
-
-  /* header */
-  header {
-    display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
-    margin-bottom: 18px;
+  table, .mono, .decision-value, .conf-num, .status-pill b, .card-time, .key-level-label,
+  .score-labels, .kv b, .chart-head .card-time, .card-title .age {
+    font-family: var(--font-mono);
   }
-  header h1 { font-size: 18px; margin: 0; margin-right: auto; white-space: nowrap; }
-  header h1 span { color: var(--muted); font-weight: 400; }
-  .field { display: flex; flex-direction: column; gap: 2px; }
-  .field label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  .wrap { max-width: 1280px; margin: 0 auto; padding: 16px 16px 60px; }
+
+  /* ---- compact header ---- */
+  header {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px;
+    margin-bottom: 12px; padding-bottom: 10px; border-bottom: 1px solid var(--border);
+  }
+  header h1 {
+    font-size: 15px; font-weight: 600; margin: 0; margin-right: auto; white-space: nowrap;
+    letter-spacing: .01em;
+  }
+  header h1 span { color: var(--muted); font-weight: 400; font-family: var(--font-mono); font-size: 12px; }
+  .field { display: flex; flex-direction: column; gap: 1px; }
+  .field label { font-size: 9px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
   .field input {
     background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
-    border-radius: 6px; padding: 6px 8px; font-size: 13px; width: 90px;
+    border-radius: 5px; padding: 4px 7px; font-size: 12px; width: 76px; font-family: var(--font-mono);
   }
-  .field input.wide { width: 260px; }
+  .field input.wide { width: 220px; }
   button {
-    background: var(--accent); color: white; border: none; border-radius: 6px;
-    padding: 8px 12px; font-size: 13px; cursor: pointer; font-weight: 500;
+    background: var(--accent); color: #1a1508; border: none; border-radius: 6px;
+    padding: 7px 11px; font-size: 12.5px; cursor: pointer; font-weight: 600; font-family: var(--font-head);
   }
-  button:hover { filter: brightness(1.1); }
+  button:hover { filter: brightness(1.08); }
   button:disabled { opacity: .5; cursor: not-allowed; }
   button.secondary { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); }
-  button.small { padding: 5px 9px; font-size: 12px; }
-  .toggle { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
-  #lastUpdated { font-size: 11px; color: var(--muted); white-space: nowrap; }
+  button.small { padding: 5px 9px; font-size: 11.5px; }
+  .toggle { display: flex; align-items: center; gap: 5px; font-size: 11.5px; color: var(--muted); }
+  #lastUpdated { font-size: 10.5px; color: var(--muted); white-space: nowrap; }
 
-  /* system status */
+  /* ---- status panel: alert + session clock + status strip ---- */
+  .status-panel {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 14px 16px; margin-bottom: 14px;
+  }
   .sched-alert {
-    display: none; align-items: center; gap: 8px; border-radius: 10px;
-    padding: 10px 14px; margin-bottom: 12px; font-size: 13px; font-weight: 600;
-    background: rgba(245,158,11,0.12); border: 1px solid var(--warn); color: var(--warn);
+    display: none; align-items: center; gap: 8px; border-radius: 8px;
+    padding: 8px 12px; margin-bottom: 12px; font-size: 12.5px; font-weight: 600;
+    background: var(--accent-bg); border: 1px solid var(--accent); color: var(--accent);
   }
   .sched-alert.show { display: flex; }
-  .status-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 16px; }
+
+  .session-clock-head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 6px; }
+  .sc-title { font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+  .sc-now { font-size: 11px; color: var(--accent); font-family: var(--font-mono); }
+  .sc-track {
+    position: relative; height: 26px; background: var(--panel-2); border-radius: 6px;
+    border: 1px solid var(--border); overflow: visible; margin-bottom: 6px;
+  }
+  .sc-band { position: absolute; top: 0; bottom: 0; border-radius: 4px; }
+  .sc-band.sc-london { background: var(--accent-bg); border: 1px solid rgba(212,168,87,0.4); }
+  .sc-band.sc-ny { background: var(--ny-bg); border: 1px solid rgba(91,143,212,0.4); }
+  .sc-band.sc-overlap { background: rgba(190,150,220,0.30); border: 1px solid rgba(190,150,220,0.6); z-index: 1; display: none; }
+  .sc-now-marker {
+    position: absolute; top: -4px; bottom: -4px; width: 2px; background: var(--text); z-index: 3;
+    box-shadow: 0 0 6px var(--text);
+  }
+  .sc-now-marker::before {
+    content: ''; position: absolute; top: -4px; left: 50%; transform: translateX(-50%);
+    width: 6px; height: 6px; border-radius: 50%; background: var(--text);
+  }
+  .sc-ticks { display: flex; justify-content: space-between; font-size: 9.5px; color: var(--muted); font-family: var(--font-mono); margin-bottom: 10px; }
+  .sc-legend { display: flex; gap: 14px; font-size: 11px; color: var(--muted); }
+  .sc-legend span { display: flex; align-items: center; gap: 5px; }
+  .sc-legend i { width: 8px; height: 8px; border-radius: 2px; display: inline-block; }
+  .sc-legend i.london { background: var(--accent); }
+  .sc-legend i.ny { background: var(--ny); }
+  .sc-legend i.overlap { background: rgb(190,150,220); }
+
+  .status-strip { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); }
   .status-pill {
-    display: flex; align-items: center; gap: 6px; background: var(--panel);
+    display: flex; align-items: center; gap: 6px; background: var(--panel-2);
     border: 1px solid var(--border); border-radius: 999px; padding: 5px 10px 5px 8px;
-    font-size: 11.5px; color: var(--muted); white-space: nowrap;
+    font-size: 11px; color: var(--muted); white-space: nowrap;
   }
   .status-pill b { color: var(--text); font-weight: 600; }
-  .status-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .status-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
   .status-dot.green { background: var(--bull); }
-  .status-dot.orange { background: var(--warn); }
+  .status-dot.orange { background: var(--accent); }
   .status-dot.red { background: var(--bear); }
   .status-dot.gray { background: var(--neutral); }
 
-  /* decision banner */
-  .banner {
-    border-radius: 12px; border: 1px solid var(--border); background: var(--panel);
-    padding: 18px 20px; margin-bottom: 16px;
-    display: flex; flex-wrap: wrap; align-items: center; gap: 20px;
+  /* ---- unified decision panel (Coordinator + Risk) ---- */
+  .decision-panel {
+    display: grid; grid-template-columns: 1fr auto 1fr; align-items: stretch; gap: 16px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 18px 20px; margin-bottom: 14px;
   }
-  .banner.bull { border-color: var(--bull); box-shadow: 0 0 0 1px var(--bull) inset; }
-  .banner.bear { border-color: var(--bear); box-shadow: 0 0 0 1px var(--bear) inset; }
-  .decision-main { min-width: 200px; }
-  .decision-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; margin-bottom: 4px; }
-  .decision-value { font-size: 26px; font-weight: 700; }
+  .decision-panel.bull { border-color: var(--bull); box-shadow: 0 0 0 1px var(--bull) inset; }
+  .decision-panel.bear { border-color: var(--bear); box-shadow: 0 0 0 1px var(--bear) inset; }
+  .decision-col { display: flex; flex-direction: column; gap: 8px; min-width: 240px; }
+  .decision-arrow { display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 20px; }
+  .col-label { font-size: 10.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; font-weight: 600; }
+  .decision-value { font-size: 26px; font-weight: 700; font-family: var(--font-mono); }
   .decision-value.enter_long { color: var(--bull); }
   .decision-value.enter_short { color: var(--bear); }
   .decision-value.no_trade { color: var(--neutral); }
-  .decision-value.insufficient_data { color: var(--warn); }
-  .score-bar-wrap { flex: 1; min-width: 220px; }
-  .score-bar-track {
-    position: relative; height: 10px; background: var(--panel-2); border-radius: 5px; overflow: visible;
-    margin: 8px 0 4px;
-  }
-  .score-bar-fill { position: absolute; top: 0; bottom: 0; border-radius: 5px; }
-  .score-bar-mid { position: absolute; left: 50%; top: -3px; bottom: -3px; width: 1px; background: var(--border); }
-  .score-thresh { position: absolute; top: -3px; bottom: -3px; width: 1px; background: var(--warn); }
-  .score-labels { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); }
+  .decision-value.insufficient_data { color: var(--accent); }
+  .score-bar-track { position: relative; height: 8px; background: var(--panel-2); border-radius: 4px; margin: 4px 0; }
+  .score-bar-fill { position: absolute; top: 0; bottom: 0; border-radius: 4px; }
+  .score-bar-mid { position: absolute; left: 50%; top: -2px; bottom: -2px; width: 1px; background: var(--border); }
+  .score-thresh { position: absolute; top: -2px; bottom: -2px; width: 1px; background: var(--accent); }
+  .score-labels { display: flex; justify-content: space-between; font-size: 10px; color: var(--muted); }
   .chips { display: flex; flex-wrap: wrap; gap: 6px; }
   .chip {
-    font-size: 11px; padding: 3px 8px; border-radius: 999px; background: var(--panel-2);
-    border: 1px solid var(--border); color: var(--muted);
+    font-size: 10.5px; padding: 3px 8px; border-radius: 999px; background: var(--panel-2);
+    border: 1px solid var(--border); color: var(--muted); font-family: var(--font-mono);
   }
-  .chip.warn { color: var(--warn); border-color: var(--warn); }
-  .banner-actions { display: flex; flex-direction: column; gap: 6px; align-items: flex-end; }
+  .chip.warn { color: var(--accent); border-color: var(--accent); }
+  .decision-actions { display: flex; gap: 6px; margin-top: auto; padding-top: 6px; }
+  .risk-head-row { display: flex; align-items: center; justify-content: space-between; }
+  .risk-col .card-foot { margin-top: auto; padding-top: 8px; border-top: 1px solid var(--border); display: flex; justify-content: flex-end; }
 
-  /* candlestick chart */
+  /* ---- candlestick chart ---- */
   .chart-card {
     background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
-    padding: 12px 14px 6px; margin-bottom: 16px;
+    padding: 12px 14px 6px; margin-bottom: 14px;
   }
   .chart-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
-  .chart-head .card-title { font-weight: 600; font-size: 13px; }
-  .chart-head .card-time { font-size: 10px; color: var(--muted); }
-  #chartContainer { height: 340px; position: relative; overflow: hidden; }
+  .chart-head .card-title { font-weight: 600; font-size: 12.5px; font-family: var(--font-head); }
+  #chartContainer { height: 360px; position: relative; overflow: hidden; }
   #chartEmpty {
     position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
     color: var(--muted); font-size: 12.5px; font-style: italic; pointer-events: none;
   }
-  /* Custom key-level labels, deliberately separate from the chart's own
-     right-side price axis (axisLabelVisible:false on those price lines)
-     so they never collide with the candle price numbers. */
   #keyLevelLabels { position: absolute; inset: 0; pointer-events: none; z-index: 2; }
   .key-level-label {
     position: absolute; left: 6px; transform: translateY(-50%);
-    background: rgba(23,31,42,0.88); color: #b7c2cf; font-size: 10px; font-weight: 500;
-    padding: 1px 6px; border-radius: 3px; border: 1px solid rgba(148,163,184,0.3);
+    background: rgba(21,26,36,0.9); color: #b7c2cf; font-size: 10px; font-weight: 500;
+    padding: 1px 6px; border-radius: 3px; border: 1px solid var(--border);
     white-space: nowrap;
   }
 
-  /* grid of agent cards */
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; margin-bottom: 16px; }
+  /* ---- agent cards: fixed, uniform structure ---- */
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: 14px; margin-bottom: 14px; }
   .card {
     background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
-    padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; min-height: 160px;
+    padding: 14px 16px; display: flex; flex-direction: column; gap: 9px;
+    min-height: 300px;
   }
-  /* Same bullish/bearish/neutral logic as the confidence bar and badge,
-     applied as a light tint on the card itself. */
-  .card.dir-bullish { border-color: rgba(34,197,94,0.35); background: linear-gradient(180deg, rgba(34,197,94,0.07), transparent 90px), var(--panel); }
-  .card.dir-bearish { border-color: rgba(239,68,68,0.35); background: linear-gradient(180deg, rgba(239,68,68,0.07), transparent 90px), var(--panel); }
+  .card.dir-bullish { border-color: rgba(95,191,143,0.4); }
+  .card.dir-bearish { border-color: rgba(224,120,92,0.4); }
   .card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-  .card-title { font-weight: 600; font-size: 13px; display: flex; align-items: center; gap: 6px; }
+  .card-title { font-weight: 600; font-size: 12.5px; display: flex; align-items: center; gap: 6px; font-family: var(--font-head); }
   .card-time { font-size: 10px; color: var(--muted); }
   .time-wrap { display: flex; align-items: center; gap: 5px; }
   .stale-chip {
-    font-size: 9px; font-weight: 700; padding: 1px 6px; border-radius: 999px;
-    background: rgba(245,158,11,0.15); color: var(--warn); text-transform: uppercase; letter-spacing: .03em;
+    font-size: 8.5px; font-weight: 700; padding: 1px 6px; border-radius: 999px;
+    background: var(--accent-bg); color: var(--accent); text-transform: uppercase; letter-spacing: .03em;
+    font-family: var(--font-head);
   }
   .badge {
-    font-size: 11px; font-weight: 700; padding: 3px 9px; border-radius: 999px; text-transform: uppercase; letter-spacing: .03em;
+    font-size: 10.5px; font-weight: 700; padding: 3px 9px; border-radius: 999px;
+    text-transform: uppercase; letter-spacing: .03em; font-family: var(--font-head);
   }
   .badge.bullish, .badge.approve { background: var(--bull-bg); color: var(--bull); }
   .badge.bearish, .badge.reject { background: var(--bear-bg); color: var(--bear); }
   .badge.neutral, .badge.no_action { background: var(--neutral-bg); color: var(--neutral); }
-  .badge.modify { background: rgba(245,158,11,0.12); color: var(--warn); }
-  .conf-row { display: flex; align-items: center; gap: 8px; }
+  .badge.modify { background: var(--accent-bg); color: var(--accent); }
+  .badge-conf-row { display: flex; align-items: center; gap: 8px; }
+  .conf-row { display: flex; align-items: center; gap: 8px; flex: 1; }
   .conf-track { flex: 1; height: 6px; background: var(--panel-2); border-radius: 3px; overflow: hidden; }
   .conf-fill { height: 100%; background: var(--neutral); }
   .conf-num { font-size: 11px; color: var(--muted); width: 32px; text-align: right; }
-  .reasoning { font-size: 12.5px; color: #c3ccd6; flex: 1; }
   .static-note {
     font-size: 11px; color: var(--muted); font-style: italic; background: var(--panel-2);
     border-radius: 6px; padding: 5px 8px; width: fit-content;
   }
-  .kv { display: flex; flex-direction: column; gap: 3px; font-size: 11.5px; }
-  .kv div { display: flex; justify-content: space-between; gap: 8px; color: var(--muted); }
+  .kv { display: flex; flex-direction: column; gap: 3px; font-size: 11px; }
+  .kv div { display: flex; justify-content: space-between; gap: 8px; color: var(--muted); font-family: var(--font-head); }
   .kv div b { color: var(--text); font-weight: 500; text-align: right; }
-  .card-foot { display: flex; align-items: center; justify-content: space-between; margin-top: auto; padding-top: 8px; border-top: 1px solid var(--border); }
+  .reasoning-wrap { flex: 1; display: flex; flex-direction: column; gap: 3px; min-height: 0; }
+  .reasoning { font-size: 12px; color: #c3ccd6; }
+  .reasoning.clamp {
+    display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+  }
+  .read-more {
+    background: none; border: none; color: var(--accent); font-size: 10.5px; font-weight: 600;
+    padding: 0; cursor: pointer; align-self: flex-start; font-family: var(--font-head);
+  }
+  .read-more:hover { text-decoration: underline; }
+  .card-flags { min-height: 20px; display: flex; flex-wrap: wrap; gap: 5px; }
+  .card-foot { display: flex; align-items: center; justify-content: flex-end; margin-top: auto; padding-top: 8px; border-top: 1px solid var(--border); }
   .empty { color: var(--muted); font-size: 12.5px; font-style: italic; flex: 1; }
   .err { color: var(--bear); font-size: 12px; }
   .spin {
@@ -180,26 +233,30 @@
   }
   @keyframes spin { to { transform: rotate(360deg); } }
 
-  /* history */
-  .section-title { font-size: 13px; font-weight: 600; margin: 20px 0 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
-  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  /* ---- history ---- */
+  .section-title { font-size: 12px; font-weight: 600; margin: 18px 0 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; font-family: var(--font-head); }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
   th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border); }
-  th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: .03em; }
+  th { color: var(--muted); font-weight: 500; font-size: 10.5px; text-transform: uppercase; letter-spacing: .03em; font-family: var(--font-head); }
   tbody tr:hover { background: var(--panel-2); }
   .history-wrap { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
-  .history-wrap .scroll { max-height: 320px; overflow-y: auto; }
+  .history-wrap .scroll { max-height: 340px; overflow-y: auto; }
 
-  footer { margin-top: 30px; font-size: 11px; color: var(--muted); text-align: center; }
-  footer a { color: var(--muted); }
+  footer { margin-top: 26px; font-size: 10.5px; color: var(--muted); text-align: center; }
+
+  @media (max-width: 820px) {
+    .decision-panel { grid-template-columns: 1fr; }
+    .decision-arrow { display: none; }
+  }
 </style>
 </head>
 <body>
 <div class="wrap">
 
   <header>
-    <h1>Trading Agents Dashboard <span id="symTfLabel"></span></h1>
+    <h1>Trading Agents <span id="symTfLabel"></span></h1>
     <div class="field">
-      <label>API Base</label>
+      <label>API</label>
       <input id="apiBase" class="wide" value="https://web-production-c67aa.up.railway.app" spellcheck="false">
     </div>
     <div class="field">
@@ -207,26 +264,45 @@
       <input id="symbol" value="MNQ1!" spellcheck="false">
     </div>
     <div class="field">
-      <label>Timeframe</label>
+      <label>TF</label>
       <input id="timeframe" value="5m" spellcheck="false">
     </div>
-    <button class="secondary" id="refreshBtn">↻ Refresh</button>
-    <label class="toggle"><input type="checkbox" id="autoRefresh" checked> Auto (30s)</label>
+    <button class="secondary small" id="refreshBtn">↻</button>
+    <label class="toggle"><input type="checkbox" id="autoRefresh" checked>Auto 30s</label>
     <span id="lastUpdated">—</span>
   </header>
 
-  <div class="sched-alert" id="schedAlert">⚠️ Scheduler متوقف — News/Macro لازم تشتغل يدوياً</div>
+  <div class="status-panel">
+    <div class="sched-alert" id="schedAlert">⚠️ Scheduler متوقف — News/Macro لازم تشتغل يدوياً</div>
 
-  <div class="status-bar" id="statusBar">
-    <span class="status-pill"><span class="status-dot gray"></span>loading system status…</span>
+    <div class="session-clock-head">
+      <span class="sc-title">Session Clock</span>
+      <span class="sc-now" id="scNowLabel"></span>
+    </div>
+    <div class="sc-track" id="scTrack">
+      <div class="sc-band sc-london" id="scLondon"></div>
+      <div class="sc-band sc-ny" id="scNY"></div>
+      <div class="sc-band sc-overlap" id="scOverlap"></div>
+      <div class="sc-now-marker" id="scNowMarker"></div>
+    </div>
+    <div class="sc-ticks">
+      <span>00</span><span>04</span><span>08</span><span>12</span><span>16</span><span>20</span><span>24 UTC</span>
+    </div>
+    <div class="sc-legend">
+      <span><i class="london"></i>London</span>
+      <span><i class="ny"></i>New York</span>
+      <span><i class="overlap"></i>Overlap</span>
+    </div>
+
+    <div class="status-strip" id="statusBar">
+      <span class="status-pill"><span class="status-dot gray"></span>loading system status…</span>
+    </div>
   </div>
 
-  <div class="banner" id="banner">
-    <div class="decision-main">
-      <div class="decision-label">Coordinator Decision</div>
+  <div class="decision-panel" id="decisionPanel">
+    <div class="decision-col">
+      <div class="col-label">Coordinator Decision</div>
       <div class="decision-value" id="decisionValue">—</div>
-    </div>
-    <div class="score-bar-wrap">
       <div class="score-labels"><span>-100</span><span>score</span><span>+100</span></div>
       <div class="score-bar-track">
         <div class="score-bar-mid"></div>
@@ -235,10 +311,24 @@
         <div class="score-thresh" id="threshPos2"></div>
       </div>
       <div class="chips" id="decisionChips"></div>
+      <div class="decision-actions">
+        <button id="decideBtn" class="small">Compute &amp; Save</button>
+        <button id="runAllBtn" class="secondary small">▶ Run All Agents</button>
+      </div>
     </div>
-    <div class="banner-actions">
-      <button id="decideBtn" class="small">Compute &amp; Save Decision</button>
-      <button id="runAllBtn" class="secondary small">▶ Run All Agents</button>
+
+    <div class="decision-arrow">→</div>
+
+    <div class="decision-col risk-col">
+      <div class="risk-head-row">
+        <div class="col-label">Risk Assessment</div>
+        <span class="card-time" id="riskTime"></span>
+      </div>
+      <div id="riskBadge"></div>
+      <div id="riskCardBody"><span class="empty">Loading…</span></div>
+      <div class="card-foot">
+        <button class="secondary small" id="runRisk">Evaluate</button>
+      </div>
     </div>
   </div>
 
@@ -336,7 +426,7 @@ function escapeHtml(s) {
 
 function renderFlags(flags) {
   if (!flags || !flags.length) return '';
-  return `<div class="chips">${flags.map(f => `<span class="chip warn">${escapeHtml(f)}</span>`).join('')}</div>`;
+  return flags.map(f => `<span class="chip warn">${escapeHtml(f)}</span>`).join('');
 }
 
 // ---- Agent card definitions ----
@@ -375,27 +465,75 @@ const AGENT_CARDS = [
 const STALE_AFTER_MINUTES = 30;
 const STALE_ELIGIBLE_AGENTS = new Set(['news', 'macro']);
 
+// Same freshness language used both on each card's header dot and in the
+// System Status strip below. Analysis is webhook-driven (short green
+// window); News/Macro reuse the exact stale-badge threshold; Timing is
+// always computed live so it's always "fresh"; Risk only runs on demand
+// so it's neutral gray regardless of age.
+const ANALYSIS_GREEN_MINUTES = 15;
+const ANALYSIS_RED_MINUTES = 60;
+
+function freshnessDotClass(agentKey, minutes) {
+  if (agentKey === 'risk') return 'gray';
+  if (agentKey === 'timing') return 'green';
+  if (minutes === null || minutes === undefined) return 'red';
+  if (agentKey === 'analysis') {
+    if (minutes < ANALYSIS_GREEN_MINUTES) return 'green';
+    if (minutes < ANALYSIS_RED_MINUTES) return 'orange';
+    return 'red';
+  }
+  return minutes < STALE_AFTER_MINUTES ? 'green' : 'red'; // news/macro
+}
+
+// Reasoning text is clamped to a few lines so every card lands at the
+// same height; "read more" expands just that card's paragraph. State is
+// tracked here (not in the DOM) so it survives the 30s auto-refresh
+// instead of resetting every time the card's HTML is replaced.
+const expandedReasoning = new Set();
+
 function agentCardSkeleton(agent) {
   return `
     <div class="card" id="card-${agent.key}">
       <div class="card-head">
-        <div class="card-title">${agent.icon} ${agent.title}</div>
+        <div class="card-title"><span class="status-dot gray" id="dot-${agent.key}"></span>${agent.icon} ${agent.title}</div>
         <span class="time-wrap"><span class="card-time" id="time-${agent.key}"></span><span id="stale-${agent.key}"></span></span>
       </div>
       <div id="body-${agent.key}"><span class="empty">Loading…</span></div>
       <div class="card-foot">
-        <span id="badge-${agent.key}"></span>
-        ${agent.run ? `<button class="secondary small" id="run-${agent.key}">${agent.runLabel}</button>` : '<span></span>'}
+        ${agent.run ? `<button class="secondary small" id="run-${agent.key}">${agent.runLabel}</button>` : ''}
       </div>
     </div>`;
 }
 
+function toggleReadMore(key) {
+  const el = $('reasoning-' + key);
+  const btn = $('readmore-' + key);
+  if (!el || !btn) return;
+  if (expandedReasoning.has(key)) {
+    expandedReasoning.delete(key);
+    el.classList.add('clamp');
+    btn.textContent = 'اقرأ المزيد';
+  } else {
+    expandedReasoning.add(key);
+    el.classList.remove('clamp');
+    btn.textContent = 'عرض أقل';
+  }
+}
+
 function initGrid() {
   $('agentGrid').innerHTML = AGENT_CARDS.map(agentCardSkeleton).join('');
+  // Event delegation for read-more buttons — cards get replaced wholesale
+  // on every refresh, so a single listener on the stable grid container
+  // avoids re-binding per-card every 30s.
+  $('agentGrid').addEventListener('click', (e) => {
+    const btn = e.target.closest('.read-more');
+    if (btn) toggleReadMore(btn.dataset.key);
+  });
   AGENT_CARDS.forEach(agent => {
     if (agent.run) {
-      $('run-' + agent.key).addEventListener('click', async () => {
-        const btn = $('run-' + agent.key);
+      $('agentGrid').addEventListener('click', async (e) => {
+        if (e.target.id !== 'run-' + agent.key) return;
+        const btn = e.target;
         btn.disabled = true;
         const orig = btn.textContent;
         btn.innerHTML = '<span class="spin"></span>';
@@ -417,16 +555,16 @@ async function refreshAgentCard(agent) {
   const res = await api('GET', agent.fetchPath());
   const cardEl = $('card-' + agent.key);
   const bodyEl = $('body-' + agent.key);
-  const badgeEl = $('badge-' + agent.key);
+  const dotEl = $('dot-' + agent.key);
   const timeEl = $('time-' + agent.key);
   const staleEl = $('stale-' + agent.key);
   if (!res.ok) {
     bodyEl.innerHTML = res.status === 404
       ? `<span class="empty">No opinion stored yet — click Run.</span>`
       : `<div class="err">${escapeHtml((res.data && res.data.detail) || ('error ' + res.status))}</div>`;
-    badgeEl.innerHTML = '';
     timeEl.textContent = '';
     if (staleEl) staleEl.innerHTML = '';
+    if (dotEl) dotEl.className = 'status-dot red';
     cardEl.className = 'card';
     return;
   }
@@ -435,32 +573,45 @@ async function refreshAgentCard(agent) {
   const direction = d.direction || 'neutral';
   const confidence = d.confidence ?? 0;
   cardEl.className = 'card dir-' + dirClass(direction);
-  badgeEl.innerHTML = `<span class="badge ${dirClass(direction)}">${escapeHtml(direction)}</span>`;
+
+  const ageMin = d.timestamp ? (Date.now() - new Date(d.timestamp.replace(' ', 'T')).getTime()) / 60000 : null;
+  if (dotEl) dotEl.className = 'status-dot ' + freshnessDotClass(agent.key, ageMin);
 
   if (staleEl) {
-    let isStale = false;
-    if (STALE_ELIGIBLE_AGENTS.has(agent.key) && d.timestamp) {
-      const ageMin = (Date.now() - new Date(d.timestamp.replace(' ', 'T')).getTime()) / 60000;
-      isStale = ageMin > STALE_AFTER_MINUTES;
-    }
+    const isStale = STALE_ELIGIBLE_AGENTS.has(agent.key) && ageMin !== null && ageMin > STALE_AFTER_MINUTES;
     staleEl.innerHTML = isStale ? `<span class="stale-chip" title="last opinion is over ${STALE_AFTER_MINUTES}m old">stale</span>` : '';
   }
 
-  const confBlock = agent.pureLogic
-    ? `<div class="static-note">منطق مباشر — بدون LLM</div>`
-    : `<div class="conf-row">
-         <div class="conf-track"><div class="conf-fill" style="width:${confidence}%; background:${dirColor(direction)}"></div></div>
-         <div class="conf-num">${confidence}%</div>
+  const badgeConfBlock = agent.pureLogic
+    ? `<div class="badge-conf-row">
+         <span class="badge ${dirClass(direction)}">${escapeHtml(direction)}</span>
+         <div class="static-note">منطق مباشر — بدون LLM</div>
+       </div>`
+    : `<div class="badge-conf-row">
+         <span class="badge ${dirClass(direction)}">${escapeHtml(direction)}</span>
+         <div class="conf-row">
+           <div class="conf-track"><div class="conf-fill" style="width:${confidence}%; background:${dirColor(direction)}"></div></div>
+           <div class="conf-num">${confidence}%</div>
+         </div>
        </div>`;
 
+  const isExpanded = expandedReasoning.has(agent.key);
+  const reasoningText = d.reasoning || (d.key_data && d.key_data.session_label) || '';
+
   bodyEl.innerHTML = `
-    ${confBlock}
-    <div class="reasoning">${escapeHtml(d.reasoning || d.key_data && d.key_data.session_label || '')}</div>
+    ${badgeConfBlock}
     ${renderKeyData(d.key_data)}
-    ${renderFlags(d.flags)}
+    <div class="reasoning-wrap">
+      <div class="reasoning ${isExpanded ? '' : 'clamp'}" id="reasoning-${agent.key}">${escapeHtml(reasoningText)}</div>
+      <button class="read-more" data-key="${agent.key}" id="readmore-${agent.key}">${isExpanded ? 'عرض أقل' : 'اقرأ المزيد'}</button>
+    </div>
+    <div class="card-flags">${renderFlags(d.flags)}</div>
   `;
   if (agent.key === 'analysis') {
     lastAnalysisKeyLevels = (d.key_data && Array.isArray(d.key_data.key_levels)) ? d.key_data.key_levels : [];
+  }
+  if (agent.key === 'timing') {
+    lastTimingData = d;
   }
 }
 
@@ -468,30 +619,15 @@ async function refreshAllAgentCards() {
   await Promise.all(AGENT_CARDS.map(refreshAgentCard));
 }
 
-// ---- System status ----
-// Analysis is webhook-driven (fires per bar), so a short green window;
-// News/Macro run on their own scheduler clock and reuse the exact same
-// 30-minute "stale" threshold as their card badges above, driven by the
-// endpoint's own minutes_since_last_run — not a client-side recompute.
-const ANALYSIS_GREEN_MINUTES = 15;
-const ANALYSIS_RED_MINUTES = 60;
+// ---- System status + Session clock ----
+let lastSystemStatus = null;
+let lastTimingData = null;
 
 function fmtMinutes(mins) {
   if (mins === null || mins === undefined) return 'never';
   if (mins < 1) return 'just now';
   if (mins < 60) return Math.round(mins) + 'm ago';
   return (mins / 60).toFixed(1) + 'h ago';
-}
-
-function statusDotClass(agentKey, minutes) {
-  if (agentKey === 'risk') return 'gray'; // on-demand only, never "stale"
-  if (minutes === null || minutes === undefined) return 'red';
-  if (agentKey === 'analysis') {
-    if (minutes < ANALYSIS_GREEN_MINUTES) return 'green';
-    if (minutes < ANALYSIS_RED_MINUTES) return 'orange';
-    return 'red';
-  }
-  return minutes < STALE_AFTER_MINUTES ? 'green' : 'red'; // news/macro
 }
 
 const STATUS_AGENT_LABELS = { analysis: '📊 Analysis', news: '📰 News', macro: '🌐 Macro', risk: '🛡 Risk' };
@@ -504,9 +640,11 @@ async function refreshSystemStatus() {
   if (!res.ok) {
     alertEl.classList.remove('show');
     barEl.innerHTML = `<span class="status-pill"><span class="status-dot red"></span>status unavailable: ${escapeHtml((res.data && res.data.detail) || 'error ' + res.status)}</span>`;
+    lastSystemStatus = null;
     return;
   }
   const d = res.data;
+  lastSystemStatus = d;
   alertEl.classList.toggle('show', d.scheduler_enabled === false);
 
   const pills = [
@@ -516,10 +654,73 @@ async function refreshSystemStatus() {
   ];
   for (const [key, label] of Object.entries(STATUS_AGENT_LABELS)) {
     const info = d.agents[key] || {};
-    const cls = statusDotClass(key, info.minutes_since_last_run);
+    const cls = freshnessDotClass(key, info.minutes_since_last_run);
     pills.push(`<span class="status-pill"><span class="status-dot ${cls}"></span>${label} <b>${fmtMinutes(info.minutes_since_last_run)}</b></span>`);
   }
   barEl.innerHTML = pills.join('');
+}
+
+function mod24h(min) { return ((min % 1440) + 1440) % 1440; }
+function pctOfDay(min) { return (min / 1440) * 100; }
+
+function positionBand(el, startMin, endMin) {
+  if (!el) return;
+  if (endMin < startMin) endMin += 1440; // guard against a midnight wrap
+  el.style.left = pctOfDay(startMin) + '%';
+  el.style.width = pctOfDay(endMin - startMin) + '%';
+}
+
+// Session windows are defined in each city's own local time (see
+// timing_agent.py: London 08:00-16:30, NY 08:00-17:00). To draw them on
+// one UTC-based 24h track we derive today's UTC offset for each city by
+// comparing the localized time strings /timing/now already returns
+// against the server's UTC clock — good enough for a visual aid, no
+// timezone library needed client-side.
+function renderSessionClock() {
+  const kd = lastTimingData && lastTimingData.key_data;
+  const utcIso = lastSystemStatus && lastSystemStatus.server_time_utc;
+  if (!kd || !utcIso || !kd.london_local_time || !kd.ny_local_time) return;
+
+  const utcDate = new Date(utcIso);
+  const utcMin = utcDate.getUTCHours() * 60 + utcDate.getUTCMinutes();
+
+  function offsetMinutes(localStr) {
+    const [hh, mm] = localStr.split(' ')[0].split(':').map(Number);
+    let diff = (hh * 60 + mm) - utcMin;
+    if (diff > 720) diff -= 1440;
+    if (diff < -720) diff += 1440;
+    return diff;
+  }
+
+  const londonOffset = offsetMinutes(kd.london_local_time);
+  const nyOffset = offsetMinutes(kd.ny_local_time);
+
+  const londonStart = mod24h(8 * 60 - londonOffset);
+  const londonEnd = mod24h(16 * 60 + 30 - londonOffset);
+  const nyStart = mod24h(8 * 60 - nyOffset);
+  const nyEnd = mod24h(17 * 60 - nyOffset);
+
+  positionBand($('scLondon'), londonStart, londonEnd);
+  positionBand($('scNY'), nyStart, nyEnd);
+
+  const overlapStart = Math.max(londonStart, nyStart);
+  const overlapEnd = Math.min(londonEnd, nyEnd);
+  const overlapEl = $('scOverlap');
+  if (overlapEl) {
+    if (overlapEnd > overlapStart) {
+      overlapEl.style.display = 'block';
+      positionBand(overlapEl, overlapStart, overlapEnd);
+    } else {
+      overlapEl.style.display = 'none';
+    }
+  }
+
+  const marker = $('scNowMarker');
+  if (marker) marker.style.left = pctOfDay(utcMin) + '%';
+
+  const hh = String(utcDate.getUTCHours()).padStart(2, '0');
+  const mm = String(utcDate.getUTCMinutes()).padStart(2, '0');
+  $('scNowLabel').textContent = `${(kd.session_label || '').replace(/_/g, ' ')} · ${hh}:${mm} UTC`;
 }
 
 // ---- Candlestick chart (5m only, per lightweight-charts) ----
@@ -534,19 +735,19 @@ function initChart() {
   const container = $('chartContainer');
   candleChart = LightweightCharts.createChart(container, {
     width: container.clientWidth,
-    height: 340,
-    layout: { background: { color: 'transparent' }, textColor: '#8b98a8' },
+    height: 360,
+    layout: { background: { color: 'transparent' }, textColor: '#8B93A7', fontFamily: 'JetBrains Mono, monospace' },
     grid: {
-      vertLines: { color: 'rgba(35,45,58,0.6)' },
-      horzLines: { color: 'rgba(35,45,58,0.6)' },
+      vertLines: { color: 'rgba(38,47,64,0.6)' },
+      horzLines: { color: 'rgba(38,47,64,0.6)' },
     },
-    rightPriceScale: { borderColor: '#232d3a' },
-    timeScale: { borderColor: '#232d3a', timeVisible: true, secondsVisible: false },
+    rightPriceScale: { borderColor: '#262F40' },
+    timeScale: { borderColor: '#262F40', timeVisible: true, secondsVisible: false },
     crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
   });
   candleSeries = candleChart.addCandlestickSeries({
-    upColor: '#22c55e', downColor: '#ef4444', borderVisible: false,
-    wickUpColor: '#22c55e', wickDownColor: '#ef4444',
+    upColor: '#5FBF8F', downColor: '#E0785C', borderVisible: false,
+    wickUpColor: '#5FBF8F', wickDownColor: '#E0785C',
   });
   // Re-place the custom key-level labels whenever the visible range (and
   // therefore the auto-scaled price axis) changes, so they track the
@@ -596,7 +797,7 @@ function updateKeyLevelLines(levels) {
       currentKeyLevelPrices.push(num);
       keyLevelLines.push(candleSeries.createPriceLine({
         price: num,
-        color: 'rgba(148,163,184,0.55)',
+        color: 'rgba(212,168,87,0.55)',
         lineWidth: 1,
         lineStyle: LightweightCharts.LineStyle.Dashed,
         // The built-in axis label collides with the candle price scale —
@@ -632,7 +833,7 @@ async function refreshChart() {
   $('chartTime').textContent = `${candles.length} bars · last ${fmtAgo(bars[bars.length - 1].timestamp)}`;
 }
 
-// ---- Decision banner ----
+// ---- Decision + Risk panel ----
 function setScoreBar(score, threshold) {
   score = Math.max(-100, Math.min(100, score));
   const pct = (score + 100) / 2; // 0..100
@@ -655,8 +856,8 @@ async function refreshDecisionLive() {
   const symbol = symbolEl.value, timeframe = timeframeEl.value;
   $('symTfLabel').textContent = `— ${symbol} / ${timeframe}`;
   const res = await api('GET', `/coordinator/decide?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&persist=false`);
-  const banner = $('banner');
-  banner.classList.remove('bull', 'bear');
+  const panel = $('decisionPanel');
+  panel.classList.remove('bull', 'bear');
   if (!res.ok) {
     $('decisionValue').textContent = 'error';
     $('decisionValue').className = 'decision-value';
@@ -667,8 +868,8 @@ async function refreshDecisionLive() {
   const d = res.data;
   $('decisionValue').textContent = d.decision;
   $('decisionValue').className = 'decision-value ' + d.decision;
-  if (d.decision === 'enter_long') banner.classList.add('bull');
-  if (d.decision === 'enter_short') banner.classList.add('bear');
+  if (d.decision === 'enter_long') panel.classList.add('bull');
+  if (d.decision === 'enter_short') panel.classList.add('bear');
   setScoreBar(d.score, d.threshold);
   const chips = [];
   chips.push(`<span class="chip">score ${d.score}</span>`);
@@ -682,19 +883,19 @@ async function refreshDecisionLive() {
 async function refreshRisk() {
   const symbol = symbolEl.value, timeframe = timeframeEl.value;
   const res = await api('GET', `/agents/risk/evaluate?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}`);
-  const el = document.getElementById('riskCardBody');
-  if (!el) return;
+  const el = $('riskCardBody');
   if (!res.ok) {
-    document.getElementById('riskBadge').innerHTML = '';
+    $('riskBadge').innerHTML = '';
     el.innerHTML = res.status === 404
-      ? `<span class="empty">No saved decision yet — click "Compute &amp; Save Decision" first.</span>`
+      ? `<span class="empty">No saved decision yet — click "Compute &amp; Save" first.</span>`
       : `<div class="err">${escapeHtml((res.data && res.data.detail) || ('error ' + res.status))}</div>`;
+    $('riskTime').textContent = '';
     return;
   }
   const risk = res.data.risk_opinion;
   const basedOn = res.data.coordinator_decision;
-  document.getElementById('riskTime').textContent = fmtAgo(risk.timestamp);
-  document.getElementById('riskBadge').innerHTML = `<span class="badge ${risk.decision}">${escapeHtml(risk.decision)}</span>`;
+  $('riskTime').textContent = fmtAgo(risk.timestamp);
+  $('riskBadge').innerHTML = `<span class="badge ${risk.decision}">${escapeHtml(risk.decision)}</span>`;
   el.innerHTML = `
     <div class="reasoning">${escapeHtml(risk.reasoning)}</div>
     <div class="kv">
@@ -702,7 +903,7 @@ async function refreshRisk() {
       <div><span>based on decision</span><b>${escapeHtml(basedOn.decision)} @ ${fmtAgo(basedOn.timestamp)}</b></div>
     </div>
     ${renderKeyData(risk.key_data)}
-    ${renderFlags(risk.flags)}
+    <div class="card-flags">${renderFlags(risk.flags)}</div>
   `;
 }
 
@@ -726,38 +927,13 @@ async function refreshHistory() {
   `).join('');
 }
 
-// Inject Risk card as a 5th card in the grid (kept separate from AGENT_CARDS
-// since its data model — decision/size/reasoning — differs from the four
-// opinion agents above).
-function injectRiskCard() {
-  const grid = $('agentGrid');
-  const div = document.createElement('div');
-  div.className = 'card';
-  div.innerHTML = `
-    <div class="card-head">
-      <div class="card-title">🛡 Risk</div>
-      <span class="card-time" id="riskTime"></span>
-    </div>
-    <div id="riskCardBody"><span class="empty">Loading…</span></div>
-    <div class="card-foot">
-      <span id="riskBadge"></span>
-      <button class="secondary small" id="runRisk">Evaluate</button>
-    </div>
-  `;
-  grid.appendChild(div);
-  document.getElementById('runRisk').addEventListener('click', async () => {
-    const btn = document.getElementById('runRisk');
-    btn.disabled = true;
-    await refreshRisk();
-    btn.disabled = false;
-  });
-}
-
 async function refreshAll() {
-  // Agent cards first: refreshChart reads lastAnalysisKeyLevels, which
-  // the analysis card's fetch sets as a side effect.
+  // Agent cards first: refreshChart / renderSessionClock read data
+  // (lastAnalysisKeyLevels, lastTimingData) that the card fetches set as
+  // a side effect.
   await refreshAllAgentCards();
   await Promise.all([refreshDecisionLive(), refreshRisk(), refreshHistory(), refreshChart(), refreshSystemStatus()]);
+  renderSessionClock();
   $('lastUpdated').textContent = 'updated ' + new Date().toLocaleTimeString();
 }
 
@@ -789,6 +965,13 @@ $('runAllBtn').addEventListener('click', async () => {
   btn.disabled = false;
 });
 
+$('runRisk').addEventListener('click', async () => {
+  const btn = $('runRisk');
+  btn.disabled = true;
+  await refreshRisk();
+  btn.disabled = false;
+});
+
 [symbolEl, timeframeEl, apiBaseEl].forEach(el => el.addEventListener('change', refreshAll));
 
 let autoTimer = null;
@@ -803,7 +986,6 @@ $('autoRefresh').addEventListener('change', setupAutoRefresh);
 // ---- boot ----
 initChart();
 initGrid();
-injectRiskCard();
 refreshAll();
 setupAutoRefresh();
 </script>
