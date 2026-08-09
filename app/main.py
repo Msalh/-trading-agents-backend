@@ -25,6 +25,11 @@ Sprint 6: added the Coordinator — pure aggregation (no LLM call of
 its own) that combines the four agents' latest opinions into a
 weighted score and a preliminary decision.
 
+Sprint 7: added the Risk Agent — deterministic risk math (no LLM,
+same reasoning as Timing), holding full veto over the Coordinator's
+decision: approve / modify (smaller size) / reject. Account state is
+static/manual for now via environment variables.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -40,6 +45,7 @@ from app.coordinator import compute_decision
 from app.macro_agent import MacroAgentError, run_macro
 from app.models import MarketStateOut, MarketStatePayload, WebhookAck
 from app.news_agent import NewsAgentError, run_news
+from app.risk_agent import evaluate_risk
 from app.scheduler import (
     MACRO_SYMBOL,
     MACRO_TIMEFRAME,
@@ -277,6 +283,39 @@ def coordinator_history(
     limit: int = Query(default=20, le=200),
 ) -> list[dict]:
     return get_recent_decisions(symbol=symbol, timeframe=timeframe, limit=limit)
+
+
+@app.get("/agents/risk/evaluate")
+def risk_evaluate(
+    symbol: str = Query(...),
+    timeframe: str = Query(...),
+) -> dict:
+    recent_decisions = get_recent_decisions(symbol=symbol, timeframe=timeframe, limit=1)
+    if not recent_decisions:
+        raise HTTPException(
+            status_code=404,
+            detail="no Coordinator decision stored yet — call /coordinator/decide first",
+        )
+    latest_decision = recent_decisions[0]
+    latest_bar = get_latest(symbol=symbol, timeframe=timeframe)
+
+    risk_opinion = evaluate_risk(
+        symbol=symbol,
+        timeframe=timeframe,
+        coordinator_decision=latest_decision,
+        latest_bar=latest_bar,
+    )
+    save_opinion(
+        agent="risk",
+        symbol=symbol,
+        timeframe=timeframe,
+        timestamp=risk_opinion.timestamp,
+        opinion=risk_opinion.to_dict(),
+    )
+    return {
+        "coordinator_decision": latest_decision,
+        "risk_opinion": risk_opinion.to_dict(),
+    }
 
 
 @app.get("/market-state/latest", response_model=MarketStateOut)
