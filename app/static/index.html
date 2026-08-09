@@ -98,10 +98,20 @@
   .chart-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
   .chart-head .card-title { font-weight: 600; font-size: 13px; }
   .chart-head .card-time { font-size: 10px; color: var(--muted); }
-  #chartContainer { height: 340px; position: relative; }
+  #chartContainer { height: 340px; position: relative; overflow: hidden; }
   #chartEmpty {
     position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
     color: var(--muted); font-size: 12.5px; font-style: italic; pointer-events: none;
+  }
+  /* Custom key-level labels, deliberately separate from the chart's own
+     right-side price axis (axisLabelVisible:false on those price lines)
+     so they never collide with the candle price numbers. */
+  #keyLevelLabels { position: absolute; inset: 0; pointer-events: none; z-index: 2; }
+  .key-level-label {
+    position: absolute; left: 6px; transform: translateY(-50%);
+    background: rgba(23,31,42,0.88); color: #b7c2cf; font-size: 10px; font-weight: 500;
+    padding: 1px 6px; border-radius: 3px; border: 1px solid rgba(148,163,184,0.3);
+    white-space: nowrap;
   }
 
   /* grid of agent cards */
@@ -110,9 +120,18 @@
     background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
     padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; min-height: 160px;
   }
+  /* Same bullish/bearish/neutral logic as the confidence bar and badge,
+     applied as a light tint on the card itself. */
+  .card.dir-bullish { border-color: rgba(34,197,94,0.35); background: linear-gradient(180deg, rgba(34,197,94,0.07), transparent 90px), var(--panel); }
+  .card.dir-bearish { border-color: rgba(239,68,68,0.35); background: linear-gradient(180deg, rgba(239,68,68,0.07), transparent 90px), var(--panel); }
   .card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
   .card-title { font-weight: 600; font-size: 13px; display: flex; align-items: center; gap: 6px; }
   .card-time { font-size: 10px; color: var(--muted); }
+  .time-wrap { display: flex; align-items: center; gap: 5px; }
+  .stale-chip {
+    font-size: 9px; font-weight: 700; padding: 1px 6px; border-radius: 999px;
+    background: rgba(245,158,11,0.15); color: var(--warn); text-transform: uppercase; letter-spacing: .03em;
+  }
   .badge {
     font-size: 11px; font-weight: 700; padding: 3px 9px; border-radius: 999px; text-transform: uppercase; letter-spacing: .03em;
   }
@@ -122,9 +141,13 @@
   .badge.modify { background: rgba(245,158,11,0.12); color: var(--warn); }
   .conf-row { display: flex; align-items: center; gap: 8px; }
   .conf-track { flex: 1; height: 6px; background: var(--panel-2); border-radius: 3px; overflow: hidden; }
-  .conf-fill { height: 100%; background: var(--accent); }
+  .conf-fill { height: 100%; background: var(--neutral); }
   .conf-num { font-size: 11px; color: var(--muted); width: 32px; text-align: right; }
   .reasoning { font-size: 12.5px; color: #c3ccd6; flex: 1; }
+  .static-note {
+    font-size: 11px; color: var(--muted); font-style: italic; background: var(--panel-2);
+    border-radius: 6px; padding: 5px 8px; width: fit-content;
+  }
   .kv { display: flex; flex-direction: column; gap: 3px; font-size: 11.5px; }
   .kv div { display: flex; justify-content: space-between; gap: 8px; color: var(--muted); }
   .kv div b { color: var(--text); font-weight: 500; text-align: right; }
@@ -198,7 +221,10 @@
       <div class="card-title">🕯 MNQ1! · 5m</div>
       <span class="card-time" id="chartTime"></span>
     </div>
-    <div id="chartContainer"><span id="chartEmpty">Loading candles…</span></div>
+    <div id="chartContainer">
+      <span id="chartEmpty">Loading candles…</span>
+      <div id="keyLevelLabels"></div>
+    </div>
   </div>
 
   <div class="grid" id="agentGrid"></div>
@@ -256,8 +282,14 @@ function dirClass(direction) {
   return 'neutral';
 }
 
-function confColor(conf) {
-  return conf >= 60 ? 'var(--accent)' : (conf >= 30 ? 'var(--warn)' : 'var(--muted)');
+// Confidence bar / card tint color: driven by direction, not by the
+// confidence number — bullish is always green, bearish always red,
+// so two bullish agents (e.g. News and Macro) read as visually consistent
+// instead of differing by whatever their raw confidence happens to be.
+function dirColor(direction) {
+  if (direction === 'bullish') return 'var(--bull)';
+  if (direction === 'bearish') return 'var(--bear)';
+  return 'var(--neutral)';
 }
 
 function renderKeyData(obj) {
@@ -306,15 +338,23 @@ const AGENT_CARDS = [
     fetchPath: () => `/timing/now`,
     runLabel: null, run: null,
     unwrap: (d) => d,
+    pureLogic: true, // no LLM — render a static note instead of a confidence bar
   },
 ];
+
+// Agents whose latest opinion is time-based (News/Macro run on their own
+// scheduler, not the webhook), so a stale opinion means the scheduler
+// might be behind — worth flagging independent of whatever "stale_data"
+// flag the agent itself may or may not have set on that particular call.
+const STALE_AFTER_MINUTES = 30;
+const STALE_ELIGIBLE_AGENTS = new Set(['news', 'macro']);
 
 function agentCardSkeleton(agent) {
   return `
     <div class="card" id="card-${agent.key}">
       <div class="card-head">
         <div class="card-title">${agent.icon} ${agent.title}</div>
-        <span class="card-time" id="time-${agent.key}"></span>
+        <span class="time-wrap"><span class="card-time" id="time-${agent.key}"></span><span id="stale-${agent.key}"></span></span>
       </div>
       <div id="body-${agent.key}"><span class="empty">Loading…</span></div>
       <div class="card-foot">
@@ -349,27 +389,46 @@ function initGrid() {
 
 async function refreshAgentCard(agent) {
   const res = await api('GET', agent.fetchPath());
+  const cardEl = $('card-' + agent.key);
   const bodyEl = $('body-' + agent.key);
   const badgeEl = $('badge-' + agent.key);
   const timeEl = $('time-' + agent.key);
+  const staleEl = $('stale-' + agent.key);
   if (!res.ok) {
     bodyEl.innerHTML = res.status === 404
       ? `<span class="empty">No opinion stored yet — click Run.</span>`
       : `<div class="err">${escapeHtml((res.data && res.data.detail) || ('error ' + res.status))}</div>`;
     badgeEl.innerHTML = '';
     timeEl.textContent = '';
+    if (staleEl) staleEl.innerHTML = '';
+    cardEl.className = 'card';
     return;
   }
   const d = agent.unwrap(res.data);
   timeEl.textContent = fmtAgo(d.timestamp);
   const direction = d.direction || 'neutral';
   const confidence = d.confidence ?? 0;
+  cardEl.className = 'card dir-' + dirClass(direction);
   badgeEl.innerHTML = `<span class="badge ${dirClass(direction)}">${escapeHtml(direction)}</span>`;
+
+  if (staleEl) {
+    let isStale = false;
+    if (STALE_ELIGIBLE_AGENTS.has(agent.key) && d.timestamp) {
+      const ageMin = (Date.now() - new Date(d.timestamp.replace(' ', 'T')).getTime()) / 60000;
+      isStale = ageMin > STALE_AFTER_MINUTES;
+    }
+    staleEl.innerHTML = isStale ? `<span class="stale-chip" title="last opinion is over ${STALE_AFTER_MINUTES}m old">stale</span>` : '';
+  }
+
+  const confBlock = agent.pureLogic
+    ? `<div class="static-note">منطق مباشر — بدون LLM</div>`
+    : `<div class="conf-row">
+         <div class="conf-track"><div class="conf-fill" style="width:${confidence}%; background:${dirColor(direction)}"></div></div>
+         <div class="conf-num">${confidence}%</div>
+       </div>`;
+
   bodyEl.innerHTML = `
-    <div class="conf-row">
-      <div class="conf-track"><div class="conf-fill" style="width:${confidence}%; background:${confColor(confidence)}"></div></div>
-      <div class="conf-num">${confidence}%</div>
-    </div>
+    ${confBlock}
     <div class="reasoning">${escapeHtml(d.reasoning || d.key_data && d.key_data.session_label || '')}</div>
     ${renderKeyData(d.key_data)}
     ${renderFlags(d.flags)}
@@ -388,6 +447,7 @@ const CHART_TIMEFRAME = '5m';
 let candleChart = null;
 let candleSeries = null;
 let keyLevelLines = [];
+let currentKeyLevelPrices = [];
 let lastAnalysisKeyLevels = [];
 
 function initChart() {
@@ -408,31 +468,65 @@ function initChart() {
     upColor: '#22c55e', downColor: '#ef4444', borderVisible: false,
     wickUpColor: '#22c55e', wickDownColor: '#ef4444',
   });
+  // Re-place the custom key-level labels whenever the visible range (and
+  // therefore the auto-scaled price axis) changes, so they track the
+  // lines instead of drifting after a pan/zoom.
+  candleChart.timeScale().subscribeVisibleLogicalRangeChange(renderKeyLevelLabels);
   window.addEventListener('resize', () => {
     candleChart.applyOptions({ width: container.clientWidth });
+    renderKeyLevelLabels();
+  });
+}
+
+// Positions the custom labels via priceToCoordinate — separate from
+// updateKeyLevelLines so it can be re-run on pan/zoom/resize without
+// touching the price lines themselves.
+function renderKeyLevelLabels() {
+  const labelsContainer = $('keyLevelLabels');
+  const chartContainer = $('chartContainer');
+  if (!candleSeries || !labelsContainer || !chartContainer) return;
+  const height = chartContainer.clientHeight;
+  labelsContainer.innerHTML = '';
+  currentKeyLevelPrices.forEach(price => {
+    const y = candleSeries.priceToCoordinate(price);
+    // Skip levels the chart hasn't scrolled/scaled into view — the price
+    // line itself still exists on the series, just off-screen for now.
+    if (y === null || y === undefined || y < 0 || y > height) return;
+    const label = document.createElement('div');
+    label.className = 'key-level-label';
+    label.style.top = y + 'px';
+    label.textContent = price.toFixed(2);
+    labelsContainer.appendChild(label);
   });
 }
 
 function updateKeyLevelLines(levels) {
   keyLevelLines.forEach(line => candleSeries.removePriceLine(line));
   keyLevelLines = [];
-  if (!levels || !levels.length) return;
-  // Dedupe near-identical levels so the chart isn't cluttered with
-  // overlapping labels for prices that round to the same line.
-  const seen = new Set();
-  levels.forEach(level => {
-    const key = Number(level).toFixed(2);
-    if (seen.has(key)) return;
-    seen.add(key);
-    keyLevelLines.push(candleSeries.createPriceLine({
-      price: Number(level),
-      color: 'rgba(148,163,184,0.55)',
-      lineWidth: 1,
-      lineStyle: LightweightCharts.LineStyle.Dashed,
-      axisLabelVisible: true,
-      title: key,
-    }));
-  });
+  currentKeyLevelPrices = [];
+  if (levels && levels.length) {
+    // Dedupe near-identical levels so the chart isn't cluttered with
+    // overlapping lines/labels for prices that round to the same value.
+    const seen = new Set();
+    levels.forEach(level => {
+      const num = Number(level);
+      const key = num.toFixed(2);
+      if (seen.has(key)) return;
+      seen.add(key);
+      currentKeyLevelPrices.push(num);
+      keyLevelLines.push(candleSeries.createPriceLine({
+        price: num,
+        color: 'rgba(148,163,184,0.55)',
+        lineWidth: 1,
+        lineStyle: LightweightCharts.LineStyle.Dashed,
+        // The built-in axis label collides with the candle price scale —
+        // we draw our own label (see renderKeyLevelLabels) on the left
+        // edge of the chart instead, fully separate from that axis.
+        axisLabelVisible: false,
+      }));
+    });
+  }
+  renderKeyLevelLabels();
 }
 
 async function refreshChart() {
