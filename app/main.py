@@ -18,6 +18,9 @@ Sprint 4: added the News Agent (uses Claude's hosted web_search tool
 scheduler (APScheduler, in-process) that runs it on its own clock,
 decoupled from the webhook that drives Analysis.
 
+Sprint 5: added the Macro/Correlation Agent (DXY, US10Y, SPX/NDX),
+same web_search pattern as News, sharing the same scheduler.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -29,9 +32,17 @@ from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import JSONResponse
 
 from app.analysis_agent import AnalysisAgentError, run_analysis
+from app.macro_agent import MacroAgentError, run_macro
 from app.models import MarketStateOut, MarketStatePayload, WebhookAck
 from app.news_agent import NewsAgentError, run_news
-from app.scheduler import NEWS_SYMBOL, NEWS_TIMEFRAME, start_scheduler, stop_scheduler
+from app.scheduler import (
+    MACRO_SYMBOL,
+    MACRO_TIMEFRAME,
+    NEWS_SYMBOL,
+    NEWS_TIMEFRAME,
+    start_scheduler,
+    stop_scheduler,
+)
 from app.storage import (
     get_latest,
     get_latest_opinion,
@@ -203,6 +214,35 @@ def read_latest_news(
     opinion = get_latest_opinion(agent="news", symbol=symbol, timeframe=NEWS_TIMEFRAME)
     if opinion is None:
         raise HTTPException(status_code=404, detail="no news opinion stored yet")
+    return opinion
+
+
+@app.post("/agents/macro/run")
+def trigger_macro(
+    symbol: str = Query(default=MACRO_SYMBOL),
+) -> dict:
+    try:
+        opinion = run_macro(symbol=symbol)
+    except MacroAgentError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    save_opinion(
+        agent="macro",
+        symbol=symbol,
+        timeframe=MACRO_TIMEFRAME,
+        timestamp=opinion.timestamp,
+        opinion=opinion.to_dict(),
+    )
+    return {"opinion": opinion.to_dict()}
+
+
+@app.get("/agents/macro/latest")
+def read_latest_macro(
+    symbol: str = Query(default=MACRO_SYMBOL),
+) -> dict:
+    opinion = get_latest_opinion(agent="macro", symbol=symbol, timeframe=MACRO_TIMEFRAME)
+    if opinion is None:
+        raise HTTPException(status_code=404, detail="no macro opinion stored yet")
     return opinion
 
 
