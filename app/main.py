@@ -38,6 +38,10 @@ Sprint 9: added the dashboard itself — a single static HTML page
 (app/static/index.html) served from this same FastAPI app at
 /dashboard, reading every agent/coordinator/risk endpoint above.
 
+Sprint 10: added /system/status (server time, scheduler config, last
+webhook/agent-run timestamps) plus a tests/ suite for the Coordinator
+and Risk Agent and an API_REFERENCE.md.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -65,6 +69,8 @@ from app.scheduler import (
     stop_scheduler,
 )
 from app.storage import (
+    get_last_opinion_timestamps,
+    get_last_webhook_received,
     get_latest,
     get_latest_opinion,
     get_recent,
@@ -114,6 +120,43 @@ def _startup() -> None:
 @app.on_event("shutdown")
 def _shutdown() -> None:
     stop_scheduler()
+
+
+def _minutes_since(sqlite_datetime: str | None) -> float | None:
+    """SQLite's datetime('now') stores UTC as 'YYYY-MM-DD HH:MM:SS'
+    (no timezone suffix). Parse it as UTC and return minutes elapsed."""
+    if not sqlite_datetime:
+        return None
+    dt = datetime.strptime(sqlite_datetime, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    delta = datetime.now(timezone.utc) - dt
+    return round(delta.total_seconds() / 60, 1)
+
+
+@app.get("/system/status")
+def system_status(symbol: str = Query(default=NEWS_SYMBOL)) -> dict:
+    scheduler_enabled = os.environ.get("ENABLE_SCHEDULER", "false").lower() == "true"
+    last_runs = get_last_opinion_timestamps(symbol=symbol)
+    last_webhook = get_last_webhook_received(symbol=symbol)
+
+    agents = {}
+    for agent in ("analysis", "news", "macro", "risk"):
+        last_run = last_runs.get(agent)
+        agents[agent] = {
+            "last_run": last_run,
+            "minutes_since_last_run": _minutes_since(last_run),
+        }
+
+    return {
+        "server_time_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "scheduler_enabled": scheduler_enabled,
+        "scheduler_intervals_minutes": {
+            "news": int(os.environ.get("NEWS_INTERVAL_MINUTES", "20")),
+            "macro": int(os.environ.get("MACRO_INTERVAL_MINUTES", "20")),
+        },
+        "last_webhook_received": last_webhook,
+        "minutes_since_last_webhook": _minutes_since(last_webhook),
+        "agents": agents,
+    }
 
 
 @app.get("/")

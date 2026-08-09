@@ -184,6 +184,43 @@ def save_decision(symbol: str, timeframe: str, timestamp: str, decision: dict) -
         conn.close()
 
 
+def get_last_opinion_timestamps(symbol: str) -> dict:
+    """Returns the created_at time of the most recent opinion for
+    each agent, keyed by agent name. Used by the system status
+    endpoint — doesn't care about symbol/timeframe matching exactly,
+    just wants a quick health signal per agent."""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT agent, MAX(created_at) as last_run
+            FROM agent_opinions
+            WHERE symbol = ?
+            GROUP BY agent
+            """,
+            (symbol,),
+        ).fetchall()
+        return {r["agent"]: r["last_run"] for r in rows}
+    finally:
+        conn.close()
+
+
+def get_last_webhook_received(symbol: str) -> Optional[str]:
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            """
+            SELECT MAX(received_at) as last_received
+            FROM market_state
+            WHERE symbol = ?
+            """,
+            (symbol,),
+        ).fetchone()
+        return row["last_received"] if row else None
+    finally:
+        conn.close()
+
+
 def get_recent_decisions(symbol: str, timeframe: str, limit: int = 20) -> list[dict]:
     conn = get_connection()
     try:
