@@ -19,6 +19,8 @@ from datetime import datetime, timezone
 
 import anthropic
 
+from app.text_utils import clean_opinion_text_fields
+
 MODEL = "claude-sonnet-5"
 
 SYSTEM_PROMPT = """You track news and the economic calendar relevant to Nasdaq/tech and US macro data (Fed, CPI, NFP, jobless claims, PCE, and similar releases).
@@ -118,6 +120,7 @@ def run_news(symbol: str) -> NewsOpinion:
         raise NewsAgentError("model returned no text content (only tool-use blocks)")
 
     parsed = _parse_response(raw_text)
+    parsed = clean_opinion_text_fields(parsed)
 
     required = {"direction", "confidence", "reasoning", "key_data", "flags"}
     missing = required - parsed.keys()

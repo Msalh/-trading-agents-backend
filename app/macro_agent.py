@@ -14,6 +14,8 @@ from datetime import datetime, timezone
 
 import anthropic
 
+from app.text_utils import clean_opinion_text_fields
+
 MODEL = "claude-sonnet-5"
 
 SYSTEM_PROMPT = """You monitor the broader macro context relevant to Nasdaq-100 futures (NQ/MNQ): the US Dollar Index (DXY), US 10-Year Treasury yields, and the correlation/behavior between SPX and NDX (Nasdaq-100).
@@ -111,6 +113,7 @@ def run_macro(symbol: str) -> MacroOpinion:
         raise MacroAgentError("model returned no text content (only tool-use blocks)")
 
     parsed = _parse_response(raw_text)
+    parsed = clean_opinion_text_fields(parsed)
 
     required = {"direction", "confidence", "reasoning", "key_data", "flags"}
     missing = required - parsed.keys()
