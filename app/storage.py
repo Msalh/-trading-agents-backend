@@ -46,6 +46,17 @@ CREATE TABLE IF NOT EXISTS agent_opinions (
 );
 CREATE INDEX IF NOT EXISTS idx_agent_symbol_timeframe_ts
     ON agent_opinions (agent, symbol, timeframe, timestamp DESC);
+
+CREATE TABLE IF NOT EXISTS coordinator_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    timeframe TEXT NOT NULL,
+    timestamp TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    decision_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_decisions_symbol_timeframe_ts
+    ON coordinator_decisions (symbol, timeframe, timestamp DESC);
 """
 
 
@@ -154,5 +165,37 @@ def get_latest_opinion(agent: str, symbol: str, timeframe: str) -> Optional[dict
             (agent, symbol, timeframe),
         ).fetchone()
         return json.loads(row["opinion_json"]) if row else None
+    finally:
+        conn.close()
+
+
+def save_decision(symbol: str, timeframe: str, timestamp: str, decision: dict) -> None:
+    conn = get_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO coordinator_decisions (symbol, timeframe, timestamp, decision_json)
+            VALUES (?, ?, ?, ?)
+            """,
+            (symbol, timeframe, timestamp, json.dumps(decision)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_recent_decisions(symbol: str, timeframe: str, limit: int = 20) -> list[dict]:
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT decision_json FROM coordinator_decisions
+            WHERE symbol = ? AND timeframe = ?
+            ORDER BY timestamp DESC, id DESC
+            LIMIT ?
+            """,
+            (symbol, timeframe, limit),
+        ).fetchall()
+        return [json.loads(r["decision_json"]) for r in rows]
     finally:
         conn.close()

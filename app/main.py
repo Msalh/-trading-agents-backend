@@ -21,6 +21,10 @@ decoupled from the webhook that drives Analysis.
 Sprint 5: added the Macro/Correlation Agent (DXY, US10Y, SPX/NDX),
 same web_search pattern as News, sharing the same scheduler.
 
+Sprint 6: added the Coordinator — pure aggregation (no LLM call of
+its own) that combines the four agents' latest opinions into a
+weighted score and a preliminary decision.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -32,6 +36,7 @@ from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import JSONResponse
 
 from app.analysis_agent import AnalysisAgentError, run_analysis
+from app.coordinator import compute_decision
 from app.macro_agent import MacroAgentError, run_macro
 from app.models import MarketStateOut, MarketStatePayload, WebhookAck
 from app.news_agent import NewsAgentError, run_news
@@ -47,7 +52,9 @@ from app.storage import (
     get_latest,
     get_latest_opinion,
     get_recent,
+    get_recent_decisions,
     init_db,
+    save_decision,
     save_event,
     save_opinion,
 )
@@ -244,6 +251,32 @@ def read_latest_macro(
     if opinion is None:
         raise HTTPException(status_code=404, detail="no macro opinion stored yet")
     return opinion
+
+
+@app.get("/coordinator/decide")
+def coordinator_decide(
+    symbol: str = Query(...),
+    timeframe: str = Query(...),
+    persist: bool = Query(default=True, description="store this decision in the history log"),
+) -> dict:
+    decision = compute_decision(symbol=symbol, timeframe=timeframe)
+    if persist:
+        save_decision(
+            symbol=symbol,
+            timeframe=timeframe,
+            timestamp=decision.timestamp,
+            decision=decision.to_dict(),
+        )
+    return decision.to_dict()
+
+
+@app.get("/coordinator/history")
+def coordinator_history(
+    symbol: str = Query(...),
+    timeframe: str = Query(...),
+    limit: int = Query(default=20, le=200),
+) -> list[dict]:
+    return get_recent_decisions(symbol=symbol, timeframe=timeframe, limit=limit)
 
 
 @app.get("/market-state/latest", response_model=MarketStateOut)
