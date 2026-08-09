@@ -30,6 +30,10 @@ same reasoning as Timing), holding full veto over the Coordinator's
 decision: approve / modify (smaller size) / reject. Account state is
 static/manual for now via environment variables.
 
+Sprint 8: added CORS support so the dashboard (a browser-based page,
+running on a different origin than this API) can call these
+endpoints directly.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -38,6 +42,7 @@ import os
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.analysis_agent import AnalysisAgentError, run_analysis
@@ -69,6 +74,19 @@ from app.timing_agent import evaluate_timing, should_run_analysis
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 
 app = FastAPI(title="Trading Agents Backend", version="0.1.0")
+
+# The dashboard is a static page served from a different origin than
+# this API (e.g. an artifact preview, or later a proper static host).
+# Read-only GET endpoints, no cookies/session auth involved — allowing
+# any origin is acceptable here. Tighten to specific origins later if
+# this API ever handles anything more sensitive than read-mostly
+# trading data behind its own webhook secret / API key checks.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
 
 
 @app.on_event("startup")
