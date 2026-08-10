@@ -17,7 +17,7 @@ class MarketStatePayload(BaseModel):
     event_id: str
     symbol: str
     source: str
-    timeframe: Literal["1m", "5m", "15m", "1h"]
+    timeframe: Literal["1m", "5m", "15m", "1h", "4h"]
     timestamp: str  # ISO-8601 UTC, e.g. "2026-08-08T14:35:00Z"
     bar_status: Literal["closed"]
     event_type: Literal["bar_closed"]
