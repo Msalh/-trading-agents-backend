@@ -26,6 +26,8 @@
     --accent-bg: rgba(212,168,87,0.14);
     --ny: #5B8FD4;
     --ny-bg: rgba(91,143,212,0.16);
+    --ny-pm: #B98FD4;
+    --ny-pm-bg: rgba(185,143,212,0.18);
     --font-head: 'Space Grotesk', sans-serif;
     --font-mono: 'JetBrains Mono', monospace;
   }
@@ -91,10 +93,18 @@
     position: relative; height: 26px; background: var(--panel-2); border-radius: 6px;
     border: 1px solid var(--border); overflow: visible; margin-bottom: 6px;
   }
-  .sc-band { position: absolute; top: 0; bottom: 0; border-radius: 4px; }
+  .sc-band { position: absolute; top: 0; bottom: 0; border-radius: 4px; transition: box-shadow .2s; }
   .sc-band.sc-london { background: var(--accent-bg); border: 1px solid rgba(212,168,87,0.4); }
-  .sc-band.sc-ny { background: var(--ny-bg); border: 1px solid rgba(91,143,212,0.4); }
-  .sc-band.sc-overlap { background: rgba(190,150,220,0.30); border: 1px solid rgba(190,150,220,0.6); z-index: 1; display: none; }
+  .sc-band.sc-ny-am { background: var(--ny-bg); border: 1px solid rgba(91,143,212,0.4); }
+  .sc-band.sc-ny-pm { background: var(--ny-pm-bg); border: 1px solid rgba(185,143,212,0.45); }
+  /* The currently-active kill zone gets a brighter border/glow; the two
+     gaps between zones (05:00-09:30, 11:00-13:30 NY) deliberately have
+     no band element at all — they just show the plain track background,
+     reading as genuinely empty dead time rather than a dim fourth color. */
+  .sc-band.active { box-shadow: 0 0 0 1px currentColor, 0 0 8px 1px currentColor; }
+  .sc-band.sc-london.active { color: var(--accent); }
+  .sc-band.sc-ny-am.active { color: var(--ny); }
+  .sc-band.sc-ny-pm.active { color: var(--ny-pm); }
   .sc-now-marker {
     position: absolute; top: -4px; bottom: -4px; width: 2px; background: var(--text); z-index: 3;
     box-shadow: 0 0 6px var(--text);
@@ -108,8 +118,8 @@
   .sc-legend span { display: flex; align-items: center; gap: 5px; }
   .sc-legend i { width: 8px; height: 8px; border-radius: 2px; display: inline-block; }
   .sc-legend i.london { background: var(--accent); }
-  .sc-legend i.ny { background: var(--ny); }
-  .sc-legend i.overlap { background: rgb(190,150,220); }
+  .sc-legend i.ny-am { background: var(--ny); }
+  .sc-legend i.ny-pm { background: var(--ny-pm); }
 
   .status-strip { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); }
   .status-pill {
@@ -281,17 +291,17 @@
     </div>
     <div class="sc-track" id="scTrack">
       <div class="sc-band sc-london" id="scLondon"></div>
-      <div class="sc-band sc-ny" id="scNY"></div>
-      <div class="sc-band sc-overlap" id="scOverlap"></div>
+      <div class="sc-band sc-ny-am" id="scNYAM"></div>
+      <div class="sc-band sc-ny-pm" id="scNYPM"></div>
       <div class="sc-now-marker" id="scNowMarker"></div>
     </div>
     <div class="sc-ticks">
-      <span>00</span><span>04</span><span>08</span><span>12</span><span>16</span><span>20</span><span>24 UTC</span>
+      <span>00</span><span>04</span><span>08</span><span>12</span><span>16</span><span>20</span><span>24 NY time</span>
     </div>
     <div class="sc-legend">
-      <span><i class="london"></i>London</span>
-      <span><i class="ny"></i>New York</span>
-      <span><i class="overlap"></i>Overlap</span>
+      <span><i class="london"></i>London KZ 02:00–05:00</span>
+      <span><i class="ny-am"></i>NY AM 09:30–11:00</span>
+      <span><i class="ny-pm"></i>NY PM 13:30–15:00</span>
     </div>
 
     <div class="status-strip" id="statusBar">
@@ -620,7 +630,6 @@ async function refreshAllAgentCards() {
 }
 
 // ---- System status + Session clock ----
-let lastSystemStatus = null;
 let lastTimingData = null;
 
 function fmtMinutes(mins) {
@@ -640,11 +649,9 @@ async function refreshSystemStatus() {
   if (!res.ok) {
     alertEl.classList.remove('show');
     barEl.innerHTML = `<span class="status-pill"><span class="status-dot red"></span>status unavailable: ${escapeHtml((res.data && res.data.detail) || 'error ' + res.status)}</span>`;
-    lastSystemStatus = null;
     return;
   }
   const d = res.data;
-  lastSystemStatus = d;
   alertEl.classList.toggle('show', d.scheduler_enabled === false);
 
   const pills = [
@@ -660,67 +667,59 @@ async function refreshSystemStatus() {
   barEl.innerHTML = pills.join('');
 }
 
-function mod24h(min) { return ((min % 1440) + 1440) % 1440; }
 function pctOfDay(min) { return (min / 1440) * 100; }
-
 function positionBand(el, startMin, endMin) {
   if (!el) return;
-  if (endMin < startMin) endMin += 1440; // guard against a midnight wrap
   el.style.left = pctOfDay(startMin) + '%';
   el.style.width = pctOfDay(endMin - startMin) + '%';
 }
 
-// Session windows are defined in each city's own local time (see
-// timing_agent.py: London 08:00-16:30, NY 08:00-17:00). To draw them on
-// one UTC-based 24h track we derive today's UTC offset for each city by
-// comparing the localized time strings /timing/now already returns
-// against the server's UTC clock — good enough for a visual aid, no
-// timezone library needed client-side.
+// ICT Kill Zone windows, all in NY-time minutes-of-day. These are fixed
+// layout constants for the clock face — not derived from anything — and
+// must be kept in sync with LONDON_SESSION_START/END, NY_SESSION_START/
+// END, NY_PM_SESSION_START/END in app/timing_agent.py.
+const KILL_ZONES = {
+  scLondon: { start: 2 * 60, end: 5 * 60 },
+  scNYAM: { start: 9 * 60 + 30, end: 11 * 60 },
+  scNYPM: { start: 13 * 60 + 30, end: 15 * 60 },
+};
+
+const SESSION_LABEL_TEXT = {
+  weekend: 'Weekend',
+  london: 'London Kill Zone',
+  new_york: 'New York AM Kill Zone',
+  new_york_pm: 'New York PM Kill Zone',
+  outside_sessions: 'Outside kill zones',
+};
+
+// The clock face (band positions) never changes — only which band is
+// "active" and where the now-marker sits does, both read straight off
+// /timing/now's key_data rather than recomputed here.
 function renderSessionClock() {
+  for (const id of Object.keys(KILL_ZONES)) {
+    const zone = KILL_ZONES[id];
+    positionBand($(id), zone.start, zone.end);
+  }
+
   const kd = lastTimingData && lastTimingData.key_data;
-  const utcIso = lastSystemStatus && lastSystemStatus.server_time_utc;
-  if (!kd || !utcIso || !kd.london_local_time || !kd.ny_local_time) return;
+  if (!kd || !kd.ny_local_time) return;
 
-  const utcDate = new Date(utcIso);
-  const utcMin = utcDate.getUTCHours() * 60 + utcDate.getUTCMinutes();
-
-  function offsetMinutes(localStr) {
-    const [hh, mm] = localStr.split(' ')[0].split(':').map(Number);
-    let diff = (hh * 60 + mm) - utcMin;
-    if (diff > 720) diff -= 1440;
-    if (diff < -720) diff += 1440;
-    return diff;
-  }
-
-  const londonOffset = offsetMinutes(kd.london_local_time);
-  const nyOffset = offsetMinutes(kd.ny_local_time);
-
-  const londonStart = mod24h(8 * 60 - londonOffset);
-  const londonEnd = mod24h(16 * 60 + 30 - londonOffset);
-  const nyStart = mod24h(8 * 60 - nyOffset);
-  const nyEnd = mod24h(17 * 60 - nyOffset);
-
-  positionBand($('scLondon'), londonStart, londonEnd);
-  positionBand($('scNY'), nyStart, nyEnd);
-
-  const overlapStart = Math.max(londonStart, nyStart);
-  const overlapEnd = Math.min(londonEnd, nyEnd);
-  const overlapEl = $('scOverlap');
-  if (overlapEl) {
-    if (overlapEnd > overlapStart) {
-      overlapEl.style.display = 'block';
-      positionBand(overlapEl, overlapStart, overlapEnd);
-    } else {
-      overlapEl.style.display = 'none';
-    }
-  }
+  const [nyHH, nyMM] = kd.ny_local_time.split(' ')[0].split(':').map(Number);
+  const nyMin = nyHH * 60 + nyMM;
 
   const marker = $('scNowMarker');
-  if (marker) marker.style.left = pctOfDay(utcMin) + '%';
+  if (marker) marker.style.left = pctOfDay(nyMin) + '%';
 
-  const hh = String(utcDate.getUTCHours()).padStart(2, '0');
-  const mm = String(utcDate.getUTCMinutes()).padStart(2, '0');
-  $('scNowLabel').textContent = `${(kd.session_label || '').replace(/_/g, ' ')} · ${hh}:${mm} UTC`;
+  const activeId = kd.in_london_session ? 'scLondon'
+    : kd.in_ny_session ? 'scNYAM'
+    : kd.in_ny_pm_session ? 'scNYPM'
+    : null;
+  for (const id of Object.keys(KILL_ZONES)) {
+    $(id).classList.toggle('active', id === activeId);
+  }
+
+  const label = SESSION_LABEL_TEXT[kd.session_label] || (kd.session_label || '').replace(/_/g, ' ');
+  $('scNowLabel').textContent = `${label} · ${kd.ny_local_time}`;
 }
 
 // ---- Candlestick chart (5m only, per lightweight-charts) ----
