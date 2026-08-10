@@ -15,16 +15,25 @@ its own copy of the job).
 Disabled by default (ENABLE_SCHEDULER unset or false) so running the
 backend locally for testing never triggers paid API calls on a timer
 without asking for it explicitly.
+
+Cost control: both jobs are session-gated using the same Timing
+logic Analysis uses. Real usage showed News/Macro firing every 20
+minutes around the clock, including outside London/NY hours, driving
+up API spend for no benefit (no one's trading then anyway). Now each
+job checks the current session before doing anything and simply
+skips — no LLM call, no cost — when outside both sessions.
 """
 
 import logging
 import os
+from datetime import datetime, timezone
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from app.macro_agent import MacroAgentError, run_macro
 from app.news_agent import NewsAgentError, run_news
 from app.storage import save_opinion
+from app.timing_agent import evaluate_timing, should_run_analysis
 
 logger = logging.getLogger("scheduler")
 
@@ -39,7 +48,18 @@ MACRO_TIMEFRAME = "global"
 _scheduler: BackgroundScheduler | None = None
 
 
+def _in_active_session() -> bool:
+    """Same London/NY session gate Analysis uses, evaluated against
+    the current server time rather than a bar's timestamp."""
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    timing = evaluate_timing(now_iso)
+    return should_run_analysis(timing)
+
+
 def _news_job() -> None:
+    if not _in_active_session():
+        logger.info("news job skipped — outside London/NY session")
+        return
     try:
         opinion = run_news(symbol=NEWS_SYMBOL)
         save_opinion(
@@ -60,6 +80,9 @@ def _news_job() -> None:
 
 
 def _macro_job() -> None:
+    if not _in_active_session():
+        logger.info("macro job skipped — outside London/NY session")
+        return
     try:
         opinion = run_macro(symbol=MACRO_SYMBOL)
         save_opinion(
