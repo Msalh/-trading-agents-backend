@@ -94,14 +94,18 @@ def start_scheduler() -> BackgroundScheduler | None:
         "interval",
         minutes=NEWS_INTERVAL_MINUTES,
         id="news_agent_job",
-        next_run_time=None,  # first run waits one full interval; trigger manually to test sooner
+        # No next_run_time override here — APScheduler computes the
+        # first fire time itself (now + interval). An earlier version
+        # of this code explicitly passed next_run_time=None intending
+        # "first run waits one interval", but that value actually
+        # means "pause this job" in APScheduler — the job was added
+        # but would NEVER fire on its own. Confirmed and fixed.
     )
     _scheduler.add_job(
         _macro_job,
         "interval",
         minutes=MACRO_INTERVAL_MINUTES,
         id="macro_agent_job",
-        next_run_time=None,
     )
     _scheduler.start()
     logger.info(
