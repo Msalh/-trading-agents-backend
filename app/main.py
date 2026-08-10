@@ -45,10 +45,15 @@ and Risk Agent and an API_REFERENCE.md.
 Sprint 11: added /admin/wipe-all-data — a one-time, secret-protected
 reset for clearing test/synthetic data before a real trading session.
 
+Sprint 12: the webhook handler now actually invokes Analysis on new
+bars inside the Timing gate, instead of only computing the gate
+decision — closing a gap where Analysis never ran automatically.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
 
+import logging
 import os
 from datetime import datetime, timezone
 
@@ -200,10 +205,31 @@ def receive_market_state(
 
     timing = evaluate_timing(payload.timestamp)
     analysis_would_run = should_run_analysis(timing)
-    # Sprint 2 scope: compute and surface the gate decision. The
-    # Analysis Agent itself doesn't exist yet, so nothing is actually
-    # skipped — this just proves the gate logic is correct against
-    # real bar timestamps before anything expensive depends on it.
+
+    # This used to only COMPUTE the gate decision without acting on it
+    # (a leftover from Sprint 2, before Analysis existed) — meaning
+    # Analysis never actually ran automatically, only ever via a
+    # manual /agents/analysis/run call or the dashboard's Run button.
+    # Now it actually runs Analysis here, matching the roadmap's
+    # original design (event-driven, fires on the webhook). Only for
+    # genuinely new bars — a retried/duplicate delivery shouldn't
+    # trigger a second paid LLM call for the same bar.
+    if is_new and analysis_would_run:
+        try:
+            recent_bars = get_recent(symbol=payload.symbol, timeframe=payload.timeframe, limit=10)
+            recent_bars.reverse()
+            opinion = run_analysis(symbol=payload.symbol, timeframe=payload.timeframe, bars=recent_bars)
+            save_opinion(
+                agent="analysis",
+                symbol=payload.symbol,
+                timeframe=payload.timeframe,
+                timestamp=opinion.timestamp,
+                opinion=opinion.to_dict(),
+            )
+        except AnalysisAgentError as e:
+            # Don't let an Analysis failure break the webhook ack —
+            # TradingView still needs a clean response either way.
+            logging.getLogger("webhook").error("auto-analysis failed: %s", e)
 
     return WebhookAck(
         status="stored" if is_new else "duplicate",
