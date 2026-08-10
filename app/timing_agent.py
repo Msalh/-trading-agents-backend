@@ -1,30 +1,45 @@
 """
-Timing/Session Agent — Sprint 2.
+Timing/Session Agent — Sprint 2, redefined to ICT Kill Zones.
 
 Deliberately NOT an LLM call. This is pure, deterministic logic: given
-a timestamp, determine whether it falls inside the London session,
-the New York session, both (overlap), or neither, and whether it's a
-weekday at all. Runs on every webhook before anything expensive
-(Analysis Agent, once it exists) is triggered.
+a timestamp, determine whether it falls inside the London Kill Zone,
+the New York Kill Zone, both, or neither, and whether it's a weekday
+at all. Runs on every webhook before anything expensive (Analysis
+Agent) is triggered.
 
-Session windows are configurable below. These are common trading
-liquidity windows, not official exchange hours — MNQ itself trades
-nearly 24 hours on Globex. Adjust LONDON_* / NY_* if you want a
-tighter or wider window.
+ICT Kill Zones are narrower, higher-conviction windows than generic
+"session hours" — both are defined and quoted in New York time,
+fixed year-round (ICT teaches these as NY wall-clock time; it does
+NOT shift for London's own DST changes, only for NY's own EST/EDT
+transitions, which zoneinfo handles automatically since we convert
+through America/New_York).
+
+  - London Kill Zone: 02:00–05:00 New York time
+  - New York AM Kill Zone: 09:30–11:00 New York time (equity open)
+  - New York PM Kill Zone: 13:30–15:00 New York time (afternoon session)
+
+There are genuine gaps between them (05:00–09:30 and 11:00–13:30 NY
+time) that are NOT part of any kill zone — deliberately left as dead
+time, not patched with additional zones. Because the windows don't
+touch, an "overlap" essentially never occurs with this narrower
+definition; the field is kept for shape-compatibility with the rest
+of the system but will rarely if ever be true.
 """
 
 from dataclasses import dataclass
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
-LONDON_TZ = ZoneInfo("Europe/London")
 NY_TZ = ZoneInfo("America/New_York")
 
-LONDON_SESSION_START = time(8, 0)
-LONDON_SESSION_END = time(16, 30)
+LONDON_SESSION_START = time(2, 0)
+LONDON_SESSION_END = time(5, 0)
 
-NY_SESSION_START = time(8, 0)
-NY_SESSION_END = time(17, 0)
+NY_SESSION_START = time(9, 30)
+NY_SESSION_END = time(11, 0)
+
+NY_PM_SESSION_START = time(13, 30)
+NY_PM_SESSION_END = time(15, 0)
 
 
 @dataclass
@@ -60,46 +75,53 @@ def _in_window(local_dt: datetime, start: time, end: time) -> bool:
 
 
 def evaluate_timing(timestamp: str) -> TimingOpinion:
-    """Evaluate session timing for a given ISO-8601 UTC timestamp.
+    """Evaluate ICT Kill Zone timing for a given ISO-8601 UTC timestamp.
 
     Direction is always "neutral" — timing quality has no directional
     bias, it only gates whether now is a reasonable time to act at all.
-    Confidence reflects liquidity quality: highest during the
-    London/NY overlap, lower in a single session, lowest outside both.
+    Confidence reflects liquidity quality: highest during a kill zone,
+    lowest outside all of them (including the dead gaps between them).
     """
     dt_utc = _parse_utc(timestamp)
     is_weekday = dt_utc.weekday() < 5  # Mon=0 ... Sun=6
 
-    london_local = dt_utc.astimezone(LONDON_TZ)
     ny_local = dt_utc.astimezone(NY_TZ)
+    # Kept only for informational display — all kill zones are
+    # actually evaluated against NY time now, not London local time.
+    london_local = dt_utc.astimezone(ZoneInfo("Europe/London"))
 
-    in_london = is_weekday and _in_window(london_local, LONDON_SESSION_START, LONDON_SESSION_END)
+    in_london = is_weekday and _in_window(ny_local, LONDON_SESSION_START, LONDON_SESSION_END)
     in_ny = is_weekday and _in_window(ny_local, NY_SESSION_START, NY_SESSION_END)
-    in_overlap = in_london and in_ny
+    in_ny_pm = is_weekday and _in_window(ny_local, NY_PM_SESSION_START, NY_PM_SESSION_END)
+    in_overlap = in_london and in_ny  # structurally near-impossible with these windows
 
     flags: list[str] = []
 
     if not is_weekday:
         confidence = 0
         session_label = "weekend"
-        reasoning = "Weekend — no London or New York session active."
+        reasoning = "Weekend — no kill zone active."
         flags.append("market_closed")
     elif in_overlap:
         confidence = 100
         session_label = "london_ny_overlap"
-        reasoning = "Inside the London/New York overlap — highest expected liquidity window."
+        reasoning = "Inside both the London and New York kill zones."
     elif in_london:
         confidence = 65
         session_label = "london"
-        reasoning = "Inside the London session, outside the New York session."
+        reasoning = "Inside the London Kill Zone (02:00-05:00 NY time)."
     elif in_ny:
         confidence = 65
         session_label = "new_york"
-        reasoning = "Inside the New York session, outside the London session."
+        reasoning = "Inside the New York AM Kill Zone (09:30-11:00 NY time)."
+    elif in_ny_pm:
+        confidence = 65
+        session_label = "new_york_pm"
+        reasoning = "Inside the New York PM Kill Zone (13:30-15:00 NY time)."
     else:
         confidence = 20
         session_label = "outside_sessions"
-        reasoning = "Outside both the London and New York sessions — low expected liquidity."
+        reasoning = "Outside all kill zones — low expected liquidity/conviction."
         flags.append("low_liquidity")
 
     return TimingOpinion(
@@ -113,6 +135,7 @@ def evaluate_timing(timestamp: str) -> TimingOpinion:
             "is_weekday": is_weekday,
             "in_london_session": in_london,
             "in_ny_session": in_ny,
+            "in_ny_pm_session": in_ny_pm,
             "in_overlap": in_overlap,
             "london_local_time": london_local.strftime("%H:%M %Z"),
             "ny_local_time": ny_local.strftime("%H:%M %Z"),
@@ -123,6 +146,10 @@ def evaluate_timing(timestamp: str) -> TimingOpinion:
 
 def should_run_analysis(timing: TimingOpinion) -> bool:
     """The gate Sprint 2 exists to build: should the (future) Analysis
-    Agent even run for this bar? Currently: yes if we're inside either
-    session on a weekday."""
-    return timing.key_data["in_london_session"] or timing.key_data["in_ny_session"]
+    Agent even run for this bar? Currently: yes if we're inside any
+    kill zone on a weekday."""
+    return (
+        timing.key_data["in_london_session"]
+        or timing.key_data["in_ny_session"]
+        or timing.key_data["in_ny_pm_session"]
+    )
