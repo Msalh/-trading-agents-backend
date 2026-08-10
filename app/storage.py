@@ -238,6 +238,28 @@ def get_recent_decisions(symbol: str, timeframe: str, limit: int = 20) -> list[d
         conn.close()
 
 
+def get_recent_opinions(agent: str, symbol: str, timeframe: str, limit: int = 20) -> list[dict]:
+    """Historical opinions for one agent — unlike get_latest_opinion,
+    returns more than just the newest row. Used for after-the-fact
+    investigation (e.g. did the LLM actually re-run each time, or did
+    the same opinion get re-saved) since there's no other way to see
+    what an agent said at a specific past moment."""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT opinion_json FROM agent_opinions
+            WHERE agent = ? AND symbol = ? AND timeframe = ?
+            ORDER BY timestamp DESC, id DESC
+            LIMIT ?
+            """,
+            (agent, symbol, timeframe, limit),
+        ).fetchall()
+        return [json.loads(r["opinion_json"]) for r in rows]
+    finally:
+        conn.close()
+
+
 def wipe_all_data() -> dict:
     """Deletes every row from market_state, agent_opinions, and
     coordinator_decisions. Irreversible — used once to clear test/

@@ -88,6 +88,7 @@ from app.storage import (
     get_latest_opinion,
     get_recent,
     get_recent_decisions,
+    get_recent_opinions,
     init_db,
     save_decision,
     save_event,
@@ -340,6 +341,19 @@ def read_latest_analysis(
     if opinion is None:
         raise HTTPException(status_code=404, detail="no analysis opinion stored yet")
     return opinion
+
+
+@app.get("/agents/analysis/history")
+def read_analysis_history(
+    symbol: str = Query(...),
+    timeframe: str = Query(...),
+    limit: int = Query(default=20, le=200),
+) -> list[dict]:
+    """Newest-first history of Analysis opinions — read-only, for
+    after-the-fact investigation (was the LLM actually re-run each
+    time, did key_data/reasoning actually change, etc). /latest only
+    ever shows the single most recent opinion."""
+    return get_recent_opinions(agent="analysis", symbol=symbol, timeframe=timeframe, limit=limit)
 
 
 @app.post("/agents/news/run")
