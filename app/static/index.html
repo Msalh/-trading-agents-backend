@@ -344,7 +344,7 @@
 
   <div class="chart-card">
     <div class="chart-head">
-      <div class="card-title">🕯 MNQ1! · 5m</div>
+      <div class="card-title">🕯 MNQ1! · 5m <span style="color:var(--muted);font-weight:400;font-size:10px;">(Israel time)</span></div>
       <span class="card-time" id="chartTime"></span>
     </div>
     <div id="chartContainer">
@@ -359,7 +359,7 @@
   <div class="history-wrap">
     <div class="scroll">
       <table>
-        <thead><tr><th>Time (UTC)</th><th>Decision</th><th>Direction</th><th>Score</th><th>Missing</th><th>Conflicts</th></tr></thead>
+        <thead><tr><th>Time (Israel)</th><th>Decision</th><th>Direction</th><th>Score</th><th>Missing</th><th>Conflicts</th></tr></thead>
         <tbody id="historyBody"><tr><td colspan="6" class="empty">No history yet.</td></tr></tbody>
       </table>
     </div>
@@ -388,10 +388,34 @@ async function api(method, path) {
   }
 }
 
+// Every timestamp this API produces is UTC — either "...Z" (agent/
+// decision opinions) or a bare SQLite "YYYY-MM-DD HH:MM:SS" (system
+// status). Force the bare form to be parsed as UTC too, since the
+// browser would otherwise silently read it as local time.
+function parseUtc(iso) {
+  if (!iso) return null;
+  let s = iso.replace(' ', 'T');
+  if (!/[Zz]$|[+-]\d\d:\d\d$/.test(s)) s += 'Z';
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+const IL_TZ = 'Asia/Jerusalem';
+// 'sv-SE' formats as "YYYY-MM-DD HH:mm:ss" — a convenient built-in
+// ISO-like layout, just localized to Israel time via timeZone.
+const ilDateTimeFmt = new Intl.DateTimeFormat('sv-SE', {
+  timeZone: IL_TZ, hour12: false,
+  year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit',
+});
+
+function fmtIsraelTime(iso) {
+  const t = parseUtc(iso);
+  return t ? ilDateTimeFmt.format(t) : (iso || '');
+}
+
 function fmtAgo(iso) {
-  if (!iso) return '';
-  const t = new Date(iso.replace(' ', 'T'));
-  if (isNaN(t)) return iso;
+  const t = parseUtc(iso);
+  if (!t) return iso || '';
   const secs = Math.round((Date.now() - t.getTime()) / 1000);
   if (secs < 5) return 'just now';
   if (secs < 60) return secs + 's ago';
@@ -655,7 +679,7 @@ async function refreshSystemStatus() {
   alertEl.classList.toggle('show', d.scheduler_enabled === false);
 
   const pills = [
-    `<span class="status-pill">🕒 server <b>${escapeHtml(d.server_time_utc)}</b></span>`,
+    `<span class="status-pill">🕒 israel <b>${escapeHtml(fmtIsraelTime(d.server_time_utc))}</b></span>`,
     `<span class="status-pill">🔔 webhook <b>${fmtMinutes(d.minutes_since_last_webhook)}</b></span>`,
     `<span class="status-pill">⚙ scheduler <b>${d.scheduler_enabled ? 'ON' : 'OFF'}</b> (news ${d.scheduler_intervals_minutes.news}m · macro ${d.scheduler_intervals_minutes.macro}m)</span>`,
   ];
@@ -736,6 +760,17 @@ let lastClosePrice = null;
 // too would just stack two labels on top of each other.
 const KEY_LEVEL_PROXIMITY_THRESHOLD = 0.04;
 
+// lightweight-charts renders bar times in the browser's local timezone
+// by default. Bar times we feed it are Unix seconds (inherently UTC),
+// so overriding both the axis tick labels and the crosshair/tooltip
+// formatter via Intl with timeZone Asia/Jerusalem makes the chart read
+// in Israel time regardless of the viewer's own local timezone.
+const chartTickFmt = new Intl.DateTimeFormat('en-GB', { timeZone: IL_TZ, hour: '2-digit', minute: '2-digit', hour12: false });
+const chartCrosshairFmt = new Intl.DateTimeFormat('sv-SE', {
+  timeZone: IL_TZ, hour12: false,
+  year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
+});
+
 function initChart() {
   const container = $('chartContainer');
   candleChart = LightweightCharts.createChart(container, {
@@ -747,7 +782,13 @@ function initChart() {
       horzLines: { color: 'rgba(38,47,64,0.6)' },
     },
     rightPriceScale: { borderColor: '#262F40' },
-    timeScale: { borderColor: '#262F40', timeVisible: true, secondsVisible: false },
+    localization: {
+      timeFormatter: (time) => chartCrosshairFmt.format(new Date(time * 1000)),
+    },
+    timeScale: {
+      borderColor: '#262F40', timeVisible: true, secondsVisible: false,
+      tickMarkFormatter: (time) => chartTickFmt.format(new Date(time * 1000)),
+    },
     crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
   });
   candleSeries = candleChart.addCandlestickSeries({
@@ -935,7 +976,7 @@ async function refreshHistory() {
   }
   body.innerHTML = res.data.map(d => `
     <tr>
-      <td>${escapeHtml(d.timestamp)}</td>
+      <td>${escapeHtml(fmtIsraelTime(d.timestamp))}</td>
       <td><span class="badge ${d.decision === 'enter_long' ? 'bullish' : d.decision === 'enter_short' ? 'bearish' : 'neutral'}">${escapeHtml(d.decision)}</span></td>
       <td>${escapeHtml(d.direction)}</td>
       <td>${d.score}</td>
