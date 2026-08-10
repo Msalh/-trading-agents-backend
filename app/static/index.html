@@ -165,19 +165,20 @@
   .risk-head-row { display: flex; align-items: center; justify-content: space-between; }
   .risk-col .card-foot { margin-top: auto; padding-top: 8px; border-top: 1px solid var(--border); display: flex; justify-content: flex-end; }
 
-  /* ---- candlestick chart ---- */
+  /* ---- candlestick charts (stacked, one per timeframe) ---- */
+  .charts-stack { display: flex; flex-direction: column; gap: 12px; margin-bottom: 14px; }
   .chart-card {
     background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
-    padding: 12px 14px 6px; margin-bottom: 14px;
+    padding: 12px 14px 6px;
   }
   .chart-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
   .chart-head .card-title { font-weight: 600; font-size: 12.5px; font-family: var(--font-head); }
-  #chartContainer { height: 360px; position: relative; overflow: hidden; }
-  #chartEmpty {
+  .chart-container { height: 260px; position: relative; overflow: hidden; }
+  .chart-empty {
     position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
     color: var(--muted); font-size: 12.5px; font-style: italic; pointer-events: none;
   }
-  #keyLevelLabels { position: absolute; inset: 0; pointer-events: none; z-index: 2; }
+  .key-level-labels { position: absolute; inset: 0; pointer-events: none; z-index: 2; }
   .key-level-label {
     position: absolute; left: 6px; transform: translateY(-50%);
     background: rgba(21,26,36,0.9); color: #b7c2cf; font-size: 10px; font-weight: 500;
@@ -342,16 +343,7 @@
     </div>
   </div>
 
-  <div class="chart-card">
-    <div class="chart-head">
-      <div class="card-title">🕯 MNQ1! · 5m <span style="color:var(--muted);font-weight:400;font-size:10px;">(Israel time)</span></div>
-      <span class="card-time" id="chartTime"></span>
-    </div>
-    <div id="chartContainer">
-      <span id="chartEmpty">Loading candles…</span>
-      <div id="keyLevelLabels"></div>
-    </div>
-  </div>
+  <div class="charts-stack" id="chartsStack"></div>
 
   <div class="grid" id="agentGrid"></div>
 
@@ -641,9 +633,6 @@ async function refreshAgentCard(agent) {
     </div>
     <div class="card-flags">${renderFlags(d.flags)}</div>
   `;
-  if (agent.key === 'analysis') {
-    lastAnalysisKeyLevels = (d.key_data && Array.isArray(d.key_data.key_levels)) ? d.key_data.key_levels : [];
-  }
   if (agent.key === 'timing') {
     lastTimingData = d;
   }
@@ -746,14 +735,14 @@ function renderSessionClock() {
   $('scNowLabel').textContent = `${label} · ${kd.ny_local_time}`;
 }
 
-// ---- Candlestick chart (5m only, per lightweight-charts) ----
-const CHART_TIMEFRAME = '5m';
-let candleChart = null;
-let candleSeries = null;
-let keyLevelLines = [];
-let currentKeyLevelPrices = [];
-let lastAnalysisKeyLevels = [];
-let lastClosePrice = null;
+// ---- Candlestick charts — one independent chart per timeframe, stacked ----
+// Each chart fetches its own bars AND its own Analysis opinion (key_levels
+// are timeframe-specific by design on the backend — a 5m opinion's levels
+// don't apply to the 4h chart). Fully decoupled from the TF field, which
+// only drives the Coordinator/Risk/agent-card panel above.
+const CHART_TIMEFRAMES = ['5m', '15m', '1h', '4h'];
+const charts = {}; // tf -> { chart, series, keyLevelLines, currentKeyLevelPrices, lastClosePrice }
+
 // If a level sits within this fraction of the currently visible price
 // range from the last close, its custom label is skipped — right where
 // the built-in last-price label already lives, so drawing our own there
@@ -763,7 +752,7 @@ const KEY_LEVEL_PROXIMITY_THRESHOLD = 0.04;
 // lightweight-charts renders bar times in the browser's local timezone
 // by default. Bar times we feed it are Unix seconds (inherently UTC),
 // so overriding both the axis tick labels and the crosshair/tooltip
-// formatter via Intl with timeZone Asia/Jerusalem makes the chart read
+// formatter via Intl with timeZone Asia/Jerusalem makes every chart read
 // in Israel time regardless of the viewer's own local timezone.
 const chartTickFmt = new Intl.DateTimeFormat('en-GB', { timeZone: IL_TZ, hour: '2-digit', minute: '2-digit', hour12: false });
 const chartCrosshairFmt = new Intl.DateTimeFormat('sv-SE', {
@@ -771,64 +760,84 @@ const chartCrosshairFmt = new Intl.DateTimeFormat('sv-SE', {
   year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
 });
 
-function initChart() {
-  const container = $('chartContainer');
-  candleChart = LightweightCharts.createChart(container, {
-    width: container.clientWidth,
-    height: 360,
-    layout: { background: { color: 'transparent' }, textColor: '#8B93A7', fontFamily: 'JetBrains Mono, monospace' },
-    grid: {
-      vertLines: { color: 'rgba(38,47,64,0.6)' },
-      horzLines: { color: 'rgba(38,47,64,0.6)' },
-    },
-    rightPriceScale: { borderColor: '#262F40' },
-    localization: {
-      timeFormatter: (time) => chartCrosshairFmt.format(new Date(time * 1000)),
-    },
-    timeScale: {
-      borderColor: '#262F40', timeVisible: true, secondsVisible: false,
-      tickMarkFormatter: (time) => chartTickFmt.format(new Date(time * 1000)),
-    },
-    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
-  });
-  candleSeries = candleChart.addCandlestickSeries({
-    upColor: '#5FBF8F', downColor: '#E0785C', borderVisible: false,
-    wickUpColor: '#5FBF8F', wickDownColor: '#E0785C',
-  });
-  // Re-place the custom key-level labels whenever the visible range (and
-  // therefore the auto-scaled price axis) changes, so they track the
-  // lines instead of drifting after a pan/zoom.
-  candleChart.timeScale().subscribeVisibleLogicalRangeChange(renderKeyLevelLabels);
-  window.addEventListener('resize', () => {
-    candleChart.applyOptions({ width: container.clientWidth });
-    renderKeyLevelLabels();
+function chartCardSkeleton(tf) {
+  return `
+    <div class="chart-card">
+      <div class="chart-head">
+        <div class="card-title">🕯 <span id="chartSymbolLabel-${tf}"></span> · ${tf} <span style="color:var(--muted);font-weight:400;font-size:10px;">(Israel time)</span></div>
+        <span class="card-time" id="chartTime-${tf}"></span>
+      </div>
+      <div class="chart-container" id="chartContainer-${tf}">
+        <span class="chart-empty" id="chartEmpty-${tf}">Loading candles…</span>
+        <div class="key-level-labels" id="keyLevelLabels-${tf}"></div>
+      </div>
+    </div>`;
+}
+
+function initCharts() {
+  $('chartsStack').innerHTML = CHART_TIMEFRAMES.map(chartCardSkeleton).join('');
+  CHART_TIMEFRAMES.forEach(tf => {
+    const container = $('chartContainer-' + tf);
+    const chart = LightweightCharts.createChart(container, {
+      width: container.clientWidth,
+      height: 260,
+      layout: { background: { color: 'transparent' }, textColor: '#8B93A7', fontFamily: 'JetBrains Mono, monospace' },
+      grid: {
+        vertLines: { color: 'rgba(38,47,64,0.6)' },
+        horzLines: { color: 'rgba(38,47,64,0.6)' },
+      },
+      rightPriceScale: { borderColor: '#262F40' },
+      localization: {
+        timeFormatter: (time) => chartCrosshairFmt.format(new Date(time * 1000)),
+      },
+      timeScale: {
+        borderColor: '#262F40', timeVisible: true, secondsVisible: false,
+        tickMarkFormatter: (time) => chartTickFmt.format(new Date(time * 1000)),
+      },
+      crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+    });
+    const series = chart.addCandlestickSeries({
+      upColor: '#5FBF8F', downColor: '#E0785C', borderVisible: false,
+      wickUpColor: '#5FBF8F', wickDownColor: '#E0785C',
+    });
+    charts[tf] = { chart, series, keyLevelLines: [], currentKeyLevelPrices: [], lastClosePrice: null };
+
+    // Re-place this chart's key-level labels whenever its visible range
+    // (and therefore its auto-scaled price axis) changes, so they track
+    // the lines instead of drifting after a pan/zoom.
+    chart.timeScale().subscribeVisibleLogicalRangeChange(() => renderKeyLevelLabels(tf));
+    window.addEventListener('resize', () => {
+      chart.applyOptions({ width: container.clientWidth });
+      renderKeyLevelLabels(tf);
+    });
   });
 }
 
-// Positions the custom labels via priceToCoordinate — separate from
-// updateKeyLevelLines so it can be re-run on pan/zoom/resize without
-// touching the price lines themselves.
-function renderKeyLevelLabels() {
-  const labelsContainer = $('keyLevelLabels');
-  const chartContainer = $('chartContainer');
-  if (!candleSeries || !labelsContainer || !chartContainer) return;
-  const height = chartContainer.clientHeight;
+// Positions one chart's custom labels via priceToCoordinate — separate
+// from updateKeyLevelLines so it can be re-run on pan/zoom/resize without
+// touching that chart's price lines themselves.
+function renderKeyLevelLabels(tf) {
+  const state = charts[tf];
+  const labelsContainer = $('keyLevelLabels-' + tf);
+  const container = $('chartContainer-' + tf);
+  if (!state || !labelsContainer || !container) return;
+  const height = container.clientHeight;
   labelsContainer.innerHTML = '';
 
   // Visible price range, derived from the two edges of the pane, so
   // "too close to the current price" scales with how zoomed-in the
   // chart currently is rather than a fixed dollar amount.
-  const topPrice = candleSeries.coordinateToPrice(0);
-  const bottomPrice = candleSeries.coordinateToPrice(height);
+  const topPrice = state.series.coordinateToPrice(0);
+  const bottomPrice = state.series.coordinateToPrice(height);
   const visibleRange = (topPrice !== null && bottomPrice !== null) ? Math.abs(topPrice - bottomPrice) : null;
 
-  currentKeyLevelPrices.forEach(price => {
-    const y = candleSeries.priceToCoordinate(price);
+  state.currentKeyLevelPrices.forEach(price => {
+    const y = state.series.priceToCoordinate(price);
     // Skip levels the chart hasn't scrolled/scaled into view — the price
     // line itself still exists on the series, just off-screen for now.
     if (y === null || y === undefined || y < 0 || y > height) return;
-    if (lastClosePrice !== null && visibleRange) {
-      const proximity = Math.abs(price - lastClosePrice) / visibleRange;
+    if (state.lastClosePrice !== null && visibleRange) {
+      const proximity = Math.abs(price - state.lastClosePrice) / visibleRange;
       if (proximity < KEY_LEVEL_PROXIMITY_THRESHOLD) return; // too close to the last-price label
     }
     const label = document.createElement('div');
@@ -839,10 +848,12 @@ function renderKeyLevelLabels() {
   });
 }
 
-function updateKeyLevelLines(levels) {
-  keyLevelLines.forEach(line => candleSeries.removePriceLine(line));
-  keyLevelLines = [];
-  currentKeyLevelPrices = [];
+function updateKeyLevelLines(tf, levels) {
+  const state = charts[tf];
+  if (!state) return;
+  state.keyLevelLines.forEach(line => state.series.removePriceLine(line));
+  state.keyLevelLines = [];
+  state.currentKeyLevelPrices = [];
   if (levels && levels.length) {
     // Dedupe near-identical levels so the chart isn't cluttered with
     // overlapping lines/labels for prices that round to the same value.
@@ -852,8 +863,8 @@ function updateKeyLevelLines(levels) {
       const key = num.toFixed(2);
       if (seen.has(key)) return;
       seen.add(key);
-      currentKeyLevelPrices.push(num);
-      keyLevelLines.push(candleSeries.createPriceLine({
+      state.currentKeyLevelPrices.push(num);
+      state.keyLevelLines.push(state.series.createPriceLine({
         price: num,
         color: 'rgba(212,168,87,0.55)',
         lineWidth: 1,
@@ -865,31 +876,57 @@ function updateKeyLevelLines(levels) {
       }));
     });
   }
-  renderKeyLevelLabels();
+  renderKeyLevelLabels(tf);
 }
 
-async function refreshChart() {
+async function refreshChart(tf) {
   const symbol = symbolEl.value;
-  const res = await api('GET', `/market-state/recent?symbol=${encodeURIComponent(symbol)}&timeframe=${CHART_TIMEFRAME}&limit=100`);
-  const emptyEl = $('chartEmpty');
-  if (!res.ok || !res.data || !res.data.length) {
-    if (emptyEl) emptyEl.textContent = res.status === 404 ? 'No 5m bars yet for this symbol.' : 'Failed to load candles.';
-    else $('chartContainer').insertAdjacentHTML('beforeend', '<span id="chartEmpty">No 5m bars yet.</span>');
-    $('chartTime').textContent = '';
+  const symLabelEl = $('chartSymbolLabel-' + tf);
+  if (symLabelEl) symLabelEl.textContent = symbol;
+  const state = charts[tf];
+  if (!state) return;
+
+  // Bars and this timeframe's own Analysis opinion (for key_levels) are
+  // independent lookups — fetch both in parallel.
+  const [barsRes, analysisRes] = await Promise.all([
+    api('GET', `/market-state/recent?symbol=${encodeURIComponent(symbol)}&timeframe=${tf}&limit=100`),
+    api('GET', `/agents/analysis/latest?symbol=${encodeURIComponent(symbol)}&timeframe=${tf}`),
+  ]);
+
+  const emptyEl = $('chartEmpty-' + tf);
+  if (!barsRes.ok || !barsRes.data || !barsRes.data.length) {
+    // /market-state/recent returns 200 + [] when there's simply no data
+    // yet for this symbol/timeframe (unlike /latest, it never 404s) — so
+    // "empty" and "actually failed" have to be told apart by res.ok, not
+    // by status code.
+    if (emptyEl) {
+      emptyEl.style.display = '';
+      emptyEl.textContent = barsRes.ok ? `No ${tf} bars yet for this symbol.` : 'Failed to load candles.';
+    }
+    $('chartTime-' + tf).textContent = '';
     return;
   }
-  if (emptyEl) emptyEl.remove();
+  if (emptyEl) emptyEl.style.display = 'none';
 
   // API returns newest-first; the chart wants ascending time.
-  const bars = [...res.data].reverse();
+  const bars = [...barsRes.data].reverse();
   const candles = bars.map(b => ({
     time: Math.floor(new Date(b.timestamp.replace(' ', 'T')).getTime() / 1000),
     open: b.open, high: b.high, low: b.low, close: b.close,
   }));
-  candleSeries.setData(candles);
-  lastClosePrice = candles.length ? candles[candles.length - 1].close : null;
-  updateKeyLevelLines(lastAnalysisKeyLevels);
-  $('chartTime').textContent = `${candles.length} bars · last ${fmtAgo(bars[bars.length - 1].timestamp)}`;
+  state.series.setData(candles);
+  state.lastClosePrice = candles.length ? candles[candles.length - 1].close : null;
+
+  const keyLevels = (analysisRes.ok && analysisRes.data && analysisRes.data.key_data && Array.isArray(analysisRes.data.key_data.key_levels))
+    ? analysisRes.data.key_data.key_levels
+    : [];
+  updateKeyLevelLines(tf, keyLevels);
+
+  $('chartTime-' + tf).textContent = `${candles.length} bars · last ${fmtAgo(bars[bars.length - 1].timestamp)}`;
+}
+
+async function refreshAllCharts() {
+  await Promise.all(CHART_TIMEFRAMES.map(refreshChart));
 }
 
 // ---- Decision + Risk panel ----
@@ -987,11 +1024,12 @@ async function refreshHistory() {
 }
 
 async function refreshAll() {
-  // Agent cards first: refreshChart / renderSessionClock read data
-  // (lastAnalysisKeyLevels, lastTimingData) that the card fetches set as
-  // a side effect.
+  // Agent cards first: renderSessionClock reads lastTimingData, which the
+  // Timing card's fetch sets as a side effect. The four charts are fully
+  // independent (their own bars + their own per-timeframe Analysis
+  // opinion), so they run alongside everything else.
   await refreshAllAgentCards();
-  await Promise.all([refreshDecisionLive(), refreshRisk(), refreshHistory(), refreshChart(), refreshSystemStatus()]);
+  await Promise.all([refreshDecisionLive(), refreshRisk(), refreshHistory(), refreshAllCharts(), refreshSystemStatus()]);
   renderSessionClock();
   $('lastUpdated').textContent = 'updated ' + new Date().toLocaleTimeString();
 }
@@ -1043,7 +1081,7 @@ function setupAutoRefresh() {
 $('autoRefresh').addEventListener('change', setupAutoRefresh);
 
 // ---- boot ----
-initChart();
+initCharts();
 initGrid();
 refreshAll();
 setupAutoRefresh();
