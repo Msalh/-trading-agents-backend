@@ -49,6 +49,11 @@ Sprint 12: the webhook handler now actually invokes Analysis on new
 bars inside the Timing gate, instead of only computing the gate
 decision — closing a gap where Analysis never ran automatically.
 
+Sprint 13: after a fresh Analysis opinion saves, the webhook handler
+now also auto-computes and persists a Coordinator decision, so
+/coordinator/history fills in on its own instead of needing a manual
+"Compute & Save" click.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -226,6 +231,27 @@ def receive_market_state(
                 timestamp=opinion.timestamp,
                 opinion=opinion.to_dict(),
             )
+
+            # Auto-compute and persist a Coordinator decision right
+            # after a fresh Analysis opinion lands — this is what
+            # actually populates /coordinator/history on its own,
+            # instead of requiring a manual "Compute & Save" click on
+            # the dashboard. Every 5-minute bar during an active
+            # session now produces one decision-history row, using
+            # whatever the latest News/Macro/Timing opinions are at
+            # that moment. Wrapped separately so a Coordinator failure
+            # (e.g. a storage hiccup) doesn't also erase the Analysis
+            # opinion we just successfully saved above.
+            try:
+                decision = compute_decision(symbol=payload.symbol, timeframe=payload.timeframe)
+                save_decision(
+                    symbol=payload.symbol,
+                    timeframe=payload.timeframe,
+                    timestamp=decision.timestamp,
+                    decision=decision.to_dict(),
+                )
+            except Exception as e:  # noqa: BLE001 - never let this break the webhook ack
+                logging.getLogger("webhook").error("auto-coordinator failed: %s", e)
         except AnalysisAgentError as e:
             # Don't let an Analysis failure break the webhook ack —
             # TradingView still needs a clean response either way.
