@@ -61,6 +61,12 @@ horizons, computed on demand from bars already stored (nothing new
 persisted). Intended for calibrating COORDINATOR_THRESHOLD against
 real accuracy instead of guessing from the dashboard.
 
+Sprint 15: added the Execution Agent (final agent from the roadmap) —
+LLM-backed, paper-only. Turns an already-approved Risk decision into
+a concrete order spec (entry/stop/targets). Never places a real order
+or talks to a broker; nothing to execute (no LLM call) unless Risk
+approved or modified the trade.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -76,6 +82,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.analysis_agent import AnalysisAgentError, run_analysis
 from app.coordinator import compute_decision
+from app.execution_agent import ExecutionAgentError, plan_execution
 from app.macro_agent import MacroAgentError, run_macro
 from app.models import MarketStateOut, MarketStatePayload, WebhookAck
 from app.news_agent import NewsAgentError, run_news
@@ -507,6 +514,55 @@ def risk_evaluate(
         "coordinator_decision": latest_decision,
         "risk_opinion": risk_opinion.to_dict(),
     }
+
+
+@app.get("/agents/execution/plan")
+def execution_plan(
+    symbol: str = Query(...),
+    timeframe: str = Query(...),
+) -> dict:
+    """Reads the most recently STORED Risk opinion and Coordinator
+    decision (does not recompute them) plus the latest bar and
+    Analysis's key_levels, and asks Execution to turn an approved
+    trade into a concrete paper order. No LLM call at all if Risk
+    didn't approve/modify anything — see plan_execution's no_action
+    short-circuit."""
+    risk_opinion = get_latest_opinion(agent="risk", symbol=symbol, timeframe=timeframe)
+    if risk_opinion is None:
+        raise HTTPException(
+            status_code=404,
+            detail="no Risk opinion stored yet — call /agents/risk/evaluate first",
+        )
+
+    recent_decisions = get_recent_decisions(symbol=symbol, timeframe=timeframe, limit=1)
+    if not recent_decisions:
+        raise HTTPException(status_code=404, detail="no Coordinator decision stored yet")
+    latest_decision = recent_decisions[0]
+
+    latest_bar = get_latest(symbol=symbol, timeframe=timeframe)
+    analysis_opinion = get_latest_opinion(agent="analysis", symbol=symbol, timeframe=timeframe)
+    key_levels = (analysis_opinion or {}).get("key_data", {}).get("key_levels")
+
+    try:
+        execution_opinion = plan_execution(
+            symbol=symbol,
+            timeframe=timeframe,
+            risk_evaluation=risk_opinion,
+            coordinator_decision=latest_decision,
+            latest_bar=latest_bar,
+            analysis_key_levels=key_levels,
+        )
+    except ExecutionAgentError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    save_opinion(
+        agent="execution",
+        symbol=symbol,
+        timeframe=timeframe,
+        timestamp=execution_opinion.timestamp,
+        opinion=execution_opinion.to_dict(),
+    )
+    return {"execution_opinion": execution_opinion.to_dict()}
 
 
 @app.get("/market-state/latest", response_model=MarketStateOut)
