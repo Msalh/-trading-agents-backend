@@ -16,9 +16,9 @@ through America/New_York).
 
   - London Kill Zone: 02:00–05:00 New York time
   - New York AM Kill Zone: 09:30–11:00 New York time (equity open)
-  - New York PM Kill Zone: 13:30–15:00 New York time (afternoon session)
+  - New York PM Kill Zone: 13:00–15:00 New York time (afternoon session)
 
-There are genuine gaps between them (05:00–09:30 and 11:00–13:30 NY
+There are genuine gaps between them (05:00–09:30 and 11:00–13:00 NY
 time) that are NOT part of any kill zone — deliberately left as dead
 time, not patched with additional zones. Because the windows don't
 touch, an "overlap" essentially never occurs with this narrower
@@ -38,7 +38,7 @@ LONDON_SESSION_END = time(5, 0)
 NY_SESSION_START = time(9, 30)
 NY_SESSION_END = time(11, 0)
 
-NY_PM_SESSION_START = time(13, 30)
+NY_PM_SESSION_START = time(13, 0)
 NY_PM_SESSION_END = time(15, 0)
 
 
@@ -117,7 +117,7 @@ def evaluate_timing(timestamp: str) -> TimingOpinion:
     elif in_ny_pm:
         confidence = 65
         session_label = "new_york_pm"
-        reasoning = "Inside the New York PM Kill Zone (13:30-15:00 NY time)."
+        reasoning = "Inside the New York PM Kill Zone (13:00-15:00 NY time)."
     else:
         confidence = 20
         session_label = "outside_sessions"
