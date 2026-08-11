@@ -54,6 +54,13 @@ now also auto-computes and persists a Coordinator decision, so
 /coordinator/history fills in on its own instead of needing a manual
 "Compute & Save" click.
 
+Sprint 14: added outcome tracking (app/outcomes.py) — for each
+directional Coordinator decision, /coordinator/history/outcomes looks
+up whether price actually moved the predicted way at several time
+horizons, computed on demand from bars already stored (nothing new
+persisted). Intended for calibrating COORDINATOR_THRESHOLD against
+real accuracy instead of guessing from the dashboard.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -72,6 +79,7 @@ from app.coordinator import compute_decision
 from app.macro_agent import MacroAgentError, run_macro
 from app.models import MarketStateOut, MarketStatePayload, WebhookAck
 from app.news_agent import NewsAgentError, run_news
+from app.outcomes import HORIZON_MINUTES_DEFAULT, compute_outcomes_for_decision
 from app.risk_agent import evaluate_risk
 from app.scheduler import (
     MACRO_SYMBOL,
@@ -438,6 +446,34 @@ def coordinator_history(
     limit: int = Query(default=20, le=200),
 ) -> list[dict]:
     return get_recent_decisions(symbol=symbol, timeframe=timeframe, limit=limit)
+
+
+@app.get("/coordinator/history/outcomes")
+def coordinator_history_outcomes(
+    symbol: str = Query(...),
+    timeframe: str = Query(...),
+    limit: int = Query(default=20, le=200),
+    horizons: str = Query(default="15,30,60", description="comma-separated minutes"),
+) -> list[dict]:
+    """Same as /coordinator/history, but for each directional decision
+    (enter_long/enter_short) also attaches whether price actually moved
+    the predicted way at each horizon. no_trade/insufficient_data rows
+    get outcomes=None — nothing to score. Computed live from stored
+    bars each call; nothing persisted, nothing recomputed in the
+    background."""
+    try:
+        horizon_list = [int(h.strip()) for h in horizons.split(",") if h.strip()]
+    except ValueError:
+        raise HTTPException(status_code=400, detail="horizons must be comma-separated integers")
+
+    decisions = get_recent_decisions(symbol=symbol, timeframe=timeframe, limit=limit)
+    results = []
+    for decision in decisions:
+        outcomes = compute_outcomes_for_decision(
+            symbol=symbol, timeframe=timeframe, decision=decision, horizons=horizon_list
+        )
+        results.append({**decision, "outcomes": outcomes})
+    return results
 
 
 @app.get("/agents/risk/evaluate")

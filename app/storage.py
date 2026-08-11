@@ -221,6 +221,40 @@ def get_last_webhook_received(symbol: str) -> Optional[str]:
         conn.close()
 
 
+def get_bar_at_or_before(symbol: str, timeframe: str, timestamp: str) -> Optional[dict]:
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            """
+            SELECT payload_json FROM market_state
+            WHERE symbol = ? AND timeframe = ? AND timestamp <= ?
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            (symbol, timeframe, timestamp),
+        ).fetchone()
+        return json.loads(row["payload_json"]) if row else None
+    finally:
+        conn.close()
+
+
+def get_bar_at_or_after(symbol: str, timeframe: str, timestamp: str) -> Optional[dict]:
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            """
+            SELECT payload_json FROM market_state
+            WHERE symbol = ? AND timeframe = ? AND timestamp >= ?
+            ORDER BY timestamp ASC
+            LIMIT 1
+            """,
+            (symbol, timeframe, timestamp),
+        ).fetchone()
+        return json.loads(row["payload_json"]) if row else None
+    finally:
+        conn.close()
+
+
 def get_recent_decisions(symbol: str, timeframe: str, limit: int = 20) -> list[dict]:
     conn = get_connection()
     try:
