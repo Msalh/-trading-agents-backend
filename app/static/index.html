@@ -740,7 +740,10 @@ function renderSessionClock() {
 // are timeframe-specific by design on the backend — a 5m opinion's levels
 // don't apply to the 4h chart). Fully decoupled from the TF field, which
 // only drives the Coordinator/Risk/agent-card panel above.
-const CHART_TIMEFRAMES = ['5m', '15m', '1h', '4h'];
+// 4h chart removed from view for now (dashboard-only — the backend,
+// /market-state/recent, and the DB all still accept "4h" fine, so
+// adding it back here is a one-line change if it's needed later).
+const CHART_TIMEFRAMES = ['5m', '15m', '1h'];
 const charts = {}; // tf -> { chart, series, keyLevelLines, currentKeyLevelPrices, lastClosePrice }
 
 // If a level sits within this fraction of the currently visible price
