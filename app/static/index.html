@@ -134,9 +134,9 @@
   .status-dot.red { background: var(--bear); }
   .status-dot.gray { background: var(--neutral); }
 
-  /* ---- unified decision panel (Coordinator + Risk) ---- */
+  /* ---- unified decision panel (Coordinator -> Risk -> Execution) ---- */
   .decision-panel {
-    display: grid; grid-template-columns: 1fr auto 1fr; align-items: stretch; gap: 16px;
+    display: grid; grid-template-columns: 1fr auto 1fr auto 1fr; align-items: stretch; gap: 16px;
     background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
     padding: 18px 20px; margin-bottom: 14px;
   }
@@ -163,7 +163,7 @@
   .chip.warn { color: var(--accent); border-color: var(--accent); }
   .decision-actions { display: flex; gap: 6px; margin-top: auto; padding-top: 6px; }
   .risk-head-row { display: flex; align-items: center; justify-content: space-between; }
-  .risk-col .card-foot { margin-top: auto; padding-top: 8px; border-top: 1px solid var(--border); display: flex; justify-content: flex-end; }
+  .risk-col .card-foot, .exec-col .card-foot { margin-top: auto; padding-top: 8px; border-top: 1px solid var(--border); display: flex; justify-content: flex-end; }
 
   /* ---- candlestick charts (stacked, one per timeframe) ---- */
   .charts-stack { display: flex; flex-direction: column; gap: 12px; margin-bottom: 14px; }
@@ -339,6 +339,20 @@
       <div id="riskCardBody"><span class="empty">Loading…</span></div>
       <div class="card-foot">
         <button class="secondary small" id="runRisk">Evaluate</button>
+      </div>
+    </div>
+
+    <div class="decision-arrow">→</div>
+
+    <div class="decision-col exec-col">
+      <div class="risk-head-row">
+        <div class="col-label">Execution</div>
+        <span class="card-time" id="execTime"></span>
+      </div>
+      <div id="execBadge"></div>
+      <div id="execCardBody"><span class="empty">Click "Plan Execution" to generate an order plan.</span></div>
+      <div class="card-foot">
+        <button class="secondary small" id="runExec">Plan Execution</button>
       </div>
     </div>
   </div>
@@ -1006,6 +1020,44 @@ async function refreshRisk() {
   `;
 }
 
+// Execution is deliberately NOT part of the 30s auto-refresh cycle —
+// unlike Risk (pure math, free), /agents/execution/plan calls the LLM
+// every time it's hit. Only the "Plan Execution" button triggers it,
+// same cost-conscious pattern as the News/Macro/Analysis Run buttons.
+async function refreshExecution() {
+  const symbol = symbolEl.value, timeframe = timeframeEl.value;
+  const res = await api('GET', `/agents/execution/plan?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}`);
+  const el = $('execCardBody');
+  if (!res.ok) {
+    $('execBadge').innerHTML = '';
+    el.innerHTML = res.status === 404
+      ? `<span class="empty">No Risk opinion yet — click "Evaluate" first.</span>`
+      : `<div class="err">${escapeHtml((res.data && res.data.detail) || ('error ' + res.status))}</div>`;
+    $('execTime').textContent = '';
+    return;
+  }
+  const exec = res.data.execution_opinion;
+  $('execTime').textContent = fmtAgo(exec.timestamp);
+  const badgeClass = exec.status === 'planned' ? dirClass(exec.direction) : 'no_action';
+  $('execBadge').innerHTML = `<span class="badge ${badgeClass}">${escapeHtml(exec.status)}</span>`;
+
+  const isExpanded = expandedReasoning.has('execution');
+  el.innerHTML = `
+    ${renderKeyData({
+      order_type: exec.order_type,
+      entry_price: exec.entry_price,
+      stop_loss: exec.stop_loss,
+      targets: exec.targets,
+      ready_now: exec.ready_now,
+    })}
+    <div class="reasoning-wrap">
+      <div class="reasoning ${isExpanded ? '' : 'clamp'}" id="reasoning-execution">${escapeHtml(exec.reasoning || '')}</div>
+      <button class="read-more" data-key="execution" id="readmore-execution">${isExpanded ? 'عرض أقل' : 'اقرأ المزيد'}</button>
+    </div>
+    <div class="card-flags">${renderFlags(exec.flags)}</div>
+  `;
+}
+
 async function refreshHistory() {
   const symbol = symbolEl.value, timeframe = timeframeEl.value;
   const res = await api('GET', `/coordinator/history?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&limit=20`);
@@ -1070,6 +1122,23 @@ $('runRisk').addEventListener('click', async () => {
   btn.disabled = true;
   await refreshRisk();
   btn.disabled = false;
+});
+
+$('runExec').addEventListener('click', async () => {
+  const btn = $('runExec');
+  btn.disabled = true;
+  const orig = btn.textContent;
+  btn.innerHTML = '<span class="spin"></span>';
+  await refreshExecution();
+  btn.disabled = false;
+  btn.textContent = orig;
+});
+
+// Read-more delegation for the decision panel (Risk/Execution reasoning
+// live outside #agentGrid, which has its own separate delegation).
+$('decisionPanel').addEventListener('click', (e) => {
+  const btn = e.target.closest('.read-more');
+  if (btn) toggleReadMore(btn.dataset.key);
 });
 
 [symbolEl, timeframeEl, apiBaseEl].forEach(el => el.addEventListener('change', refreshAll));
