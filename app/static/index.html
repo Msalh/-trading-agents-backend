@@ -98,7 +98,7 @@
   .sc-band.sc-ny-am { background: var(--ny-bg); border: 1px solid rgba(91,143,212,0.4); }
   .sc-band.sc-ny-pm { background: var(--ny-pm-bg); border: 1px solid rgba(185,143,212,0.45); }
   /* The currently-active kill zone gets a brighter border/glow; the two
-     gaps between zones (05:00-09:30, 11:00-13:30 NY) deliberately have
+     gaps between zones (05:00-09:30, 11:00-13:00 NY) deliberately have
      no band element at all — they just show the plain track background,
      reading as genuinely empty dead time rather than a dim fourth color. */
   .sc-band.active { box-shadow: 0 0 0 1px currentColor, 0 0 8px 1px currentColor; }
@@ -302,7 +302,7 @@
     <div class="sc-legend">
       <span><i class="london"></i>London KZ 02:00–05:00</span>
       <span><i class="ny-am"></i>NY AM 09:30–11:00</span>
-      <span><i class="ny-pm"></i>NY PM 13:30–15:00</span>
+      <span><i class="ny-pm"></i>NY PM 13:00–15:00</span>
     </div>
 
     <div class="status-strip" id="statusBar">
@@ -694,7 +694,7 @@ function positionBand(el, startMin, endMin) {
 const KILL_ZONES = {
   scLondon: { start: 2 * 60, end: 5 * 60 },
   scNYAM: { start: 9 * 60 + 30, end: 11 * 60 },
-  scNYPM: { start: 13 * 60 + 30, end: 15 * 60 },
+  scNYPM: { start: 13 * 60, end: 15 * 60 },
 };
 
 const SESSION_LABEL_TEXT = {
