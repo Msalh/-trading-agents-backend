@@ -25,6 +25,8 @@ SYSTEM_PROMPT = """You are a technical analyst specialized in MNQ (Micro E-mini 
 Your job only: analyze price action and structure — not news, not risk.
 Determine: overall direction (bullish, bearish, or neutral), the most important key levels visible in the data (support/resistance, recent highs/lows, VWAP relationship), and whether there's a clear setup aligned with the recent trend.
 
+Each bar also includes five boolean setup flags computed directly from price/volume (not your judgment call): liquidity_sweep (a recent high/low was taken out intrabar then closed back on the other side — a stop-hunt-then-reverse signature), reclaim (price closed back on the "correct" side of VWAP after being on the wrong side), rejection (a long wick against the close near a tracked reference level), displacement (an unusually large-range bar relative to ATR — an impulsive move), and volume_spike (volume meaningfully above its recent average). Weigh these directly in your reasoning when they appear on recent bars — a sweep+reclaim combo near a key level is a stronger structural signal than the same price action without them, and you should say so explicitly when relevant rather than only describing raw OHLC movement.
+
 Be specific with actual price levels from the data given — never invent numbers not present in or reasonably derivable from the bars you were given.
 
 Respond with a single JSON object ONLY, no other text, no markdown code fences, matching exactly this shape:
@@ -96,6 +98,11 @@ def _build_user_message(symbol: str, timeframe: str, bars: list[dict]) -> str:
             "trend_5m": b.get("trend_5m"),
             "trend_15m": b.get("trend_15m"),
             "trend_1h": b.get("trend_1h"),
+            "liquidity_sweep": b.get("liquidity_sweep"),
+            "reclaim": b.get("reclaim"),
+            "rejection": b.get("rejection"),
+            "displacement": b.get("displacement"),
+            "volume_spike": b.get("volume_spike"),
         }
         for b in bars
     ]
