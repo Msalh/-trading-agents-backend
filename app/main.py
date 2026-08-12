@@ -67,6 +67,11 @@ a concrete order spec (entry/stop/targets). Never places a real order
 or talks to a broker; nothing to execute (no LLM call) unless Risk
 approved or modified the trade.
 
+Sprint 16: the webhook's auto-Analysis/Coordinator run now happens in
+a BackgroundTasks task instead of inline — the webhook acks
+TradingView immediately instead of waiting on the LLM call, avoiding
+delivery timeouts on TradingView's side.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -75,7 +80,7 @@ import logging
 import os
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -209,9 +214,49 @@ def health_check() -> dict:
     return {"status": "ok"}
 
 
+def _run_auto_analysis_and_coordinator(symbol: str, timeframe: str) -> None:
+    """Runs Analysis + Coordinator for a freshly-arrived bar. Called via
+    BackgroundTasks so the webhook can ack TradingView immediately —
+    the LLM call is the slow part, and TradingView's own delivery
+    timeout is short enough that waiting for it inline caused
+    legitimate "request took too long and timed out" failures at
+    TradingView even though the work itself completed successfully
+    a few seconds later."""
+    try:
+        recent_bars = get_recent(symbol=symbol, timeframe=timeframe, limit=10)
+        recent_bars.reverse()
+        opinion = run_analysis(symbol=symbol, timeframe=timeframe, bars=recent_bars)
+        save_opinion(
+            agent="analysis",
+            symbol=symbol,
+            timeframe=timeframe,
+            timestamp=opinion.timestamp,
+            opinion=opinion.to_dict(),
+        )
+
+        # Auto-compute and persist a Coordinator decision right after a
+        # fresh Analysis opinion lands — this is what actually
+        # populates /coordinator/history on its own. Wrapped separately
+        # so a Coordinator failure doesn't erase the Analysis opinion
+        # just saved above.
+        try:
+            decision = compute_decision(symbol=symbol, timeframe=timeframe)
+            save_decision(
+                symbol=symbol,
+                timeframe=timeframe,
+                timestamp=decision.timestamp,
+                decision=decision.to_dict(),
+            )
+        except Exception as e:  # noqa: BLE001 - background task, log and move on
+            logging.getLogger("webhook").error("auto-coordinator failed: %s", e)
+    except AnalysisAgentError as e:
+        logging.getLogger("webhook").error("auto-analysis failed: %s", e)
+
+
 @app.post("/webhook/tradingview", response_model=WebhookAck)
 def receive_market_state(
     payload: MarketStatePayload,
+    background_tasks: BackgroundTasks,
     x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret"),
 ) -> WebhookAck:
     # TradingView alerts can't set custom headers, so the secret travels
@@ -227,51 +272,15 @@ def receive_market_state(
     timing = evaluate_timing(payload.timestamp)
     analysis_would_run = should_run_analysis(timing)
 
-    # This used to only COMPUTE the gate decision without acting on it
-    # (a leftover from Sprint 2, before Analysis existed) — meaning
-    # Analysis never actually ran automatically, only ever via a
-    # manual /agents/analysis/run call or the dashboard's Run button.
-    # Now it actually runs Analysis here, matching the roadmap's
-    # original design (event-driven, fires on the webhook). Only for
-    # genuinely new bars — a retried/duplicate delivery shouldn't
-    # trigger a second paid LLM call for the same bar.
+    # Only for genuinely new bars — a retried/duplicate delivery
+    # shouldn't trigger a second paid LLM call for the same bar.
+    # Scheduled as a background task: the HTTP response below returns
+    # to TradingView immediately, and the (slower) LLM call + Coordinator
+    # run after, off the request/response path entirely.
     if is_new and analysis_would_run:
-        try:
-            recent_bars = get_recent(symbol=payload.symbol, timeframe=payload.timeframe, limit=10)
-            recent_bars.reverse()
-            opinion = run_analysis(symbol=payload.symbol, timeframe=payload.timeframe, bars=recent_bars)
-            save_opinion(
-                agent="analysis",
-                symbol=payload.symbol,
-                timeframe=payload.timeframe,
-                timestamp=opinion.timestamp,
-                opinion=opinion.to_dict(),
-            )
-
-            # Auto-compute and persist a Coordinator decision right
-            # after a fresh Analysis opinion lands — this is what
-            # actually populates /coordinator/history on its own,
-            # instead of requiring a manual "Compute & Save" click on
-            # the dashboard. Every 5-minute bar during an active
-            # session now produces one decision-history row, using
-            # whatever the latest News/Macro/Timing opinions are at
-            # that moment. Wrapped separately so a Coordinator failure
-            # (e.g. a storage hiccup) doesn't also erase the Analysis
-            # opinion we just successfully saved above.
-            try:
-                decision = compute_decision(symbol=payload.symbol, timeframe=payload.timeframe)
-                save_decision(
-                    symbol=payload.symbol,
-                    timeframe=payload.timeframe,
-                    timestamp=decision.timestamp,
-                    decision=decision.to_dict(),
-                )
-            except Exception as e:  # noqa: BLE001 - never let this break the webhook ack
-                logging.getLogger("webhook").error("auto-coordinator failed: %s", e)
-        except AnalysisAgentError as e:
-            # Don't let an Analysis failure break the webhook ack —
-            # TradingView still needs a clean response either way.
-            logging.getLogger("webhook").error("auto-analysis failed: %s", e)
+        background_tasks.add_task(
+            _run_auto_analysis_and_coordinator, payload.symbol, payload.timeframe
+        )
 
     return WebhookAck(
         status="stored" if is_new else "duplicate",
