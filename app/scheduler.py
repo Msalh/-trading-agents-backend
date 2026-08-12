@@ -38,11 +38,11 @@ from app.timing_agent import evaluate_timing, should_run_analysis
 logger = logging.getLogger("scheduler")
 
 NEWS_SYMBOL = os.environ.get("NEWS_SYMBOL", "MNQ1!")
-NEWS_INTERVAL_MINUTES = int(os.environ.get("NEWS_INTERVAL_MINUTES", "20"))
+NEWS_INTERVAL_MINUTES = int(os.environ.get("NEWS_INTERVAL_MINUTES", "60"))
 NEWS_TIMEFRAME = "global"  # News/Macro aren't tied to any chart timeframe
 
 MACRO_SYMBOL = os.environ.get("MACRO_SYMBOL", NEWS_SYMBOL)
-MACRO_INTERVAL_MINUTES = int(os.environ.get("MACRO_INTERVAL_MINUTES", "20"))
+MACRO_INTERVAL_MINUTES = int(os.environ.get("MACRO_INTERVAL_MINUTES", "60"))
 MACRO_TIMEFRAME = "global"
 
 _scheduler: BackgroundScheduler | None = None

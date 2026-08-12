@@ -9,6 +9,16 @@ reopens "should we trade" — that's fully decided before this runs;
 its only job is turning an already-approved decision into a
 concrete, well-formed order.
 
+An external review correctly pointed out that "valid JSON" was being
+treated as "valid trade" — the model's stop/target prices were never
+checked against basic trade geometry. This module now runs a
+deterministic validation pass after parsing: stop on the correct
+side of entry, targets on the profitable side, and a minimum
+reward:risk ratio. A geometrically invalid proposal is never
+silently accepted — it's returned with status="invalid" and the
+specific reason, so it's visible on the dashboard rather than acted
+on as if it were a normal plan.
+
 Paper only. Nothing here places a real order or talks to a broker —
 it produces a JSON order spec for the dashboard to display, exactly
 like every other agent's opinion.
@@ -23,6 +33,12 @@ import anthropic
 
 MODEL = "claude-sonnet-5"
 
+# Minimum acceptable reward:risk, measured against the NEAREST target
+# (the most conservative of however many targets were proposed) — a
+# plan that doesn't clear this bar even to its closest target is
+# rejected rather than displayed as a normal, actionable plan.
+MIN_REWARD_RISK_RATIO = float(os.environ.get("MIN_REWARD_RISK_RATIO", "1.0"))
+
 SYSTEM_PROMPT = """You handle execution. You receive the final decision after Risk Agent approval/modification (direction, size, account risk context), the current price and recent structure, and the key levels Analysis identified.
 
 Your job only: turn the decision into a concrete order — the decision to trade has already been made before you, and Risk has already approved a size. Do not reopen whether to trade.
@@ -30,8 +46,8 @@ Your job only: turn the decision into a concrete order — the decision to trade
 Determine:
 - order_type: "market" if the current price is already a reasonable entry, or "limit" if a specific nearby level makes more sense (e.g. waiting for a pullback to a key level in a trending move).
 - entry_price: the actual price for the order (current price for market, the specific level for limit).
-- stop_loss: an actual price, placed using the ATR and/or nearest structural level against the trade — not an arbitrary round number.
-- targets: 1-3 actual price levels, drawn from or reasoned from the key_levels you were given, in the direction of the trade.
+- stop_loss: an actual price, placed using the ATR and/or nearest structural level against the trade — not an arbitrary round number. The stop MUST be on the losing side of entry (below entry for a long, above entry for a short).
+- targets: 1-3 actual price levels, drawn from or reasoned from the key_levels you were given, in the direction of the trade. Targets MUST be on the profitable side of entry (above entry for a long, below entry for a short).
 - ready_now: true if this is a market order or the limit price is at/near current price; false if genuinely waiting for price to reach a limit zone.
 
 Respond with a single JSON object ONLY, no other text, no markdown code fences, matching exactly this shape:
@@ -55,7 +71,7 @@ class ExecutionOpinion:
     timestamp: str
     symbol: str
     timeframe: str
-    status: str  # "planned" | "no_action" | "error"
+    status: str  # "planned" | "no_action" | "error" | "invalid"
     direction: str | None
     size: int | None
     order_type: str | None
@@ -65,6 +81,7 @@ class ExecutionOpinion:
     ready_now: bool | None
     reasoning: str
     flags: list[str]
+    validation_error: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -82,6 +99,7 @@ class ExecutionOpinion:
             "ready_now": self.ready_now,
             "reasoning": self.reasoning,
             "flags": self.flags,
+            "validation_error": self.validation_error,
         }
 
 
@@ -123,6 +141,49 @@ def _parse_response(raw_text: str) -> dict:
         return json.loads(text)
     except json.JSONDecodeError as e:
         raise ExecutionAgentError(f"model did not return valid JSON: {e}\nraw: {raw_text[:500]}")
+
+
+def _validate_trade_geometry(
+    direction: str, entry_price: float, stop_loss: float, targets: list[float]
+) -> str | None:
+    """Deterministic sanity check on the LLM's proposed prices.
+    Returns None if valid, or a human-readable reason if not. Checks
+    only geometry (which side of entry things are on) and minimum
+    reward:risk — it has no opinion on whether the trade itself is a
+    good idea, that's the Coordinator/Risk's job upstream."""
+    if not targets:
+        return "no targets provided"
+
+    if direction == "bullish":
+        if not (stop_loss < entry_price):
+            return f"stop_loss ({stop_loss}) must be below entry_price ({entry_price}) for a long"
+        if any(t <= entry_price for t in targets):
+            return f"all targets must be above entry_price ({entry_price}) for a long, got {targets}"
+        nearest_target = min(targets)
+        reward = nearest_target - entry_price
+        risk = entry_price - stop_loss
+    elif direction == "bearish":
+        if not (stop_loss > entry_price):
+            return f"stop_loss ({stop_loss}) must be above entry_price ({entry_price}) for a short"
+        if any(t >= entry_price for t in targets):
+            return f"all targets must be below entry_price ({entry_price}) for a short, got {targets}"
+        nearest_target = max(targets)
+        reward = entry_price - nearest_target
+        risk = stop_loss - entry_price
+    else:
+        return f"unrecognized direction '{direction}'"
+
+    if risk <= 0:
+        return f"zero or negative risk distance (entry={entry_price}, stop={stop_loss})"
+
+    reward_risk_ratio = reward / risk
+    if reward_risk_ratio < MIN_REWARD_RISK_RATIO:
+        return (
+            f"reward:risk to nearest target is {reward_risk_ratio:.2f}, "
+            f"below the minimum {MIN_REWARD_RISK_RATIO:.2f}"
+        )
+
+    return None
 
 
 def plan_execution(
@@ -191,12 +252,19 @@ def plan_execution(
     if missing:
         raise ExecutionAgentError(f"model response missing required fields: {missing}")
 
+    validation_error = _validate_trade_geometry(
+        direction=direction,
+        entry_price=parsed["entry_price"],
+        stop_loss=parsed["stop_loss"],
+        targets=parsed["targets"],
+    )
+
     return ExecutionOpinion(
         agent="execution",
         timestamp=_now_iso(),
         symbol=symbol,
         timeframe=timeframe,
-        status="planned",
+        status="invalid" if validation_error else "planned",
         direction=direction,
         size=size,
         order_type=parsed["order_type"],
@@ -205,5 +273,6 @@ def plan_execution(
         targets=parsed["targets"],
         ready_now=parsed["ready_now"],
         reasoning=parsed["reasoning"],
-        flags=[],
+        flags=["failed_geometry_validation"] if validation_error else [],
+        validation_error=validation_error,
     )

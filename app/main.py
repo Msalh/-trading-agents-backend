@@ -77,6 +77,13 @@ removal of a single known-bad bar (e.g. a manual test webhook that
 leaked into real history) without wiping everything via
 /admin/wipe-all-data. Same secret-guard as the webhook.
 
+Tier-1 safety fixes (external review): six endpoints that trigger a
+paid LLM/search call or write to the database — /agents/analysis/run,
+/agents/news/run, /agents/macro/run, /coordinator/decide,
+/agents/risk/evaluate, /agents/execution/plan — were reachable by
+anyone with the URL. Now guarded by the same X-Webhook-Secret as the
+webhook and /admin/* endpoints.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -124,6 +131,19 @@ from app.storage import (
 from app.timing_agent import evaluate_timing, should_run_analysis
 
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+
+
+def _check_secret(x_webhook_secret: str | None) -> None:
+    """Shared guard for any endpoint that costs money (LLM/search
+    calls) or writes to the database. Originally only /webhook/tradingview
+    and /admin/* were protected — the /agents/*/run, /coordinator/decide,
+    /agents/risk/evaluate, and /agents/execution/plan endpoints were
+    reachable by anyone with the URL, including Execution which fires a
+    real paid LLM call on a bare GET. Same secret as the webhook, so no
+    new credential to manage."""
+    if not x_webhook_secret or x_webhook_secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="invalid or missing secret")
+
 
 app = FastAPI(title="Trading Agents Backend", version="0.1.0")
 
@@ -191,8 +211,8 @@ def system_status(symbol: str = Query(default=NEWS_SYMBOL)) -> dict:
         "server_time_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "scheduler_enabled": scheduler_enabled,
         "scheduler_intervals_minutes": {
-            "news": int(os.environ.get("NEWS_INTERVAL_MINUTES", "20")),
-            "macro": int(os.environ.get("MACRO_INTERVAL_MINUTES", "20")),
+            "news": int(os.environ.get("NEWS_INTERVAL_MINUTES", "60")),
+            "macro": int(os.environ.get("MACRO_INTERVAL_MINUTES", "60")),
         },
         "last_webhook_received": last_webhook,
         "minutes_since_last_webhook": _minutes_since(last_webhook),
@@ -351,7 +371,9 @@ def trigger_analysis(
         default=False,
         description="For manual testing only. In normal operation the Timing gate decides whether this runs.",
     ),
+    x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret"),
 ) -> dict:
+    _check_secret(x_webhook_secret)
     latest = get_latest(symbol=symbol, timeframe=timeframe)
     if latest is None:
         raise HTTPException(status_code=404, detail="no market data yet for that symbol/timeframe")
@@ -410,7 +432,9 @@ def read_analysis_history(
 @app.post("/agents/news/run")
 def trigger_news(
     symbol: str = Query(default=NEWS_SYMBOL),
+    x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret"),
 ) -> dict:
+    _check_secret(x_webhook_secret)
     try:
         opinion = run_news(symbol=symbol)
     except NewsAgentError as e:
@@ -439,7 +463,9 @@ def read_latest_news(
 @app.post("/agents/macro/run")
 def trigger_macro(
     symbol: str = Query(default=MACRO_SYMBOL),
+    x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret"),
 ) -> dict:
+    _check_secret(x_webhook_secret)
     try:
         opinion = run_macro(symbol=symbol)
     except MacroAgentError as e:
@@ -470,7 +496,9 @@ def coordinator_decide(
     symbol: str = Query(...),
     timeframe: str = Query(...),
     persist: bool = Query(default=True, description="store this decision in the history log"),
+    x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret"),
 ) -> dict:
+    _check_secret(x_webhook_secret)
     decision = compute_decision(symbol=symbol, timeframe=timeframe)
     if persist:
         save_decision(
@@ -523,7 +551,9 @@ def coordinator_history_outcomes(
 def risk_evaluate(
     symbol: str = Query(...),
     timeframe: str = Query(...),
+    x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret"),
 ) -> dict:
+    _check_secret(x_webhook_secret)
     recent_decisions = get_recent_decisions(symbol=symbol, timeframe=timeframe, limit=1)
     if not recent_decisions:
         raise HTTPException(
@@ -556,6 +586,7 @@ def risk_evaluate(
 def execution_plan(
     symbol: str = Query(...),
     timeframe: str = Query(...),
+    x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret"),
 ) -> dict:
     """Reads the most recently STORED Risk opinion and Coordinator
     decision (does not recompute them) plus the latest bar and
@@ -563,6 +594,7 @@ def execution_plan(
     trade into a concrete paper order. No LLM call at all if Risk
     didn't approve/modify anything — see plan_execution's no_action
     short-circuit."""
+    _check_secret(x_webhook_secret)
     risk_opinion = get_latest_opinion(agent="risk", symbol=symbol, timeframe=timeframe)
     if risk_opinion is None:
         raise HTTPException(
