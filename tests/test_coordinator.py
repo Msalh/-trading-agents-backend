@@ -197,3 +197,50 @@ def test_unparseable_timestamp_treated_as_stale(fresh_storage):
     )
     decision = coordinator.compute_decision(symbol="TEST", timeframe="5m")
     assert "analysis" in decision.stale_agents
+
+
+def test_stale_and_missing_are_disjoint(fresh_storage):
+    """A second external review caught that a stale opinion used to
+    appear in BOTH missing_agents and stale_agents (missing_agents was
+    computed as "not in the filtered opinions dict", which included
+    agents removed for staleness). They must now be mutually exclusive
+    — an agent is either present, missing (never ran), or stale (ran,
+    too old), never two of these at once."""
+    storage, coordinator = fresh_storage
+    stale_ts = _minutes_ago_iso(999)
+    storage.save_opinion("analysis", "TEST", "5m", "t1", _opinion("bullish", 90, timestamp=stale_ts))
+    # news never runs at all -> genuinely missing
+    decision = coordinator.compute_decision(symbol="TEST", timeframe="5m")
+
+    assert "analysis" in decision.stale_agents
+    assert "analysis" not in decision.missing_agents
+    assert "news" in decision.missing_agents
+    assert "news" not in decision.stale_agents
+    # no agent appears in both lists
+    assert set(decision.stale_agents).isdisjoint(set(decision.missing_agents))
+
+
+def test_future_timestamp_treated_as_stale(fresh_storage):
+    """A materially future-dated opinion is a data integrity problem,
+    not a fast clock — must not be treated as fresh."""
+    storage, coordinator = fresh_storage
+    from datetime import datetime, timedelta, timezone
+    future_ts = (datetime.now(timezone.utc) + timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    storage.save_opinion("analysis", "TEST", "5m", "t1", _opinion("bullish", 90, timestamp=future_ts))
+    decision = coordinator.compute_decision(symbol="TEST", timeframe="5m")
+    assert "analysis" in decision.stale_agents
+
+
+def test_opinions_used_captures_exact_snapshot(fresh_storage):
+    """CoordinatorDecision.opinions_used carries exactly the opinions
+    the score was computed from — this is what lets a trade candidate
+    be built as an atomic snapshot, without a second, separately-timed
+    database read that could see different data."""
+    storage, coordinator = fresh_storage
+    storage.save_opinion("analysis", "TEST", "5m", "t1", _opinion("bullish", 80))
+    storage.save_opinion("news", "TEST", "global", "t1", _opinion("bullish", 60))
+    decision = coordinator.compute_decision(symbol="TEST", timeframe="5m")
+
+    assert "analysis" in decision.opinions_used
+    assert "news" in decision.opinions_used
+    assert decision.opinions_used["analysis"]["confidence"] == 80

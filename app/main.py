@@ -84,6 +84,14 @@ paid LLM/search call or write to the database — /agents/analysis/run,
 anyone with the URL. Now guarded by the same X-Webhook-Secret as the
 webhook and /admin/* endpoints.
 
+Tier 2.1 (external review): added the trade-candidate lifecycle
+(app/candidates.py) — one immutable row per Coordinator run that
+freezes the exact bar and opinions a decision was scored from. Risk
+and Execution now act on that SAME candidate row instead of each
+independently querying "latest decision"/"latest opinion"/"latest
+bar", which could silently disagree if a new bar or opinion landed
+between two separately-timed lookups.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -98,6 +106,14 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.analysis_agent import AnalysisAgentError, run_analysis
+from app.candidates import (
+    CandidateError,
+    create_candidate,
+    get_candidate_history,
+    get_current_candidate,
+    record_execution_result,
+    record_risk_result,
+)
 from app.coordinator import compute_decision
 from app.execution_agent import ExecutionAgentError, plan_execution
 from app.macro_agent import MacroAgentError, run_macro
@@ -114,9 +130,11 @@ from app.scheduler import (
     stop_scheduler,
 )
 from app.storage import (
+    get_candidate_by_id,
     get_last_opinion_timestamps,
     get_last_webhook_received,
     get_latest,
+    get_latest_candidate,
     get_latest_opinion,
     get_recent,
     get_recent_decisions,
@@ -281,21 +299,26 @@ def _run_auto_analysis_and_coordinator(symbol: str, timeframe: str) -> None:
             opinion=opinion.to_dict(),
         )
 
-        # Auto-compute and persist a Coordinator decision right after a
-        # fresh Analysis opinion lands — this is what actually
-        # populates /coordinator/history on its own. Wrapped separately
-        # so a Coordinator failure doesn't erase the Analysis opinion
-        # just saved above.
+        # Auto-build a trade candidate right after a fresh Analysis
+        # opinion lands — this is what actually populates candidate
+        # history on its own. create_candidate() computes the
+        # Coordinator decision internally (capturing exactly which
+        # opinions it used) and freezes it together with the bar into
+        # one immutable row; Risk/Execution will act on THIS row, not
+        # on independently-fetched "latest" pieces. Still also writes
+        # to the older coordinator_decisions table for backward
+        # compatibility with the dashboard's existing Decision History
+        # view, until it's updated to read from candidate history.
         try:
-            decision = compute_decision(symbol=symbol, timeframe=timeframe)
+            candidate = create_candidate(symbol=symbol, timeframe=timeframe)
             save_decision(
                 symbol=symbol,
                 timeframe=timeframe,
-                timestamp=decision.timestamp,
-                decision=decision.to_dict(),
+                timestamp=candidate["decision"]["timestamp"],
+                decision=candidate["decision"],
             )
         except Exception as e:  # noqa: BLE001 - background task, log and move on
-            logging.getLogger("webhook").error("auto-coordinator failed: %s", e)
+            logging.getLogger("webhook").error("auto-candidate failed: %s", e)
     except AnalysisAgentError as e:
         logging.getLogger("webhook").error("auto-analysis failed: %s", e)
 
@@ -495,19 +518,54 @@ def read_latest_macro(
 def coordinator_decide(
     symbol: str = Query(...),
     timeframe: str = Query(...),
-    persist: bool = Query(default=True, description="store this decision in the history log"),
+    persist: bool = Query(default=True, description="build and store a trade candidate"),
     x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret"),
 ) -> dict:
     _check_secret(x_webhook_secret)
-    decision = compute_decision(symbol=symbol, timeframe=timeframe)
     if persist:
+        candidate = create_candidate(symbol=symbol, timeframe=timeframe)
         save_decision(
             symbol=symbol,
             timeframe=timeframe,
-            timestamp=decision.timestamp,
-            decision=decision.to_dict(),
+            timestamp=candidate["decision"]["timestamp"],
+            decision=candidate["decision"],
         )
+        return {**candidate["decision"], "candidate_id": candidate["candidate_id"]}
+    # persist=false is a preview — compute without creating a candidate
+    decision = compute_decision(symbol=symbol, timeframe=timeframe)
     return decision.to_dict()
+
+
+@app.get("/candidates/latest")
+def candidates_latest(
+    symbol: str = Query(...),
+    timeframe: str = Query(...),
+) -> dict:
+    """Read-only — the current trade candidate exactly as Risk/
+    Execution would see it: the frozen bar, the exact opinions the
+    decision was scored from, and whatever Risk/Execution results
+    have been attached to it so far (either may still be null)."""
+    candidate = get_latest_candidate(symbol=symbol, timeframe=timeframe)
+    if candidate is None:
+        raise HTTPException(status_code=404, detail="no trade candidate exists yet")
+    return candidate
+
+
+@app.get("/candidates/history")
+def candidates_history(
+    symbol: str = Query(...),
+    timeframe: str = Query(...),
+    limit: int = Query(default=20, le=200),
+) -> list[dict]:
+    return get_candidate_history(symbol=symbol, timeframe=timeframe, limit=limit)
+
+
+@app.get("/candidates/{candidate_id}")
+def candidate_by_id(candidate_id: str) -> dict:
+    candidate = get_candidate_by_id(candidate_id)
+    if candidate is None:
+        raise HTTPException(status_code=404, detail=f"no candidate found with id={candidate_id}")
+    return candidate
 
 
 @app.get("/coordinator/history")
@@ -553,22 +611,26 @@ def risk_evaluate(
     timeframe: str = Query(...),
     x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret"),
 ) -> dict:
+    """Reworked (Tier 2.1) to act on the current trade candidate as a
+    whole, instead of independently fetching 'latest decision' and
+    'latest bar' — those two used to potentially come from different
+    moments if a new bar arrived between the two separate queries.
+    The result is written back onto the SAME candidate row."""
     _check_secret(x_webhook_secret)
-    recent_decisions = get_recent_decisions(symbol=symbol, timeframe=timeframe, limit=1)
-    if not recent_decisions:
-        raise HTTPException(
-            status_code=404,
-            detail="no Coordinator decision stored yet — call /coordinator/decide first",
-        )
-    latest_decision = recent_decisions[0]
-    latest_bar = get_latest(symbol=symbol, timeframe=timeframe)
+    try:
+        candidate = get_current_candidate(symbol=symbol, timeframe=timeframe)
+    except CandidateError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
     risk_opinion = evaluate_risk(
         symbol=symbol,
         timeframe=timeframe,
-        coordinator_decision=latest_decision,
-        latest_bar=latest_bar,
+        coordinator_decision=candidate["decision"],
+        latest_bar=candidate["bar"],
     )
+    record_risk_result(candidate["candidate_id"], risk_opinion.to_dict())
+    # Also written to the older agent_opinions table — /system/status
+    # and the dashboard's existing Risk display still read from there.
     save_opinion(
         agent="risk",
         symbol=symbol,
@@ -577,7 +639,8 @@ def risk_evaluate(
         opinion=risk_opinion.to_dict(),
     )
     return {
-        "coordinator_decision": latest_decision,
+        "candidate_id": candidate["candidate_id"],
+        "coordinator_decision": candidate["decision"],
         "risk_opinion": risk_opinion.to_dict(),
     }
 
@@ -588,41 +651,45 @@ def execution_plan(
     timeframe: str = Query(...),
     x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret"),
 ) -> dict:
-    """Reads the most recently STORED Risk opinion and Coordinator
-    decision (does not recompute them) plus the latest bar and
-    Analysis's key_levels, and asks Execution to turn an approved
-    trade into a concrete paper order. No LLM call at all if Risk
-    didn't approve/modify anything — see plan_execution's no_action
-    short-circuit."""
+    """Reworked (Tier 2.1): requires the CURRENT candidate to already
+    have a Risk result attached — not just "some" Risk opinion from
+    anywhere. This closes the original gap where Execution could
+    combine a Risk approval for one decision with a different,
+    newer Coordinator decision. key_levels now come from the exact
+    Analysis opinion frozen inside this candidate's opinions_used,
+    not a fresh independent lookup that could have moved on."""
     _check_secret(x_webhook_secret)
-    risk_opinion = get_latest_opinion(agent="risk", symbol=symbol, timeframe=timeframe)
-    if risk_opinion is None:
+    try:
+        candidate = get_current_candidate(symbol=symbol, timeframe=timeframe)
+    except CandidateError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    if candidate["risk"] is None:
         raise HTTPException(
-            status_code=404,
-            detail="no Risk opinion stored yet — call /agents/risk/evaluate first",
+            status_code=409,
+            detail=(
+                "the current trade candidate has not been evaluated by Risk yet — "
+                "call /agents/risk/evaluate first (it must be run before Execution can "
+                "act on this same candidate)"
+            ),
         )
 
-    recent_decisions = get_recent_decisions(symbol=symbol, timeframe=timeframe, limit=1)
-    if not recent_decisions:
-        raise HTTPException(status_code=404, detail="no Coordinator decision stored yet")
-    latest_decision = recent_decisions[0]
-
-    latest_bar = get_latest(symbol=symbol, timeframe=timeframe)
-    analysis_opinion = get_latest_opinion(agent="analysis", symbol=symbol, timeframe=timeframe)
+    analysis_opinion = candidate["decision"].get("opinions_used", {}).get("analysis")
     key_levels = (analysis_opinion or {}).get("key_data", {}).get("key_levels")
 
     try:
         execution_opinion = plan_execution(
             symbol=symbol,
             timeframe=timeframe,
-            risk_evaluation=risk_opinion,
-            coordinator_decision=latest_decision,
-            latest_bar=latest_bar,
+            risk_evaluation=candidate["risk"],
+            coordinator_decision=candidate["decision"],
+            latest_bar=candidate["bar"],
             analysis_key_levels=key_levels,
         )
     except ExecutionAgentError as e:
         raise HTTPException(status_code=502, detail=str(e))
 
+    record_execution_result(candidate["candidate_id"], execution_opinion.to_dict())
     save_opinion(
         agent="execution",
         symbol=symbol,
@@ -630,7 +697,7 @@ def execution_plan(
         timestamp=execution_opinion.timestamp,
         opinion=execution_opinion.to_dict(),
     )
-    return {"execution_opinion": execution_opinion.to_dict()}
+    return {"candidate_id": candidate["candidate_id"], "execution_opinion": execution_opinion.to_dict()}
 
 
 @app.get("/market-state/latest", response_model=MarketStateOut)

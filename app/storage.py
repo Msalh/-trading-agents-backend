@@ -57,6 +57,19 @@ CREATE TABLE IF NOT EXISTS coordinator_decisions (
 );
 CREATE INDEX IF NOT EXISTS idx_decisions_symbol_timeframe_ts
     ON coordinator_decisions (symbol, timeframe, timestamp DESC);
+
+CREATE TABLE IF NOT EXISTS trade_candidates (
+    candidate_id TEXT PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    timeframe TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    bar_json TEXT,
+    decision_json TEXT NOT NULL,
+    risk_json TEXT,
+    execution_json TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_candidates_symbol_timeframe_created
+    ON trade_candidates (symbol, timeframe, created_at DESC);
 """
 
 
@@ -307,18 +320,142 @@ def delete_market_state_event(event_id: str) -> bool:
 
 
 def wipe_all_data() -> dict:
-    """Deletes every row from market_state, agent_opinions, and
-    coordinator_decisions. Irreversible — used once to clear test/
-    synthetic data before a real trading session starts. Returns the
-    number of rows removed from each table."""
+    """Deletes every row from market_state, agent_opinions,
+    coordinator_decisions, and trade_candidates. Irreversible — used
+    once to clear test/synthetic data before a real trading session
+    starts. Returns the number of rows removed from each table."""
     conn = get_connection()
     try:
         counts = {}
-        for table in ("market_state", "agent_opinions", "coordinator_decisions"):
+        for table in ("market_state", "agent_opinions", "coordinator_decisions", "trade_candidates"):
             cur = conn.execute(f"SELECT COUNT(*) as c FROM {table}")
             counts[table] = cur.fetchone()["c"]
             conn.execute(f"DELETE FROM {table}")
         conn.commit()
         return counts
+    finally:
+        conn.close()
+
+
+def save_candidate(
+    candidate_id: str,
+    symbol: str,
+    timeframe: str,
+    bar: dict | None,
+    decision: dict,
+) -> None:
+    """Persists a new trade candidate — an atomic, immutable snapshot
+    of the bar and the exact opinions/decision it was built from.
+    risk_json/execution_json start empty and are filled in later by
+    attach_risk_result/attach_execution_result, on this SAME row —
+    never a new independent record, so there's exactly one candidate
+    per decision moment, not a scattered set of "latest" lookups."""
+    conn = get_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO trade_candidates
+                (candidate_id, symbol, timeframe, bar_json, decision_json, risk_json, execution_json)
+            VALUES (?, ?, ?, ?, ?, NULL, NULL)
+            """,
+            (
+                candidate_id,
+                symbol,
+                timeframe,
+                json.dumps(bar) if bar is not None else None,
+                json.dumps(decision),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _row_to_candidate(row: sqlite3.Row) -> dict:
+    return {
+        "candidate_id": row["candidate_id"],
+        "symbol": row["symbol"],
+        "timeframe": row["timeframe"],
+        "created_at": row["created_at"],
+        "bar": json.loads(row["bar_json"]) if row["bar_json"] else None,
+        "decision": json.loads(row["decision_json"]),
+        "risk": json.loads(row["risk_json"]) if row["risk_json"] else None,
+        "execution": json.loads(row["execution_json"]) if row["execution_json"] else None,
+    }
+
+
+def get_latest_candidate(symbol: str, timeframe: str) -> Optional[dict]:
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            """
+            SELECT * FROM trade_candidates
+            WHERE symbol = ? AND timeframe = ?
+            ORDER BY created_at DESC, rowid DESC
+            LIMIT 1
+            """,
+            (symbol, timeframe),
+        ).fetchone()
+        return _row_to_candidate(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_candidate_by_id(candidate_id: str) -> Optional[dict]:
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM trade_candidates WHERE candidate_id = ?",
+            (candidate_id,),
+        ).fetchone()
+        return _row_to_candidate(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_recent_candidates(symbol: str, timeframe: str, limit: int = 20) -> list[dict]:
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT * FROM trade_candidates
+            WHERE symbol = ? AND timeframe = ?
+            ORDER BY created_at DESC, rowid DESC
+            LIMIT ?
+            """,
+            (symbol, timeframe, limit),
+        ).fetchall()
+        return [_row_to_candidate(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def attach_risk_result(candidate_id: str, risk_opinion: dict) -> bool:
+    """Writes the Risk evaluation onto the SAME candidate row it was
+    evaluated against — not a new record. Returns False if the
+    candidate_id doesn't exist (caller should treat that as an error,
+    never silently create a new row)."""
+    conn = get_connection()
+    try:
+        cur = conn.execute(
+            "UPDATE trade_candidates SET risk_json = ? WHERE candidate_id = ?",
+            (json.dumps(risk_opinion), candidate_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def attach_execution_result(candidate_id: str, execution_opinion: dict) -> bool:
+    """Same pattern as attach_risk_result, for the Execution plan."""
+    conn = get_connection()
+    try:
+        cur = conn.execute(
+            "UPDATE trade_candidates SET execution_json = ? WHERE candidate_id = ?",
+            (json.dumps(execution_opinion), candidate_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
     finally:
         conn.close()

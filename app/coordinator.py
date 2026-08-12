@@ -11,15 +11,13 @@ Important design note on Timing: its "direction" is always "neutral"
 by design (see timing_agent.py) — timing quality has no directional
 opinion, it only gates whether now is a reasonable time to act at
 all. That means Timing's slot in the weighted sum always contributes
-0 magnitude, regardless of its confidence. This is not a bug: Timing
-already did its real job earlier, as the gate that decides whether
-Analysis runs in the first place. Its presence here is for schema
-symmetry with the roadmap's original agent table, not because it
-swings the score. (An external review flagged that this mechanically
-shrinks the effective score range whenever Timing is counted in
-available_weight — noted, deliberately not changed in this pass;
-would mean restructuring Timing out of the weighted vote entirely,
-a bigger change than the two fixes below.)
+0 magnitude, regardless of its confidence. A second external review
+correctly pointed out this makes MIN_AVAILABLE_WEIGHT partly
+ineffective: Analysis (40%) + a present-but-neutral Timing (20%) =
+exactly 60%, clearing the minimum even though Timing added zero real
+evidence. Deliberately not restructured in this pass (would mean
+redesigning the weighting scheme itself, tracked as Tier 2.8) — but
+documented here so it's not mistaken for solved.
 
 Conflict handling: if Analysis and News point in opposite directions
 and News is flagged "urgent", the score is dampened rather than
@@ -27,21 +25,27 @@ letting one agent's confidence silently cancel the other's — this
 matches the "never ignore the flag" rule from the agreed prompts.
 
 Missing opinions (an agent that hasn't run yet, or ran too long ago)
-are excluded rather than treated as neutral — a genuine "don't know"
-is not the same as "neutral", so weights are re-normalized across
-only the agents that actually have a current opinion.
+are excluded rather than treated as neutral. Two genuinely different
+"don't know" cases are now tracked separately:
+  - missing_agents: the agent has NEVER produced an opinion for this
+    symbol/timeframe (get_latest_opinion returned nothing at all).
+  - stale_agents: an opinion exists but is older than its type's max
+    age (or has an unparseable/future timestamp — clock skew or a
+    corrupted write, treated conservatively as untrustworthy either
+    way), so it's excluded from the score exactly like a missing one,
+    but the two are no longer conflated in the reported lists.
 
-Two safeguards added after an external review found the renormalization
-rule could let a single available agent decide a trade alone:
-  1. MIN_AVAILABLE_WEIGHT — if the combined weight of agents that
-     actually have a current opinion falls below this fraction of the
-     total, the decision is "insufficient_data" rather than trading
-     on a lopsided subset (e.g. Analysis alone, at 40% weight, can no
-     longer single-handedly trigger enter_long/enter_short).
-  2. Freshness checks — an opinion older than its type's max age is
-     treated as if the agent never ran at all (excluded, not just
-     discounted), so a stale News/Macro read from hours ago can't
-     silently count as "current."
+MIN_AVAILABLE_WEIGHT: if the combined weight of agents that actually
+have a current opinion falls below this fraction of the total, the
+decision is "insufficient_data" rather than trading on a lopsided
+subset. Known incomplete (see Timing note above) — not re-tuned in
+this pass, since the fix is a weighting redesign, not a bigger number.
+
+opinions_used: every CoordinatorDecision now carries the exact
+opinions dict it was scored from. This is what makes a "trade
+candidate" (see app/candidates.py) an atomic snapshot instead of
+downstream stages re-querying "latest" independently and risking a
+mismatched combination.
 """
 
 import os
@@ -73,6 +77,9 @@ MIN_AVAILABLE_WEIGHT = float(os.environ.get("MIN_AVAILABLE_WEIGHT", "0.6"))
 # How old an opinion can be before it's treated as if the agent never
 # ran — separate thresholds since Analysis is bar-driven (every 5min
 # in session) while News/Macro run on a slower scheduler (60min).
+# Known-blunt (flagged by review): not yet timeframe-aware for
+# Analysis, not yet event/regime-aware for News/Macro — tracked as
+# Tier 2 work, not fixed in this pass.
 ANALYSIS_MAX_AGE_MINUTES = int(os.environ.get("ANALYSIS_MAX_AGE_MINUTES", "15"))
 NEWS_MACRO_MAX_AGE_MINUTES = int(os.environ.get("NEWS_MACRO_MAX_AGE_MINUTES", "90"))
 _MAX_AGE_MINUTES = {
@@ -80,6 +87,11 @@ _MAX_AGE_MINUTES = {
     "news": NEWS_MACRO_MAX_AGE_MINUTES,
     "macro": NEWS_MACRO_MAX_AGE_MINUTES,
 }
+
+# How far in the future a timestamp can be (clock skew tolerance)
+# before it's treated as suspect rather than fresh. A materially
+# future-dated opinion is a data integrity problem, not a fast clock.
+_FUTURE_SKEW_TOLERANCE_MINUTES = 2
 
 _DIRECTION_VALUE = {"bullish": 1, "neutral": 0, "bearish": -1}
 
@@ -98,6 +110,7 @@ class CoordinatorDecision:
     stale_agents: list[str]
     conflict_flags: list[str]
     summary: str
+    opinions_used: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -113,6 +126,7 @@ class CoordinatorDecision:
             "stale_agents": self.stale_agents,
             "conflict_flags": self.conflict_flags,
             "summary": self.summary,
+            "opinions_used": self.opinions_used,
         }
 
 
@@ -125,61 +139,60 @@ def _parse_utc(timestamp: str) -> datetime | None:
 
 def _is_stale(opinion_timestamp: str | None, max_age_minutes: int) -> bool:
     """An opinion with no parseable timestamp is treated as stale —
-    untrustworthy, not "assume it's fine"."""
+    untrustworthy, not "assume it's fine". A materially future-dated
+    timestamp is also stale (data integrity issue, not freshness)."""
     dt = _parse_utc(opinion_timestamp) if opinion_timestamp else None
     if dt is None:
         return True
     age_minutes = (datetime.now(timezone.utc) - dt).total_seconds() / 60
+    if age_minutes < -_FUTURE_SKEW_TOLERANCE_MINUTES:
+        return True
     return age_minutes > max_age_minutes
 
 
-def _gather_opinions(symbol: str, timeframe: str) -> tuple[dict, list[str]]:
+def _gather_opinions(symbol: str, timeframe: str) -> tuple[dict, list[str], list[str]]:
     """Collect the latest opinion from each agent. Analysis is keyed
     by symbol+timeframe (bar-dependent); News/Macro are keyed by
     symbol+"global" (not bar-dependent); Timing is computed fresh
     from the latest market_state timestamp (it's pure logic, always
     available and always current if we have any market data at all —
-    never subject to the staleness check below).
+    never subject to the staleness check below, though the market
+    bar it's derived from has no freshness check of its own either —
+    a known gap if the webhook stops delivering, tracked as Tier 2).
 
-    Returns (opinions, stale_agents) — an opinion older than its
-    type's max age is dropped from `opinions` and reported separately
-    in `stale_agents`, distinct from an agent that simply never ran
-    (which only ever shows up in the caller's missing_agents list)."""
+    Returns (opinions, missing_agents, stale_agents) — three disjoint
+    sets: an agent is in exactly one of "present in opinions",
+    missing (never produced an opinion at all), or stale (produced
+    one, but it's too old/unparseable/future-dated to trust)."""
     opinions: dict = {}
+    missing_agents: list[str] = []
     stale_agents: list[str] = []
 
-    analysis = get_latest_opinion(agent="analysis", symbol=symbol, timeframe=timeframe)
-    if analysis is not None:
-        if _is_stale(analysis.get("timestamp"), _MAX_AGE_MINUTES["analysis"]):
-            stale_agents.append("analysis")
+    for agent_name, timeframe_key, max_age in (
+        ("analysis", timeframe, _MAX_AGE_MINUTES["analysis"]),
+        ("news", "global", _MAX_AGE_MINUTES["news"]),
+        ("macro", "global", _MAX_AGE_MINUTES["macro"]),
+    ):
+        opinion = get_latest_opinion(agent=agent_name, symbol=symbol, timeframe=timeframe_key)
+        if opinion is None:
+            missing_agents.append(agent_name)
+        elif _is_stale(opinion.get("timestamp"), max_age):
+            stale_agents.append(agent_name)
         else:
-            opinions["analysis"] = analysis
-
-    news = get_latest_opinion(agent="news", symbol=symbol, timeframe="global")
-    if news is not None:
-        if _is_stale(news.get("timestamp"), _MAX_AGE_MINUTES["news"]):
-            stale_agents.append("news")
-        else:
-            opinions["news"] = news
-
-    macro = get_latest_opinion(agent="macro", symbol=symbol, timeframe="global")
-    if macro is not None:
-        if _is_stale(macro.get("timestamp"), _MAX_AGE_MINUTES["macro"]):
-            stale_agents.append("macro")
-        else:
-            opinions["macro"] = macro
+            opinions[agent_name] = opinion
 
     latest_bar = get_latest(symbol=symbol, timeframe=timeframe)
     if latest_bar is not None:
         timing = evaluate_timing(latest_bar["timestamp"])
         opinions["timing"] = timing.to_dict()
+    else:
+        missing_agents.append("timing")
 
-    return opinions, stale_agents
+    return opinions, missing_agents, stale_agents
 
 
 def compute_decision(symbol: str, timeframe: str) -> CoordinatorDecision:
-    opinions, stale_agents = _gather_opinions(symbol=symbol, timeframe=timeframe)
-    missing_agents = [a for a in WEIGHTS if a not in opinions]
+    opinions, missing_agents, stale_agents = _gather_opinions(symbol=symbol, timeframe=timeframe)
 
     available_weight = sum(WEIGHTS[a] for a in opinions)
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -207,6 +220,7 @@ def compute_decision(symbol: str, timeframe: str) -> CoordinatorDecision:
             stale_agents=stale_agents,
             conflict_flags=[],
             summary=reason,
+            opinions_used=opinions,
         )
 
     contributions = {}
@@ -277,4 +291,5 @@ def compute_decision(symbol: str, timeframe: str) -> CoordinatorDecision:
         stale_agents=stale_agents,
         conflict_flags=conflict_flags,
         summary=summary,
+        opinions_used=opinions,
     )
