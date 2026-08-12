@@ -271,6 +271,10 @@
       <input id="apiBase" class="wide" value="https://web-production-c67aa.up.railway.app" spellcheck="false">
     </div>
     <div class="field">
+      <label>Secret</label>
+      <input id="webhookSecret" type="password" spellcheck="false" autocomplete="off">
+    </div>
+    <div class="field">
       <label>Symbol</label>
       <input id="symbol" value="MNQ1!" spellcheck="false">
     </div>
@@ -378,14 +382,21 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
-const apiBaseEl = $('apiBase'), symbolEl = $('symbol'), timeframeEl = $('timeframe');
+const apiBaseEl = $('apiBase'), symbolEl = $('symbol'), timeframeEl = $('timeframe'), secretEl = $('webhookSecret');
 
 function apiBase() { return apiBaseEl.value.replace(/\/+$/, ''); }
 
+// Stored locally only — never sent anywhere but this API, as the
+// X-Webhook-Secret header the backend's protected endpoints require.
+secretEl.value = localStorage.getItem('webhookSecret') || '';
+secretEl.addEventListener('change', () => localStorage.setItem('webhookSecret', secretEl.value));
+
 async function api(method, path) {
   const url = apiBase() + path;
+  const headers = {};
+  if (secretEl.value) headers['X-Webhook-Secret'] = secretEl.value;
   try {
-    const res = await fetch(url, { method });
+    const res = await fetch(url, { method, headers });
     let data = null;
     try { data = await res.json(); } catch (_) {}
     return { ok: res.ok, status: res.status, data };
