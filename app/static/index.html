@@ -146,6 +146,7 @@
   .decision-arrow { display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 20px; }
   .col-label { font-size: 10.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; font-weight: 600; }
   .decision-value { font-size: 26px; font-weight: 700; font-family: var(--font-mono); }
+  .decision-value[title], .badge[title] { cursor: help; }
   .decision-value.enter_long { color: var(--bull); }
   .decision-value.enter_short { color: var(--bear); }
   .decision-value.no_trade { color: var(--neutral); }
@@ -1004,6 +1005,25 @@ async function refreshDecisionLive() {
   return d;
 }
 
+// Read-only lookup of the current trade candidate — purely to surface
+// candidate_id as a tooltip on the Coordinator Decision value, so it's
+// visually verifiable which candidate a given decision/risk/execution
+// triple actually belongs to. persist=false decide calls (the ones the
+// 30s auto-refresh uses) never create a candidate themselves, so this
+// is the only reliable way to show "whatever the latest one is" —
+// including one created by the webhook's auto-analysis path, not just
+// by clicking "Compute & Save".
+async function refreshCandidateInfo() {
+  const symbol = symbolEl.value, timeframe = timeframeEl.value;
+  const res = await api('GET', `/candidates/latest?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}`);
+  const el = $('decisionValue');
+  if (res.ok && res.data && res.data.candidate_id) {
+    el.title = `candidate_id: ${res.data.candidate_id}`;
+  } else {
+    el.title = '';
+  }
+}
+
 async function refreshRisk() {
   const symbol = symbolEl.value, timeframe = timeframeEl.value;
   const res = await api('GET', `/agents/risk/evaluate?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}`);
@@ -1018,8 +1038,9 @@ async function refreshRisk() {
   }
   const risk = res.data.risk_opinion;
   const basedOn = res.data.coordinator_decision;
+  const candidateId = res.data.candidate_id;
   $('riskTime').textContent = fmtAgo(risk.timestamp);
-  $('riskBadge').innerHTML = `<span class="badge ${risk.decision}">${escapeHtml(risk.decision)}</span>`;
+  $('riskBadge').innerHTML = `<span class="badge ${risk.decision}" ${candidateId ? `title="candidate_id: ${escapeHtml(candidateId)}"` : ''}>${escapeHtml(risk.decision)}</span>`;
   el.innerHTML = `
     <div class="reasoning">${escapeHtml(risk.reasoning)}</div>
     <div class="kv">
@@ -1048,9 +1069,10 @@ async function refreshExecution() {
     return;
   }
   const exec = res.data.execution_opinion;
+  const candidateId = res.data.candidate_id;
   $('execTime').textContent = fmtAgo(exec.timestamp);
   const badgeClass = exec.status === 'planned' ? dirClass(exec.direction) : 'no_action';
-  $('execBadge').innerHTML = `<span class="badge ${badgeClass}">${escapeHtml(exec.status)}</span>`;
+  $('execBadge').innerHTML = `<span class="badge ${badgeClass}" ${candidateId ? `title="candidate_id: ${escapeHtml(candidateId)}"` : ''}>${escapeHtml(exec.status)}</span>`;
 
   const isExpanded = expandedReasoning.has('execution');
   el.innerHTML = `
@@ -1095,7 +1117,7 @@ async function refreshAll() {
   // independent (their own bars + their own per-timeframe Analysis
   // opinion), so they run alongside everything else.
   await refreshAllAgentCards();
-  await Promise.all([refreshDecisionLive(), refreshRisk(), refreshHistory(), refreshAllCharts(), refreshSystemStatus()]);
+  await Promise.all([refreshDecisionLive(), refreshCandidateInfo(), refreshRisk(), refreshHistory(), refreshAllCharts(), refreshSystemStatus()]);
   renderSessionClock();
   $('lastUpdated').textContent = 'updated ' + new Date().toLocaleTimeString();
 }
@@ -1108,7 +1130,7 @@ $('decideBtn').addEventListener('click', async () => {
   btn.disabled = true;
   const symbol = symbolEl.value, timeframe = timeframeEl.value;
   await api('GET', `/coordinator/decide?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&persist=true`);
-  await Promise.all([refreshDecisionLive(), refreshHistory()]);
+  await Promise.all([refreshDecisionLive(), refreshCandidateInfo(), refreshHistory()]);
   btn.disabled = false;
 });
 
@@ -1123,7 +1145,7 @@ $('runAllBtn').addEventListener('click', async () => {
     await refreshAgentCard(agent);
   }
   btn.textContent = 'Deciding…';
-  await refreshDecisionLive();
+  await Promise.all([refreshDecisionLive(), refreshCandidateInfo()]);
   btn.textContent = orig;
   btn.disabled = false;
 });
