@@ -294,6 +294,18 @@ def get_recent_opinions(agent: str, symbol: str, timeframe: str, limit: int = 20
         conn.close()
 
 
+def delete_market_state_event(event_id: str) -> bool:
+    """Deletes a single market_state row by its event_id. Returns True
+    if a row was actually deleted, False if no row matched."""
+    conn = get_connection()
+    try:
+        cur = conn.execute("DELETE FROM market_state WHERE event_id = ?", (event_id,))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
 def wipe_all_data() -> dict:
     """Deletes every row from market_state, agent_opinions, and
     coordinator_decisions. Irreversible — used once to clear test/

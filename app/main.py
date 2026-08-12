@@ -72,6 +72,11 @@ a BackgroundTasks task instead of inline — the webhook acks
 TradingView immediately instead of waiting on the LLM call, avoiding
 delivery timeouts on TradingView's side.
 
+Sprint 17: added DELETE /admin/market-state/{event_id} — surgical
+removal of a single known-bad bar (e.g. a manual test webhook that
+leaked into real history) without wiping everything via
+/admin/wipe-all-data. Same secret-guard as the webhook.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -113,6 +118,7 @@ from app.storage import (
     save_decision,
     save_event,
     save_opinion,
+    delete_market_state_event,
     wipe_all_data,
 )
 from app.timing_agent import evaluate_timing, should_run_analysis
@@ -207,6 +213,27 @@ def admin_wipe_all_data(
         raise HTTPException(status_code=401, detail="invalid or missing secret")
     counts = wipe_all_data()
     return {"wiped": True, "rows_deleted": counts}
+
+
+@app.delete("/admin/market-state/{event_id}")
+def admin_delete_market_state_event(
+    event_id: str,
+    x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret"),
+) -> dict:
+    """Deletes a single market_state bar by its event_id — for
+    surgically removing known-bad data (e.g. manual test webhooks
+    that leaked into real history) without wiping everything else.
+    Scoped to market_state only: it does not cascade-delete any
+    agent_opinions or coordinator_decisions that were computed from
+    that bar, since those aren't tied to it by a reliable key (the
+    Coordinator's own timestamp is its compute time, not the bar's).
+    Guarded by the same secret as the webhook."""
+    if not x_webhook_secret or x_webhook_secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="invalid or missing secret")
+    deleted = delete_market_state_event(event_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"no market_state row found for event_id={event_id}")
+    return {"deleted": True, "event_id": event_id}
 
 
 @app.get("/")
