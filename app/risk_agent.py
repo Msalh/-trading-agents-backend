@@ -1,22 +1,47 @@
 """
-Risk Agent — Sprint 7.
+Risk Agent — Sprint 7, reworked in Tier 2.2.
 
 Deliberately NOT an LLM call, unlike Analysis/News/Macro. Money math
 needs to be exact, not "probably right" — the same reasoning that
-made Timing Agent pure logic applies even more strongly here. Given
-a Coordinator decision plus the account state, this computes whether
-the proposed trade fits within the remaining risk budget.
+made Timing Agent pure logic applies even more strongly here.
 
-Account state is static/manual for Sprint 7 (the system doesn't have
-a live broker connection yet) — set via environment variables and
-updated by hand as the real account balance/drawdown changes. See
-.env.example for ACCOUNT_BALANCE / MAX_DRAWDOWN / CURRENT_DRAWDOWN_USED
-/ CURRENT_OPEN_POSITIONS.
+Account state is static/manual (the system doesn't have a live broker
+connection yet) — set via environment variables and updated by hand as
+the real account balance/drawdown changes. See .env.example for
+ACCOUNT_BALANCE / MAX_DRAWDOWN / CURRENT_DRAWDOWN_USED /
+CURRENT_OPEN_POSITIONS.
 
-Position size is estimated in dollars using ATR (from the latest
-market_state bar) as a proxy for stop distance — there's no explicit
-stop price elsewhere in the system yet, so this is a conservative
-approximation: risk_per_contract ≈ ATR (points) × point_value.
+Tier 2.2 (external review): the original design sized every position
+using ATR as a *proxy* for stop distance, because Execution — which
+actually picks the real stop — used to run only AFTER Risk had already
+approved a size. A real stop chosen afterward could be materially
+tighter or wider than ATR, so the position Risk "approved" often
+didn't carry the dollar risk Risk thought it did. The two are now
+genuinely different numbers computed at different times; ATR is a
+volatility read, not a stop-placement decision.
+
+Fixed by splitting Risk into two stages that run around Execution
+instead of entirely before it:
+
+  1. evaluate_risk_gate() — runs immediately after a trade candidate
+     exists, before any paid LLM call. Checks only the two hard
+     constraints that don't need a stop price at all: are we already
+     at the position limit, is there any drawdown room left. No ATR
+     anywhere in this stage — it doesn't estimate risk, it only checks
+     whether spending an Execution LLM call is even worth it. Result
+     is "reject" (hard block), "no_action" (nothing to evaluate), or
+     "pending_execution" (cleared — Execution can now run).
+  2. size_position() — runs once Execution has attached a real
+     entry_price/stop_loss to the SAME candidate. Computes
+     risk_per_contract = abs(entry_price - stop_loss) * point_value
+     from that actual proposed stop, then decides
+     approve/modify/reject exactly as before — just against a real
+     number instead of an ATR-derived estimate.
+
+Both stages are read through the same /agents/risk/evaluate endpoint
+(see main.py) — it inspects the candidate to decide which stage to
+run, so calling it twice across one candidate's lifecycle (once before
+Execution, once after) is the intended flow.
 """
 
 import os
@@ -40,7 +65,8 @@ class RiskOpinion:
     timestamp: str
     symbol: str
     timeframe: str
-    decision: str  # "approve" | "modify" | "reject" | "no_action"
+    stage: str  # "gate" | "size"
+    decision: str  # "no_action" | "reject" | "pending_execution" | "approve" | "modify"
     original_size: int
     suggested_size: int | None
     reasoning: str
@@ -53,6 +79,7 @@ class RiskOpinion:
             "timestamp": self.timestamp,
             "symbol": self.symbol,
             "timeframe": self.timeframe,
+            "stage": self.stage,
             "decision": self.decision,
             "original_size": self.original_size,
             "suggested_size": self.suggested_size,
@@ -62,26 +89,13 @@ class RiskOpinion:
         }
 
 
-def evaluate_risk(symbol: str, timeframe: str, coordinator_decision: dict, latest_bar: dict | None) -> RiskOpinion:
-    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    trade_decision = coordinator_decision.get("decision")
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    if trade_decision not in ("enter_long", "enter_short"):
-        return RiskOpinion(
-            agent="risk",
-            timestamp=now_iso,
-            symbol=symbol,
-            timeframe=timeframe,
-            decision="no_action",
-            original_size=0,
-            suggested_size=None,
-            reasoning=f"Coordinator decision is '{trade_decision}' — nothing for Risk to evaluate.",
-            key_data={},
-            flags=[],
-        )
 
+def _account_snapshot() -> dict:
     remaining_room = MAX_DRAWDOWN - CURRENT_DRAWDOWN_USED
-    account_snapshot = {
+    return {
         "account_balance": ACCOUNT_BALANCE,
         "max_drawdown": MAX_DRAWDOWN,
         "current_drawdown_used": CURRENT_DRAWDOWN_USED,
@@ -90,12 +104,37 @@ def evaluate_risk(symbol: str, timeframe: str, coordinator_decision: dict, lates
         "current_open_positions": CURRENT_OPEN_POSITIONS,
     }
 
+
+def evaluate_risk_gate(symbol: str, timeframe: str, coordinator_decision: dict) -> RiskOpinion:
+    """Stage 1. No stop price involved — this only decides whether
+    it's worth letting Execution spend a paid LLM call at all."""
+    now_iso = _now_iso()
+    trade_decision = coordinator_decision.get("decision")
+
+    if trade_decision not in ("enter_long", "enter_short"):
+        return RiskOpinion(
+            agent="risk",
+            timestamp=now_iso,
+            symbol=symbol,
+            timeframe=timeframe,
+            stage="gate",
+            decision="no_action",
+            original_size=0,
+            suggested_size=None,
+            reasoning=f"Coordinator decision is '{trade_decision}' — nothing for Risk to evaluate.",
+            key_data={},
+            flags=[],
+        )
+
+    account_snapshot = _account_snapshot()
+
     if CURRENT_OPEN_POSITIONS >= MAX_OPEN_POSITIONS:
         return RiskOpinion(
             agent="risk",
             timestamp=now_iso,
             symbol=symbol,
             timeframe=timeframe,
+            stage="gate",
             decision="reject",
             original_size=BASE_POSITION_SIZE,
             suggested_size=None,
@@ -107,12 +146,14 @@ def evaluate_risk(symbol: str, timeframe: str, coordinator_decision: dict, lates
             flags=["max_positions_reached"],
         )
 
+    remaining_room = account_snapshot["remaining_drawdown_room"]
     if remaining_room <= 0:
         return RiskOpinion(
             agent="risk",
             timestamp=now_iso,
             symbol=symbol,
             timeframe=timeframe,
+            stage="gate",
             decision="reject",
             original_size=BASE_POSITION_SIZE,
             suggested_size=None,
@@ -121,28 +162,81 @@ def evaluate_risk(symbol: str, timeframe: str, coordinator_decision: dict, lates
             flags=["drawdown_exhausted"],
         )
 
-    atr = (latest_bar or {}).get("atr")
-    if atr is None or atr <= 0:
+    return RiskOpinion(
+        agent="risk",
+        timestamp=now_iso,
+        symbol=symbol,
+        timeframe=timeframe,
+        stage="gate",
+        decision="pending_execution",
+        original_size=BASE_POSITION_SIZE,
+        suggested_size=None,
+        reasoning=(
+            "Position limits and drawdown room are both clear — proceeding to Execution "
+            "to determine the actual entry/stop before sizing this trade."
+        ),
+        key_data=account_snapshot,
+        flags=[],
+    )
+
+
+def size_position(
+    symbol: str,
+    timeframe: str,
+    entry_price: float,
+    stop_loss: float,
+) -> RiskOpinion:
+    """Stage 2. Sizes the position from Execution's real proposed stop
+    distance — never ATR. Callers (see main.py) are responsible for
+    only reaching this stage once the gate has cleared and Execution
+    has produced a validated (status="planned") order."""
+    now_iso = _now_iso()
+    account_snapshot = _account_snapshot()
+    remaining_room = account_snapshot["remaining_drawdown_room"]
+
+    risk_per_unit = abs(entry_price - stop_loss)
+    if risk_per_unit <= 0:
         return RiskOpinion(
             agent="risk",
             timestamp=now_iso,
             symbol=symbol,
             timeframe=timeframe,
+            stage="size",
             decision="reject",
             original_size=BASE_POSITION_SIZE,
             suggested_size=None,
-            reasoning="No valid ATR available to estimate risk per contract — rejecting rather than guessing.",
+            reasoning=(
+                f"Zero or invalid stop distance (entry={entry_price}, stop={stop_loss}) — "
+                "cannot size a position against it."
+            ),
             key_data=account_snapshot,
-            flags=["insufficient_data"],
+            flags=["invalid_stop_distance"],
         )
 
-    risk_per_contract = atr * MNQ_POINT_VALUE
+    if remaining_room <= 0:
+        return RiskOpinion(
+            agent="risk",
+            timestamp=now_iso,
+            symbol=symbol,
+            timeframe=timeframe,
+            stage="size",
+            decision="reject",
+            original_size=BASE_POSITION_SIZE,
+            suggested_size=None,
+            reasoning=f"No drawdown room remaining (${remaining_room:.2f} of ${MAX_DRAWDOWN:.2f} left).",
+            key_data=account_snapshot,
+            flags=["drawdown_exhausted"],
+        )
+
+    risk_per_contract = risk_per_unit * MNQ_POINT_VALUE
     proposed_risk = risk_per_contract * BASE_POSITION_SIZE
     budget_for_trade = remaining_room * RISK_FRACTION_PER_TRADE
 
     account_snapshot.update(
         {
-            "atr_points": atr,
+            "entry_price": entry_price,
+            "stop_loss": stop_loss,
+            "stop_distance_points": round(risk_per_unit, 2),
             "risk_per_contract_usd": round(risk_per_contract, 2),
             "budget_for_this_trade_usd": round(budget_for_trade, 2),
         }
@@ -154,16 +248,17 @@ def evaluate_risk(symbol: str, timeframe: str, coordinator_decision: dict, lates
             timestamp=now_iso,
             symbol=symbol,
             timeframe=timeframe,
+            stage="size",
             decision="approve",
             original_size=BASE_POSITION_SIZE,
             suggested_size=BASE_POSITION_SIZE,
             reasoning=(
-                f"Estimated risk ${proposed_risk:.2f} for {BASE_POSITION_SIZE} contract(s) is within "
-                f"the ${budget_for_trade:.2f} budget for this trade "
-                f"({RISK_FRACTION_PER_TRADE:.0%} of remaining drawdown room)."
+                f"Estimated risk ${proposed_risk:.2f} for {BASE_POSITION_SIZE} contract(s), sized from "
+                f"the actual stop distance ({risk_per_unit:.2f} pts), is within the ${budget_for_trade:.2f} "
+                f"budget for this trade ({RISK_FRACTION_PER_TRADE:.0%} of remaining drawdown room)."
             ),
             key_data=account_snapshot,
-            flags=[],
+            flags=["sized_from_actual_stop"],
         )
 
     max_affordable_size = int(budget_for_trade // risk_per_contract)
@@ -173,16 +268,18 @@ def evaluate_risk(symbol: str, timeframe: str, coordinator_decision: dict, lates
             timestamp=now_iso,
             symbol=symbol,
             timeframe=timeframe,
+            stage="size",
             decision="modify",
             original_size=BASE_POSITION_SIZE,
             suggested_size=max_affordable_size,
             reasoning=(
-                f"{BASE_POSITION_SIZE} contract(s) would risk ${proposed_risk:.2f}, over the "
-                f"${budget_for_trade:.2f} budget. Reducing to {max_affordable_size} "
-                f"contract(s) (~${risk_per_contract * max_affordable_size:.2f}) stays within budget."
+                f"{BASE_POSITION_SIZE} contract(s) at the actual stop distance ({risk_per_unit:.2f} pts) "
+                f"would risk ${proposed_risk:.2f}, over the ${budget_for_trade:.2f} budget. Reducing to "
+                f"{max_affordable_size} contract(s) (~${risk_per_contract * max_affordable_size:.2f}) "
+                "stays within budget."
             ),
             key_data=account_snapshot,
-            flags=["size_reduced"],
+            flags=["size_reduced", "sized_from_actual_stop"],
         )
 
     return RiskOpinion(
@@ -190,13 +287,14 @@ def evaluate_risk(symbol: str, timeframe: str, coordinator_decision: dict, lates
         timestamp=now_iso,
         symbol=symbol,
         timeframe=timeframe,
+        stage="size",
         decision="reject",
         original_size=BASE_POSITION_SIZE,
         suggested_size=None,
         reasoning=(
-            f"Even 1 contract (~${risk_per_contract:.2f} estimated risk) exceeds the "
-            f"${budget_for_trade:.2f} budget for this trade — no safe size available right now."
+            f"Even 1 contract at the actual stop distance ({risk_per_unit:.2f} pts, ~${risk_per_contract:.2f}) "
+            f"exceeds the ${budget_for_trade:.2f} budget for this trade — no safe size available right now."
         ),
         key_data=account_snapshot,
-        flags=["budget_too_small_for_min_size"],
+        flags=["budget_too_small_for_min_size", "sized_from_actual_stop"],
     )

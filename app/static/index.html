@@ -212,7 +212,7 @@
   .badge.bullish, .badge.approve { background: var(--bull-bg); color: var(--bull); }
   .badge.bearish, .badge.reject { background: var(--bear-bg); color: var(--bear); }
   .badge.neutral, .badge.no_action { background: var(--neutral-bg); color: var(--neutral); }
-  .badge.modify { background: var(--accent-bg); color: var(--accent); }
+  .badge.modify, .badge.pending_execution { background: var(--accent-bg); color: var(--accent); }
   .badge-conf-row { display: flex; align-items: center; gap: 8px; }
   .conf-row { display: flex; align-items: center; gap: 8px; flex: 1; }
   .conf-track { flex: 1; height: 6px; background: var(--panel-2); border-radius: 3px; overflow: hidden; }
@@ -1041,9 +1041,13 @@ async function refreshRisk() {
   const candidateId = res.data.candidate_id;
   $('riskTime').textContent = fmtAgo(risk.timestamp);
   $('riskBadge').innerHTML = `<span class="badge ${risk.decision}" ${candidateId ? `title="candidate_id: ${escapeHtml(candidateId)}"` : ''}>${escapeHtml(risk.decision)}</span>`;
+  const stageNote = risk.stage === 'gate'
+    ? 'gate — checking limits/drawdown before Execution runs'
+    : 'sized from Execution\'s actual stop';
   el.innerHTML = `
     <div class="reasoning">${escapeHtml(risk.reasoning)}</div>
     <div class="kv">
+      <div><span>stage</span><b>${escapeHtml(stageNote)}</b></div>
       <div><span>size</span><b>${risk.original_size} → ${risk.suggested_size ?? '—'}</b></div>
       <div><span>based on decision</span><b>${escapeHtml(basedOn.decision)} @ ${fmtAgo(basedOn.timestamp)}</b></div>
     </div>

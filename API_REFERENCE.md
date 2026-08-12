@@ -98,13 +98,45 @@ Standalone test endpoints:
 - `GET /timing/now` — evaluates the current server time
 - `GET /timing/at?timestamp=2026-08-10T09:00:00Z` — evaluates any timestamp you give it
 
-### Risk (deterministic logic, no LLM)
+### Risk (deterministic logic, no LLM) — two-stage as of Tier 2.2
 - `GET /agents/risk/evaluate?symbol=MNQ1!&timeframe=5m`
-  - Reads the most recent stored Coordinator decision (does NOT
-    recompute one) plus the latest bar's ATR, and returns
-    `approve` / `modify` / `reject` / `no_action`.
-  - Returns 404 if no Coordinator decision has been stored yet —
-    call `/coordinator/decide` first.
+  - Acts on the current trade candidate (see Candidates below), not
+    an independent "latest decision" lookup. Same URL runs one of two
+    stages depending on the candidate's state — call it twice across
+    one candidate's lifecycle:
+    1. **Gate** (no Execution attached yet, or Execution hasn't
+       produced a valid plan): checks position limits and drawdown
+       room only — no stop price needed. Returns `pending_execution`
+       (clear to let Execution run), `reject` (hard block:
+       `max_positions_reached` / `drawdown_exhausted`), or `no_action`
+       (Coordinator isn't directional).
+    2. **Size** (Execution has attached a validated `status="planned"`
+       order to this same candidate): sizes the position from
+       Execution's actual `entry_price`/`stop_loss` —
+       `risk_per_contract = |entry - stop| × $2/pt` — never from ATR.
+       Returns `approve` / `modify` / `reject`.
+  - Response includes `stage: "gate" | "size"` alongside `decision` so
+    callers can tell which pass produced the result.
+  - Returns 404 if no trade candidate exists yet, or the latest one is
+    older than `CANDIDATE_MAX_AGE_MINUTES` — call `/coordinator/decide`
+    first.
+
+### Execution (LLM, geometry only — no size)
+- `GET /agents/execution/plan?symbol=MNQ1!&timeframe=5m`
+  - Requires the current candidate's Risk result to have cleared the
+    gate (`pending_execution`/`approve`/`modify`) — 409 if Risk hasn't
+    run yet, or if Risk's decision is `reject`/`no_action`.
+  - Proposes `order_type` / `entry_price` / `stop_loss` / `targets` /
+    `ready_now` for the Coordinator's direction. Does **not** take or
+    return a contract size — Risk sizes the trade afterward (call
+    `/agents/risk/evaluate` again once this returns) from the real
+    stop distance this produces.
+  - A deterministic geometry check runs after parsing (stop on the
+    losing side of entry, targets on the profitable side, minimum
+    reward:risk). A proposal that fails returns `status="invalid"`
+    with `validation_error` set instead of being treated as a normal
+    plan.
+  - Paper-only — never places a real order.
 
 ---
 
@@ -153,9 +185,14 @@ Most recent N persisted decisions, newest first.
 3. POST /agents/news/run
 4. POST /agents/macro/run
 5. GET  /coordinator/decide?...       -> enter_long / enter_short / no_trade
-6. GET  /agents/risk/evaluate?...     -> approve / modify / reject / no_action
+6. GET  /agents/risk/evaluate?...     -> gate stage: pending_execution / reject / no_action
+7. GET  /agents/execution/plan?...    -> order_type / entry_price / stop_loss / targets
+8. GET  /agents/risk/evaluate?...     -> size stage: approve / modify / reject (sized from step 7's stop)
 ```
 
 In production with `ENABLE_SCHEDULER=true`, steps 1–4 happen on
-their own (webhook + background scheduler) — only 5–6 need manual
+their own (webhook + background scheduler) — only 5–8 need manual
 triggering (or a future automation once the pipeline is trusted).
+Note step 6 is called twice across the lifecycle (steps 6 and 8) —
+same endpoint, different stage depending on whether Execution has
+run yet.

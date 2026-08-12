@@ -19,6 +19,17 @@ silently accepted — it's returned with status="invalid" and the
 specific reason, so it's visible on the dashboard rather than acted
 on as if it were a normal plan.
 
+Tier 2.2 (external review): this agent used to run AFTER Risk and
+receive an already-approved contract size, because Risk needed
+*something* to size against and ATR was the only number available
+before a real stop existed. That made Risk's size a guess against an
+estimate. Execution no longer takes or reasons about size at all — it
+proposes order geometry only (order_type/entry/stop/targets), and
+Risk now runs a second time afterward (see app/risk_agent.py's
+size_position) to size the position from THIS agent's actual stop
+distance. Sizing is Risk's job, not Execution's; this agent's only
+output is where the trade is, not how big.
+
 Paper only. Nothing here places a real order or talks to a broker —
 it produces a JSON order spec for the dashboard to display, exactly
 like every other agent's opinion.
@@ -39,9 +50,9 @@ MODEL = "claude-sonnet-5"
 # rejected rather than displayed as a normal, actionable plan.
 MIN_REWARD_RISK_RATIO = float(os.environ.get("MIN_REWARD_RISK_RATIO", "1.0"))
 
-SYSTEM_PROMPT = """You handle execution. You receive the final decision after Risk Agent approval/modification (direction, size, account risk context), the current price and recent structure, and the key levels Analysis identified.
+SYSTEM_PROMPT = """You handle execution. You receive the trade direction Coordinator/Risk already decided on, the current price and recent structure, and the key levels Analysis identified.
 
-Your job only: turn the decision into a concrete order — the decision to trade has already been made before you, and Risk has already approved a size. Do not reopen whether to trade.
+Your job only: turn the direction into concrete order geometry — the decision to trade has already been made before you. Do not reopen whether to trade. Do not decide position size — Risk sizes the trade afterward based on the stop distance you propose here; your job is where the trade is, not how big.
 
 Determine:
 - order_type: "market" if the current price is already a reasonable entry, or "limit" if a specific nearby level makes more sense (e.g. waiting for a pullback to a key level in a trending move).
@@ -73,7 +84,6 @@ class ExecutionOpinion:
     timeframe: str
     status: str  # "planned" | "no_action" | "error" | "invalid"
     direction: str | None
-    size: int | None
     order_type: str | None
     entry_price: float | None
     stop_loss: float | None
@@ -91,7 +101,6 @@ class ExecutionOpinion:
             "timeframe": self.timeframe,
             "status": self.status,
             "direction": self.direction,
-            "size": self.size,
             "order_type": self.order_type,
             "entry_price": self.entry_price,
             "stop_loss": self.stop_loss,
@@ -119,7 +128,6 @@ def _no_action(symbol: str, timeframe: str, reasoning: str) -> ExecutionOpinion:
         timeframe=timeframe,
         status="no_action",
         direction=None,
-        size=None,
         order_type=None,
         entry_price=None,
         stop_loss=None,
@@ -189,26 +197,22 @@ def _validate_trade_geometry(
 def plan_execution(
     symbol: str,
     timeframe: str,
-    risk_evaluation: dict,
     coordinator_decision: dict,
     latest_bar: dict | None,
     analysis_key_levels: list | None,
 ) -> ExecutionOpinion:
-    risk_decision = risk_evaluation.get("decision")
-    if risk_decision not in ("approve", "modify"):
-        # Nothing to execute — Risk rejected it or there was nothing
-        # for Risk to evaluate in the first place. No LLM call, no cost.
-        return _no_action(
-            symbol, timeframe,
-            f"Risk decision is '{risk_decision}' — nothing to execute.",
-        )
-
+    """Tier 2.2: no longer takes a Risk evaluation or a size — Risk's
+    gate stage (see app/risk_agent.py) is what decides whether it's
+    worth calling this at all (checked by the caller in main.py before
+    reaching here), and Risk's size stage runs AFTER this, against the
+    entry_price/stop_loss this function proposes. This function's only
+    inputs are the direction Coordinator already decided on and the
+    market context needed to place a sensible order."""
     direction = coordinator_decision.get("direction")
-    size = risk_evaluation.get("suggested_size")
-    if direction not in ("bullish", "bearish") or not size:
+    if direction not in ("bullish", "bearish"):
         return _no_action(
             symbol, timeframe,
-            "Missing direction or approved size from upstream decisions — cannot plan an order.",
+            f"Coordinator direction is '{direction}' — nothing to execute.",
         )
 
     if latest_bar is None:
@@ -225,12 +229,10 @@ def plan_execution(
             "symbol": symbol,
             "timeframe": timeframe,
             "direction": direction,
-            "approved_size_contracts": size,
             "current_price": latest_bar.get("close"),
             "atr": latest_bar.get("atr"),
             "vwap": latest_bar.get("vwap"),
             "key_levels": analysis_key_levels or [],
-            "risk_reasoning": risk_evaluation.get("reasoning"),
         },
         indent=2,
     )
@@ -266,7 +268,6 @@ def plan_execution(
         timeframe=timeframe,
         status="invalid" if validation_error else "planned",
         direction=direction,
-        size=size,
         order_type=parsed["order_type"],
         entry_price=parsed["entry_price"],
         stop_loss=parsed["stop_loss"],

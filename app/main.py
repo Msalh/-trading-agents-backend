@@ -92,6 +92,19 @@ independently querying "latest decision"/"latest opinion"/"latest
 bar", which could silently disagree if a new bar or opinion landed
 between two separately-timed lookups.
 
+Tier 2.2 (external review): Risk used to size every position from
+ATR as a proxy for stop distance, because it ran BEFORE Execution
+(which picks the real stop) — an estimate stood in for a number that
+didn't exist yet. Reordered around the candidate: Risk now runs
+twice. First a free "gate" pass (position limits / drawdown room only,
+no stop needed) decides whether it's worth letting Execution spend a
+paid LLM call at all. Execution then proposes order geometry only —
+no size, since Risk hasn't sized anything yet. Risk's second "size"
+pass reads that real entry_price/stop_loss back off the candidate and
+sizes the position from the actual stop distance. Same
+/agents/risk/evaluate and /agents/execution/plan endpoints as before;
+the endpoints now inspect the candidate to run the right stage.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -120,7 +133,7 @@ from app.macro_agent import MacroAgentError, run_macro
 from app.models import MarketStateOut, MarketStatePayload, WebhookAck
 from app.news_agent import NewsAgentError, run_news
 from app.outcomes import HORIZON_MINUTES_DEFAULT, compute_outcomes_for_decision
-from app.risk_agent import evaluate_risk
+from app.risk_agent import evaluate_risk_gate, size_position
 from app.scheduler import (
     MACRO_SYMBOL,
     MACRO_TIMEFRAME,
@@ -615,19 +628,42 @@ def risk_evaluate(
     whole, instead of independently fetching 'latest decision' and
     'latest bar' — those two used to potentially come from different
     moments if a new bar arrived between the two separate queries.
-    The result is written back onto the SAME candidate row."""
+    The result is written back onto the SAME candidate row.
+
+    Tier 2.2: this is now a two-stage endpoint, and which stage runs
+    depends on the candidate's current state — same URL, called twice
+    across one candidate's lifecycle:
+      - No Execution attached yet (or Execution didn't produce a valid
+        plan) -> the "gate" stage: free, no stop price needed, checks
+        position limits and drawdown room only. Result includes
+        "pending_execution" when it's clear to let Execution run.
+      - Execution has attached a validated (status="planned") order
+        -> the "size" stage: sizes the position from Execution's
+        actual entry_price/stop_loss instead of an ATR estimate.
+    Either way the result overwrites this candidate's risk_json — a
+    candidate carries exactly one current Risk opinion, not a gate
+    opinion and a size opinion side by side."""
     _check_secret(x_webhook_secret)
     try:
         candidate = get_current_candidate(symbol=symbol, timeframe=timeframe)
     except CandidateError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
-    risk_opinion = evaluate_risk(
-        symbol=symbol,
-        timeframe=timeframe,
-        coordinator_decision=candidate["decision"],
-        latest_bar=candidate["bar"],
-    )
+    execution = candidate["execution"]
+    if execution is not None and execution.get("status") == "planned":
+        risk_opinion = size_position(
+            symbol=symbol,
+            timeframe=timeframe,
+            entry_price=execution["entry_price"],
+            stop_loss=execution["stop_loss"],
+        )
+    else:
+        risk_opinion = evaluate_risk_gate(
+            symbol=symbol,
+            timeframe=timeframe,
+            coordinator_decision=candidate["decision"],
+        )
+
     record_risk_result(candidate["candidate_id"], risk_opinion.to_dict())
     # Also written to the older agent_opinions table — /system/status
     # and the dashboard's existing Risk display still read from there.
@@ -657,21 +693,37 @@ def execution_plan(
     combine a Risk approval for one decision with a different,
     newer Coordinator decision. key_levels now come from the exact
     Analysis opinion frozen inside this candidate's opinions_used,
-    not a fresh independent lookup that could have moved on."""
+    not a fresh independent lookup that could have moved on.
+
+    Tier 2.2: the required Risk result is now the "gate" opinion
+    (decision in "pending_execution"/"approve"/"modify" — i.e. the
+    gate cleared at some point; "approve"/"modify" cover re-running
+    this after a size pass already happened). A "reject" or
+    "no_action" gate blocks Execution outright — no point spending an
+    LLM call on a trade Risk has already ruled out. This call no
+    longer needs or uses a size — it proposes geometry only; call
+    /agents/risk/evaluate again afterward to size the position from
+    the entry_price/stop_loss this produces."""
     _check_secret(x_webhook_secret)
     try:
         candidate = get_current_candidate(symbol=symbol, timeframe=timeframe)
     except CandidateError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
-    if candidate["risk"] is None:
+    risk = candidate["risk"]
+    if risk is None:
         raise HTTPException(
             status_code=409,
             detail=(
-                "the current trade candidate has not been evaluated by Risk yet — "
+                "the current trade candidate has not cleared Risk's gate yet — "
                 "call /agents/risk/evaluate first (it must be run before Execution can "
                 "act on this same candidate)"
             ),
+        )
+    if risk.get("decision") in ("reject", "no_action"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Risk blocks this candidate (decision='{risk.get('decision')}'): {risk.get('reasoning')}",
         )
 
     analysis_opinion = candidate["decision"].get("opinions_used", {}).get("analysis")
@@ -681,7 +733,6 @@ def execution_plan(
         execution_opinion = plan_execution(
             symbol=symbol,
             timeframe=timeframe,
-            risk_evaluation=candidate["risk"],
             coordinator_decision=candidate["decision"],
             latest_bar=candidate["bar"],
             analysis_key_levels=key_levels,
