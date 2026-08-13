@@ -322,6 +322,25 @@ was NOT touched in this tier or the two before it — tuning it is
 intentionally the last item in the full sequence, after paper trading
 is realistic enough to learn from.
 
+Tier 3.4 (COORDINATOR_THRESHOLD tuning, the last item on the full
+sequence — now that Tier 3.1-3.3 make paper trading realistic enough
+to learn from): new GET /candidates/history/replay/threshold-sweep,
+built on app/replay.sweep_thresholds(). Answers "across a range of
+threshold values, how does directional decision volume and
+hypothetical horizon accuracy change?" by re-scoring every historical
+candidate's already-frozen opinions_used (Tier 2.5's replay
+machinery — entirely offline, no LLM calls) under each threshold in
+turn and aggregating the hypothetical horizon outcome (same estimate
+outcomes.py already uses for candidates that never became a real
+trade) into a compact per-threshold summary. weights/
+min_available_weight stay fixed for the whole sweep so an accuracy
+shift can be attributed to threshold alone. A live check against
+production data (symbol=MNQ1!, timeframe=5m) found zero real closed
+paper trades to date, so this hypothetical-horizon estimate is
+currently the ONLY data available to tune against — not a real
+backtest, an accuracy proxy, same caveat every hypothetical estimate
+in this project already carries.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -360,7 +379,7 @@ from app.outcomes import (
     summarize_outcomes,
 )
 from app.paper_trades import get_account_open_trade_count, open_trade_from_candidate, process_new_bar
-from app.replay import replay_candidate, replay_candidates_for_symbol, summarize_replay
+from app.replay import replay_candidate, replay_candidates_for_symbol, summarize_replay, sweep_thresholds
 from app.risk_agent import (
     ACCOUNT_BALANCE,
     DAILY_LOSS_LIMIT,
@@ -1019,6 +1038,46 @@ def candidates_history_replay_summary(
         limit=limit,
     )
     return summarize_replay(results)
+
+
+@app.get("/candidates/history/replay/threshold-sweep")
+def candidates_history_replay_threshold_sweep(
+    symbol: str = Query(...),
+    timeframe: str = Query(...),
+    thresholds: str = Query(..., description="comma-separated threshold values to test, e.g. 15,20,25,30,35,40"),
+    limit: int = Query(default=100, le=500),
+    weights: str = Query(default=None, description="held fixed across the whole sweep — omit to use the current live weights"),
+    min_available_weight: float = Query(default=None, description="held fixed across the whole sweep — omit to use the current live value"),
+    horizons: str = Query(default="15,30,60"),
+) -> dict:
+    """Tier 3.4 (COORDINATOR_THRESHOLD tuning): the tool this whole
+    replay/outcome pair of features was ultimately built toward —
+    "across a range of threshold values, how does directional decision
+    volume and hypothetical horizon accuracy change?" Compact,
+    pre-aggregated per-threshold summary (not a raw per-candidate
+    list) so the answer is cheap to fetch and read at a glance. weights/
+    min_available_weight stay fixed for the whole sweep — only
+    threshold varies, so an accuracy shift can be attributed to the
+    threshold alone. Same "hypothetical, not a real backtest" caveat
+    as everywhere else this project uses the horizon estimate: a
+    replayed decision under a hypothetical threshold was never
+    actually traded, so there's no real P&L to attribute to it."""
+    try:
+        threshold_list = [float(t.strip()) for t in thresholds.split(",") if t.strip()]
+    except ValueError:
+        raise HTTPException(status_code=400, detail="thresholds must be comma-separated numbers")
+    if not threshold_list:
+        raise HTTPException(status_code=400, detail="thresholds must contain at least one value")
+
+    return sweep_thresholds(
+        symbol=symbol,
+        timeframe=timeframe,
+        thresholds=threshold_list,
+        limit=limit,
+        weights=_parse_replay_weights(weights),
+        min_available_weight=min_available_weight,
+        horizons=_parse_replay_horizons(horizons),
+    )
 
 
 @app.get("/candidates/{candidate_id}")

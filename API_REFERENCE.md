@@ -434,6 +434,33 @@ The at-a-glance answer to "if `COORDINATOR_THRESHOLD` had been 35
 this whole time, how many of the last 100 decisions would have
 flipped?" before reading individual replayed candidates.
 
+### `GET /candidates/history/replay/threshold-sweep?symbol=MNQ1!&timeframe=5m&thresholds=15,20,25,30,35,40&limit=100&horizons=15,30,60&weights=...&min_available_weight=...`
+Tier 3.4 (`COORDINATOR_THRESHOLD` tuning) — the actual tuning tool:
+sweeps `thresholds` (required, comma-separated) across every recent
+candidate's frozen opinions (offline re-score, no LLM calls, same
+machinery as the replay endpoints above), and for each threshold
+aggregates directional decision volume plus hypothetical horizon
+accuracy into a compact per-threshold summary:
+```json
+{
+  "symbol": "MNQ1!", "timeframe": "5m", "candidates_considered": 54,
+  "weights_held_fixed": {"analysis": 0.4, "news": 0.25, "timing": 0.2, "macro": 0.15},
+  "min_available_weight_held_fixed": 0.6,
+  "sweep": {
+    "15": {"directional_candidates": 40, "by_horizon_minutes": {"15": {"correct": 12, "incorrect": 28, "flat": 0, "pending": 0, "no_data": 0, "accuracy": 0.3}}},
+    "35": {"directional_candidates": 9,  "by_horizon_minutes": {"15": {"correct": 6,  "incorrect": 3,  "flat": 0, "pending": 0, "no_data": 0, "accuracy": 0.667}}}
+  }
+}
+```
+`weights`/`min_available_weight` are held FIXED across the whole
+sweep — only `threshold` varies, so any accuracy shift is
+attributable to threshold alone. Same caveat as `include_outcome`
+above: this is the hypothetical horizon price-direction estimate, not
+a real backtest — a replayed decision under a hypothetical threshold
+was never actually filled/sized/executed, so there's no real P&L to
+attribute to it. 400 if `thresholds` doesn't parse as comma-separated
+numbers.
+
 ---
 
 ## Environment variables

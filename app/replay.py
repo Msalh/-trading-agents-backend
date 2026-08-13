@@ -1,5 +1,7 @@
 """
-Replay / versioning — Tier 2.5 (external review, Aug 2026).
+Replay / versioning — Tier 2.5 (external review, Aug 2026). Extended
+in Tier 3.4 (COORDINATOR_THRESHOLD tuning) with sweep_thresholds() —
+see that function's docstring below.
 
 The problem this solves: COORDINATOR_THRESHOLD, the four agent
 WEIGHTS, and MIN_AVAILABLE_WEIGHT have all changed over this
@@ -40,7 +42,7 @@ deliberately empty.
 
 from app.candidates import get_candidate_history
 from app.coordinator import DECISION_THRESHOLD, MIN_AVAILABLE_WEIGHT, WEIGHTS, _score_opinions
-from app.outcomes import compute_outcomes_for_decision
+from app.outcomes import HORIZON_MINUTES_DEFAULT, compute_outcomes_for_decision
 
 _DIRECTIONAL_DECISIONS = ("enter_long", "enter_short")
 
@@ -165,4 +167,100 @@ def summarize_replay(results: list[dict]) -> dict:
         "changed": len(changed),
         "unchanged": total - len(changed),
         "transitions": transitions,
+    }
+
+
+def _summarize_directional_accuracy(replay_results: list[dict], horizons: list[int]) -> dict:
+    """Shared aggregation for one threshold's worth of replay results
+    — same per-horizon shape outcomes.summarize_outcomes() already
+    uses for its hypothetical bucket (correct/incorrect/flat/pending/
+    no_data counts, plus accuracy = correct / (correct + incorrect)),
+    reused here rather than reinvented so the two "hypothetical
+    accuracy" numbers this project produces are always computed the
+    same way."""
+    directional = [r for r in replay_results if r["replayed"]["decision"] in _DIRECTIONAL_DECISIONS]
+    horizon_counts = {
+        h: {"correct": 0, "incorrect": 0, "flat": 0, "pending": 0, "no_data": 0} for h in horizons
+    }
+    for r in directional:
+        outcome_by_horizon = r.get("replayed_hypothetical_outcome") or {}
+        for h in horizons:
+            outcome = outcome_by_horizon.get(h)
+            if outcome is None:
+                continue
+            bucket = horizon_counts[h]
+            bucket[outcome["outcome"]] = bucket.get(outcome["outcome"], 0) + 1
+
+    by_horizon = {}
+    for h, counts in horizon_counts.items():
+        resolved = counts["correct"] + counts["incorrect"]
+        by_horizon[h] = {**counts, "accuracy": round(counts["correct"] / resolved, 3) if resolved else None}
+
+    return {"directional_candidates": len(directional), "by_horizon_minutes": by_horizon}
+
+
+def sweep_thresholds(
+    symbol: str,
+    timeframe: str,
+    thresholds: list[float],
+    limit: int = 100,
+    weights: dict = None,
+    min_available_weight: float = None,
+    horizons: list[int] = None,
+) -> dict:
+    """Tier 3.4 (COORDINATOR_THRESHOLD tuning) — the actual tool for
+    the question this whole replay/outcome machinery exists to answer:
+    "across a range of threshold values, how does directional decision
+    volume and hypothetical accuracy change?" Built for exactly the
+    case app/main.py's other summary endpoints already handle —
+    everything replay_candidate() already does (offline re-scoring of
+    frozen opinions_used, no LLM calls, no mutation, no trade side
+    effects) plus outcomes' hypothetical horizon estimate, just swept
+    across many threshold values in one call and pre-aggregated so the
+    caller gets a compact per-threshold summary instead of having to
+    fetch and tally N full candidate lists themselves — this matters
+    in practice, since the raw per-candidate replay list can be too
+    large for some callers (e.g. an LLM-mediated fetch) to reliably
+    process whole.
+
+    weights/min_available_weight are held FIXED across the whole sweep
+    (only threshold varies) — sweeping more than one axis at once
+    would confound which change caused an accuracy shift; a caller who
+    wants to sweep weights too should call this once per weights
+    config and compare the results.
+
+    Real trade P&L is deliberately NOT part of this: a replayed
+    decision under a hypothetical threshold was never actually
+    executed, so there's no real fill/slippage/size to attribute to
+    it — only the same hypothetical horizon price-direction estimate
+    outcomes.py already uses as its fallback for candidates that never
+    became a trade. This is an accuracy proxy for tuning, not a
+    backtest of what P&L would have been."""
+    horizons = horizons or HORIZON_MINUTES_DEFAULT
+    candidates = get_candidate_history(symbol=symbol, timeframe=timeframe, limit=limit)
+
+    sweep = {}
+    for threshold in thresholds:
+        replay_results = [
+            replay_candidate(
+                c,
+                weights=weights,
+                threshold=threshold,
+                min_available_weight=min_available_weight,
+                include_outcome=True,
+                outcome_horizons=horizons,
+            )
+            for c in candidates
+        ]
+        sweep[threshold] = _summarize_directional_accuracy(replay_results, horizons)
+
+    return {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "candidates_considered": len(candidates),
+        "weights_held_fixed": weights if weights is not None else WEIGHTS,
+        "min_available_weight_held_fixed": (
+            min_available_weight if min_available_weight is not None else MIN_AVAILABLE_WEIGHT
+        ),
+        "sweep": sweep,
     }
