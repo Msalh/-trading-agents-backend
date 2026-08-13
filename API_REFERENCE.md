@@ -203,6 +203,21 @@ score and a decision (`enter_long` / `enter_short` / `no_trade` /
 `insufficient_data`). Set `persist=false` to compute without writing
 to history (e.g. for a "what-if" check).
 
+As of Tier 2.8, Timing does **not** count toward the directional
+score or `MIN_AVAILABLE_WEIGHT` — its direction is always `"neutral"`
+by design, so it never carried real directional evidence; the minimum
+is now checked against the Analysis/News/Macro (directional) weight
+pool only. Timing is still gathered and still appears in
+`opinions_used`, but its actual effect is now a separate gate,
+visible in the response's `timing_context` field
+(`{"confidence", "session_label", "flags"}`, or `null` if no market
+bar was available to evaluate it against): a `"market_closed"` flag
+(weekend timestamp) forces `score` to `0` outright; a `"low_liquidity"`
+flag (a weekday bar outside every ICT kill zone) halves the score.
+Either shows up in `conflict_flags` too
+(`"timing_market_closed"` / `"timing_low_liquidity_dampened"`) next to
+the existing `analysis_news_conflict*` flags.
+
 ### `GET /coordinator/history?symbol=MNQ1!&timeframe=5m&limit=20`
 Most recent N persisted decisions, newest first.
 
@@ -220,6 +235,16 @@ produced it. Replay re-scores a trade candidate's already-frozen
 either the current live config or an explicit hypothetical override —
 entirely offline, no new market data, no LLM calls, and it never
 mutates the original candidate or opens a trade.
+
+Since Tier 2.8, replaying a candidate uses the *current* scoring
+engine (Timing excluded from `MIN_AVAILABLE_WEIGHT`/the weighted
+score, kept as a separate gate — see the Coordinator section above),
+regardless of which engine produced the original decision — so
+replaying a pre-Tier-2.8 candidate can legitimately show `changed:
+true` even under otherwise-identical weights/threshold, if the
+original decision benefited from the old Timing-counts-as-evidence
+bug. That's the intended use, not a bug in replay: it's exactly how
+you'd audit how many historical decisions the fix would have changed.
 
 `weights` (when provided) must be a JSON object string, e.g.
 `{"analysis":0.5,"news":0.2,"timing":0.2,"macro":0.1}` — an agent

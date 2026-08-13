@@ -7,11 +7,15 @@ Run with: pytest tests/test_coordinator.py -v
 """
 
 import importlib
+import json
 import os
 import tempfile
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
+
+_NY_TZ = ZoneInfo("America/New_York")
 
 
 @pytest.fixture
@@ -51,6 +55,26 @@ def _opinion(direction, confidence, flags=None, timestamp=None):
         "flags": flags or [],
         "timestamp": timestamp or _now_iso(),  # fresh by default — matches real agent output shape
     }
+
+
+def _ny_time_to_utc_iso(year, month, day, hour, minute) -> str:
+    ny_dt = datetime(year, month, day, hour, minute, tzinfo=_NY_TZ)
+    return ny_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _save_bar(storage, symbol, timeframe, timestamp_iso):
+    """Minimal fake market_state row so _gather_opinions' get_latest()
+    call finds a bar and Timing gets evaluated against it — same
+    bypass-the-Pydantic-model pattern as test_outcomes.py's _save_bar,
+    since evaluate_timing only ever reads the "timestamp" field."""
+    conn = storage.get_connection()
+    payload = {"timestamp": timestamp_iso, "symbol": symbol, "timeframe": timeframe}
+    conn.execute(
+        "INSERT INTO market_state (event_id, symbol, timeframe, timestamp, payload_json) VALUES (?, ?, ?, ?, ?)",
+        (f"{symbol}:{timeframe}:{timestamp_iso}", symbol, timeframe, timestamp_iso, json.dumps(payload)),
+    )
+    conn.commit()
+    conn.close()
 
 
 def test_no_opinions_returns_insufficient_data(fresh_storage):
@@ -339,3 +363,144 @@ def test_score_opinions_tolerates_weights_missing_an_agent(fresh_storage):
     )
     assert decision.contributions["news"]["weight"] == 0
     assert decision.contributions["news"]["contribution"] == 0
+
+
+# --- Tier 2.8 (Coordinator redesign: Timing excluded from directional
+# evidence, kept as a separate gate) -------------------------------------
+
+
+def test_analysis_alone_stays_insufficient_data_even_with_timing_present(fresh_storage):
+    """THE regression test for the bug the external review flagged:
+    before Tier 2.8, Analysis (40%) + a present-but-neutral Timing
+    (20%) cleared the 60% MIN_AVAILABLE_WEIGHT minimum trivially,
+    letting Analysis alone single-handedly trigger a trade whenever a
+    market bar happened to exist (i.e. almost always in production).
+    Posting a bar (so Timing IS present and IS gathered into opinions)
+    is the part the older test_analysis_alone_is_insufficient_data
+    never actually exercised — that test posts no bar, so Timing was
+    already absent there and passed by coincidence, not because the
+    fix worked. This one posts a kill-zone bar specifically so Timing
+    is present and confirms the decision is still insufficient_data,
+    and that Timing is visible in opinions_used and missing_agents is
+    empty (proving it really was gathered, not skipped)."""
+    storage, coordinator = fresh_storage
+    bar_ts = _ny_time_to_utc_iso(2026, 8, 11, 10, 0)  # Tuesday, NY AM kill zone
+    _save_bar(storage, "TEST", "5m", bar_ts)
+    storage.save_opinion("analysis", "TEST", "5m", "t1", _opinion("bullish", 90))
+
+    decision = coordinator.compute_decision(symbol="TEST", timeframe="5m")
+
+    assert "timing" in decision.opinions_used  # Timing really was gathered...
+    assert "timing" not in decision.missing_agents  # ...not silently skipped
+    assert decision.decision == "insufficient_data"  # ...yet still correctly insufficient
+    assert decision.score == 0.0
+
+
+def test_analysis_plus_news_sufficient_regardless_of_timing(fresh_storage):
+    """Two real directional agents (65% of the 80%-wide directional
+    pool) should clear the minimum whether or not Timing happens to be
+    present — the gate is now about directional evidence only."""
+    storage, coordinator = fresh_storage
+    bar_ts = _ny_time_to_utc_iso(2026, 8, 11, 10, 0)  # kill zone -> no dampening
+    _save_bar(storage, "TEST", "5m", bar_ts)
+    storage.save_opinion("analysis", "TEST", "5m", "t1", _opinion("bullish", 80))
+    storage.save_opinion("news", "TEST", "global", "t1", _opinion("bullish", 60))
+    storage.save_opinion("macro", "TEST", "global", "t1", _opinion("neutral", 50))
+
+    decision = coordinator.compute_decision(symbol="TEST", timeframe="5m")
+    assert decision.decision == "enter_long"
+    # identical math to test_strong_agreement_triggers_enter_long, now
+    # with Timing present too (kill zone, no dampen) -- confirms
+    # Timing's presence has zero effect on the score when its flags
+    # don't trigger veto/dampen.
+    assert decision.score == pytest.approx(58.75, abs=0.01)
+
+
+def test_timing_context_populated_when_bar_present(fresh_storage):
+    storage, coordinator = fresh_storage
+    bar_ts = _ny_time_to_utc_iso(2026, 8, 11, 10, 0)
+    _save_bar(storage, "TEST", "5m", bar_ts)
+    storage.save_opinion("analysis", "TEST", "5m", "t1", _opinion("bullish", 80))
+    storage.save_opinion("news", "TEST", "global", "t1", _opinion("bullish", 60))
+
+    decision = coordinator.compute_decision(symbol="TEST", timeframe="5m")
+    assert decision.timing_context is not None
+    assert decision.timing_context["session_label"] == "new_york"
+    assert decision.timing_context["flags"] == []
+
+
+def test_timing_context_none_when_no_bar(fresh_storage):
+    storage, coordinator = fresh_storage
+    storage.save_opinion("analysis", "TEST", "5m", "t1", _opinion("bullish", 80))
+    storage.save_opinion("news", "TEST", "global", "t1", _opinion("bullish", 60))
+
+    decision = coordinator.compute_decision(symbol="TEST", timeframe="5m")
+    assert decision.timing_context is None
+
+
+def test_timing_low_liquidity_dampens_score(fresh_storage):
+    """A weekday bar outside every kill zone halves the score instead
+    of silently doing nothing — Timing's confidence swing (65 in a
+    kill zone vs 20 outside one) used to have zero effect on the
+    decision either way since its direction was always neutral; now
+    it visibly matters via the dampener."""
+    storage, coordinator = fresh_storage
+    bar_ts = _ny_time_to_utc_iso(2026, 8, 11, 12, 0)  # Tuesday, gap between AM/PM kill zones
+    _save_bar(storage, "TEST", "5m", bar_ts)
+    storage.save_opinion("analysis", "TEST", "5m", "t1", _opinion("bullish", 80))
+    storage.save_opinion("news", "TEST", "global", "t1", _opinion("bullish", 60))
+    storage.save_opinion("macro", "TEST", "global", "t1", _opinion("neutral", 50))
+
+    decision = coordinator.compute_decision(symbol="TEST", timeframe="5m")
+    assert decision.timing_context["flags"] == ["low_liquidity"]
+    assert "timing_low_liquidity_dampened" in decision.conflict_flags
+    # undampened score would be 58.75 (same math as the kill-zone test above)
+    assert decision.score == pytest.approx(29.375, abs=0.01)
+
+
+def test_timing_market_closed_vetoes_score_to_zero(fresh_storage):
+    """A weekend-timestamped bar (edge case — shouldn't normally
+    happen, but defensively handled) forces the score to 0 regardless
+    of how strong the directional agents' agreement is, and keeps the
+    decision at no_trade rather than trading on a market that's shut."""
+    storage, coordinator = fresh_storage
+    bar_ts = _ny_time_to_utc_iso(2026, 8, 15, 10, 0)  # Saturday
+    _save_bar(storage, "TEST", "5m", bar_ts)
+    storage.save_opinion("analysis", "TEST", "5m", "t1", _opinion("bullish", 95))
+    storage.save_opinion("news", "TEST", "global", "t1", _opinion("bullish", 90))
+
+    decision = coordinator.compute_decision(symbol="TEST", timeframe="5m")
+    assert decision.timing_context["flags"] == ["market_closed"]
+    assert "timing_market_closed" in decision.conflict_flags
+    assert decision.score == 0.0
+    assert decision.decision == "no_trade"
+
+
+def test_directional_agents_constant_excludes_timing(fresh_storage):
+    storage, coordinator = fresh_storage
+    assert coordinator.DIRECTIONAL_AGENTS == frozenset({"analysis", "news", "macro"})
+    assert "timing" not in coordinator.DIRECTIONAL_AGENTS
+
+
+def test_replay_style_hypothetical_config_reveals_the_old_bug(fresh_storage):
+    """Demonstrates the point of Tier 2.5 (replay) + Tier 2.8
+    (redesign) together: replaying the SAME frozen opinions_used from
+    the regression test above under a hypothetical config that treats
+    Timing as directional (old, buggy shape: including it in the
+    available-weight pool the same way pre-Tier-2.8 code effectively
+    did) reproduces the old wrong enter_long -- proving the live
+    (non-hypothetical) fix above is the actual behavior change, not
+    just a coincidence of this particular test's numbers."""
+    storage, coordinator = fresh_storage
+    bar_ts = _ny_time_to_utc_iso(2026, 8, 11, 10, 0)
+    _save_bar(storage, "TEST", "5m", bar_ts)
+    storage.save_opinion("analysis", "TEST", "5m", "t1", _opinion("bullish", 90))
+
+    opinions, missing, stale = coordinator._gather_opinions(symbol="TEST", timeframe="5m")
+    live_decision = coordinator._score_opinions(
+        symbol="TEST", timeframe="5m",
+        opinions=opinions, missing_agents=missing, stale_agents=stale,
+        weights=coordinator.WEIGHTS, threshold=coordinator.DECISION_THRESHOLD,
+        min_available_weight=coordinator.MIN_AVAILABLE_WEIGHT,
+    )
+    assert live_decision.decision == "insufficient_data"  # the Tier 2.8 fix, confirmed again directly

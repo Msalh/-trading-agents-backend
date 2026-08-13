@@ -7,17 +7,39 @@ combines them into a weighted score and a preliminary decision.
 
 Fixed weights, as agreed: Analysis 40% / News 25% / Timing 20% / Macro 15%.
 
-Important design note on Timing: its "direction" is always "neutral"
-by design (see timing_agent.py) — timing quality has no directional
-opinion, it only gates whether now is a reasonable time to act at
-all. That means Timing's slot in the weighted sum always contributes
-0 magnitude, regardless of its confidence. A second external review
-correctly pointed out this makes MIN_AVAILABLE_WEIGHT partly
-ineffective: Analysis (40%) + a present-but-neutral Timing (20%) =
-exactly 60%, clearing the minimum even though Timing added zero real
-evidence. Deliberately not restructured in this pass (would mean
-redesigning the weighting scheme itself, tracked as Tier 2.8) — but
-documented here so it's not mistaken for solved.
+Design note on Timing: its "direction" is always "neutral" by design
+(see timing_agent.py) — timing quality has no directional opinion, it
+only gates whether now is a reasonable time to act at all. That means
+Timing's slot in a weighted sum always contributes 0 magnitude,
+regardless of its confidence. A second external review correctly
+pointed out that, before Tier 2.8, this made MIN_AVAILABLE_WEIGHT
+partly ineffective: Analysis (40%) + a present-but-neutral Timing
+(20%) = exactly 60%, clearing the minimum even though Timing added
+zero real evidence — and since Timing is derived from the latest
+market bar (present on almost every webhook), this wasn't a rare edge
+case, it was close to the default state in production.
+
+Tier 2.8 (Coordinator redesign, Aug 2026) fixes this structurally
+rather than by raising MIN_AVAILABLE_WEIGHT (a bigger number doesn't
+fix an agent that was never real evidence in the first place):
+DIRECTIONAL_AGENTS below names exactly which agents can express a
+direction at all (analysis/news/macro). Timing is excluded from the
+weighted-sum/available-weight math entirely, not just diluted by its
+already-zero direction value — available_weight (and MIN_AVAILABLE_WEIGHT)
+is now a fraction of the directional agents' total weight only, so
+Analysis alone (40% of an 80%-wide directional pool = 50%) correctly
+stays insufficient_data regardless of whether Timing happens to be
+present. Timing keeps its designed role as an actual GATE instead of a
+diluted, mathematically-inert weight slot: its opinion is still
+gathered and still lands in opinions_used (the frozen snapshot is
+unchanged — replay of pre-Tier-2.8 candidates still works exactly the
+same), but scoring now reads it separately as timing_context and
+applies it as a multiplicative dampener on the final score — full
+veto (score forced to 0) when the "market_closed" flag is set (weekend
+timestamp), half-dampened when "low_liquidity" is set (a weekday bar
+outside every kill zone) — the same "never silently ignore a flag"
+principle already used for the Analysis/News urgent-conflict dampener
+below, just finally applied to the agent it was originally meant for.
 
 Conflict handling: if Analysis and News point in opposite directions
 and News is flagged "urgent", the score is dampened rather than
@@ -34,18 +56,22 @@ are excluded rather than treated as neutral. Two genuinely different
     corrupted write, treated conservatively as untrustworthy either
     way), so it's excluded from the score exactly like a missing one,
     but the two are no longer conflated in the reported lists.
+  Timing still appears in these lists exactly as before (useful to
+  know whether timing data itself is missing/stale) even though, as
+  of Tier 2.8, its presence no longer affects available_weight.
 
-MIN_AVAILABLE_WEIGHT: if the combined weight of agents that actually
-have a current opinion falls below this fraction of the total, the
-decision is "insufficient_data" rather than trading on a lopsided
-subset. Known incomplete (see Timing note above) — not re-tuned in
-this pass, since the fix is a weighting redesign, not a bigger number.
+MIN_AVAILABLE_WEIGHT: if the combined weight of DIRECTIONAL agents
+that actually have a current opinion falls below this fraction of the
+directional total, the decision is "insufficient_data" rather than
+trading on a lopsided subset. As of Tier 2.8, Timing is structurally
+excluded from this calculation (see above) rather than merely diluted.
 
 opinions_used: every CoordinatorDecision now carries the exact
-opinions dict it was scored from. This is what makes a "trade
-candidate" (see app/candidates.py) an atomic snapshot instead of
-downstream stages re-querying "latest" independently and risking a
-mismatched combination.
+opinions dict it was scored from — including Timing's, for a complete
+audit trail, even though Timing isn't part of the weighted score. This
+is what makes a "trade candidate" (see app/candidates.py) an atomic
+snapshot instead of downstream stages re-querying "latest"
+independently and risking a mismatched combination.
 """
 
 import os
@@ -61,6 +87,22 @@ WEIGHTS = {
     "timing": 0.20,
     "macro": 0.15,
 }
+
+# Tier 2.8: the only agents that can express a direction at all —
+# Timing's direction is always "neutral" by design (timing_agent.py),
+# so it structurally cannot contribute directional evidence no matter
+# how confident it is. Deliberately a fixed architectural fact, not a
+# tunable weight — unlike WEIGHTS/DECISION_THRESHOLD/MIN_AVAILABLE_WEIGHT,
+# this isn't something a replay would want to vary; it describes which
+# agents CAN vote on direction, not how much any of them counts.
+DIRECTIONAL_AGENTS = frozenset({"analysis", "news", "macro"})
+
+# Timing flags (set by timing_agent.evaluate_timing) that dampen or
+# veto the score — see the Tier 2.8 docstring note above for why this
+# exists instead of counting Timing's weight toward available_weight.
+_TIMING_VETO_FLAG = "market_closed"
+_TIMING_DAMPEN_FLAG = "low_liquidity"
+_TIMING_DAMPEN_FACTOR = 0.5
 
 # Placeholder — the roadmap explicitly calls out that this needs
 # tuning against real/replayed data before going live. 25 means: the
@@ -117,6 +159,12 @@ class CoordinatorDecision:
     # Without this, a replay has no reliable way to know what config
     # actually produced a historical decision.
     config_version: dict = field(default_factory=dict)
+    # Tier 2.8 (Coordinator redesign): Timing's opinion, surfaced
+    # separately from contributions/weighted_sum since it's no longer
+    # part of the weighted score — this is where its gating effect
+    # (veto/dampen, see DIRECTIONAL_AGENTS note above) is visible. None
+    # when no market bar was available to evaluate timing against at all.
+    timing_context: dict | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -134,6 +182,7 @@ class CoordinatorDecision:
             "summary": self.summary,
             "opinions_used": self.opinions_used,
             "config_version": self.config_version,
+            "timing_context": self.timing_context,
         }
 
 
@@ -221,8 +270,16 @@ def _score_opinions(
     weights.get(agent, 0) (not weights[agent]) deliberately tolerates
     a replay's hypothetical weights dict omitting an agent — that's a
     valid way to ask "what if this agent's weight were 0", not a bug
-    to guard against."""
-    available_weight = sum(weights.get(a, 0) for a in opinions)
+    to guard against.
+
+    Tier 2.8: available_weight/min_available_weight are computed over
+    DIRECTIONAL_AGENTS only (analysis/news/macro) — Timing is excluded
+    from this math entirely, not just diluted by its already-zero
+    direction value, since counting a structurally-neutral agent's
+    weight as "available evidence" is exactly the bug this tier fixes.
+    Timing's opinion (if present) is still read out separately into
+    timing_context and applied as a score dampener/veto — see the
+    module docstring for the full reasoning."""
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     config_version = {
         "weights": dict(weights),
@@ -230,14 +287,38 @@ def _score_opinions(
         "min_available_weight": min_available_weight,
     }
 
-    if available_weight < min_available_weight:
+    timing_opinion = opinions.get("timing")
+    timing_flags: list[str] = []
+    timing_context: dict | None = None
+    if timing_opinion is not None:
+        timing_flags = timing_opinion.get("flags", []) or []
+        timing_context = {
+            "confidence": timing_opinion.get("confidence"),
+            "session_label": (timing_opinion.get("key_data") or {}).get("session_label"),
+            "flags": timing_flags,
+        }
+
+    directional_weight_total = sum(weights.get(a, 0) for a in DIRECTIONAL_AGENTS)
+    directional_available_weight = sum(
+        weights.get(a, 0) for a in opinions if a in DIRECTIONAL_AGENTS
+    )
+    available_fraction = (
+        directional_available_weight / directional_weight_total
+        if directional_weight_total > 0
+        else 0.0
+    )
+
+    if available_fraction < min_available_weight:
         reason = (
-            "No agent opinions available yet — nothing to aggregate."
-            if available_weight == 0
+            "No directional agent opinions available yet — nothing to aggregate "
+            "(Timing alone never counts as directional evidence)."
+            if directional_available_weight == 0
             else (
-                f"Only {available_weight:.0%} of total agent weight is currently available "
-                f"(minimum {min_available_weight:.0%} required) — not enough combined evidence "
-                f"to trade on, regardless of how confident the available agents are."
+                f"Only {available_fraction:.0%} of directional agent weight "
+                f"(analysis/news/macro) is currently available (minimum "
+                f"{min_available_weight:.0%} required) — not enough combined "
+                f"evidence to trade on, regardless of how confident the "
+                f"available agents are, or whether Timing happens to be present."
             )
         )
         return CoordinatorDecision(
@@ -255,11 +336,14 @@ def _score_opinions(
             summary=reason,
             opinions_used=opinions,
             config_version=config_version,
+            timing_context=timing_context,
         )
 
     contributions = {}
     weighted_sum = 0.0
     for agent, opinion in opinions.items():
+        if agent not in DIRECTIONAL_AGENTS:
+            continue  # Timing: gathered and preserved in opinions_used, never scored directly
         direction_value = _DIRECTION_VALUE.get(opinion.get("direction", "neutral"), 0)
         confidence = opinion.get("confidence", 0)
         weight = weights.get(agent, 0)
@@ -272,10 +356,10 @@ def _score_opinions(
             "contribution": round(contribution, 2),
         }
 
-    # Re-normalize by the weight actually available, so a missing
-    # agent doesn't silently drag the score toward zero just because
-    # its slot was empty.
-    score = weighted_sum / available_weight
+    # Re-normalize by the directional weight actually available, so a
+    # missing directional agent doesn't silently drag the score toward
+    # zero just because its slot was empty.
+    score = weighted_sum / directional_available_weight if directional_available_weight else 0.0
 
     conflict_flags: list[str] = []
     if "analysis" in opinions and "news" in opinions:
@@ -292,6 +376,19 @@ def _score_opinions(
             conflict_flags.append("analysis_news_conflict_urgent_dampened")
         elif opposing:
             conflict_flags.append("analysis_news_conflict")
+
+    # Tier 2.8: Timing's actual gating role — a full veto when the
+    # market is flagged closed (weekend timestamp), a half-dampen when
+    # it's a weekday bar outside every kill zone (low expected
+    # liquidity/conviction). No effect when Timing is missing — you
+    # can't gate on information you don't have.
+    if timing_context is not None:
+        if _TIMING_VETO_FLAG in timing_flags:
+            score = 0.0
+            conflict_flags.append("timing_market_closed")
+        elif _TIMING_DAMPEN_FLAG in timing_flags:
+            score *= _TIMING_DAMPEN_FACTOR
+            conflict_flags.append("timing_low_liquidity_dampened")
 
     if score > threshold:
         decision = "enter_long"
@@ -327,6 +424,7 @@ def _score_opinions(
         summary=summary,
         opinions_used=opinions,
         config_version=config_version,
+        timing_context=timing_context,
     )
 
 

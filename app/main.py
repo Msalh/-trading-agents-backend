@@ -156,6 +156,29 @@ only_changed filtering), and GET /candidates/history/replay/summary
 questions like "if the threshold had been 35 this whole time, how
 many of the last 100 decisions would have flipped?".
 
+Tier 2.8 (Coordinator redesign — the Timing-neutral-weight issue
+flagged back in Tier 1): Timing's direction is always "neutral" by
+design, so its slot in the weighted sum always contributed 0
+magnitude — but its 20% weight still counted as "available evidence"
+for MIN_AVAILABLE_WEIGHT, so Analysis (40%) plus a present-but-neutral
+Timing (20%, present on almost every webhook bar) cleared the 60%
+minimum trivially, letting Analysis alone effectively single-handedly
+trigger a trade in production. coordinator.py now excludes Timing from
+available_weight/the weighted score entirely via a new
+DIRECTIONAL_AGENTS constant (analysis/news/macro only) — the minimum
+is now a fraction of the *directional* evidence pool, so Analysis
+alone (40% of an 80%-wide directional pool = 50%) correctly stays
+insufficient_data regardless of Timing. Timing keeps its designed
+purpose as an actual gate instead of dead weight: still gathered and
+still in opinions_used, but now read out separately as a new
+CoordinatorDecision.timing_context field and applied as a score
+dampener/veto — full veto (score forced to 0) on a "market_closed"
+flag (weekend timestamp), half-dampened on "low_liquidity" (a weekday
+bar outside every kill zone). No new endpoints — same
+/coordinator/decide, visible in the response's timing_context field
+and, when triggered, in conflict_flags ("timing_market_closed" /
+"timing_low_liquidity_dampened").
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
