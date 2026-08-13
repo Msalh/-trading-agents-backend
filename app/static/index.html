@@ -212,7 +212,7 @@
   .badge.bullish, .badge.approve { background: var(--bull-bg); color: var(--bull); }
   .badge.bearish, .badge.reject { background: var(--bear-bg); color: var(--bear); }
   .badge.neutral, .badge.no_action { background: var(--neutral-bg); color: var(--neutral); }
-  .badge.modify, .badge.pending_execution { background: var(--accent-bg); color: var(--accent); }
+  .badge.modify, .badge.pending_execution, .badge.pending_fill { background: var(--accent-bg); color: var(--accent); }
   .badge-conf-row { display: flex; align-items: center; gap: 8px; }
   .conf-row { display: flex; align-items: center; gap: 8px; flex: 1; }
   .conf-track { flex: 1; height: 6px; background: var(--panel-2); border-radius: 3px; overflow: hidden; }
@@ -247,6 +247,11 @@
 
   /* ---- history ---- */
   .section-title { font-size: 12px; font-weight: 600; margin: 18px 0 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; font-family: var(--font-head); }
+  .pnl-total { font-family: var(--font-mono); text-transform: none; letter-spacing: normal; font-weight: 700; margin-left: 6px; }
+  .pnl-total.pos { color: var(--bull); }
+  .pnl-total.neg { color: var(--bear); }
+  .pnl-cell.pos { color: var(--bull); }
+  .pnl-cell.neg { color: var(--bear); }
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
   th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border); }
   th { color: var(--muted); font-weight: 500; font-size: 10.5px; text-transform: uppercase; letter-spacing: .03em; font-family: var(--font-head); }
@@ -360,6 +365,17 @@
         <button class="secondary small" id="runExec">Plan Execution</button>
       </div>
     </div>
+
+    <div class="decision-arrow">→</div>
+
+    <div class="decision-col position-col">
+      <div class="risk-head-row">
+        <div class="col-label">Open Position</div>
+        <span class="card-time" id="positionTime"></span>
+      </div>
+      <div id="positionBadge"></div>
+      <div id="positionCardBody"><span class="empty">No open position — opens automatically when Risk sizes an approved trade.</span></div>
+    </div>
   </div>
 
   <div class="charts-stack" id="chartsStack"></div>
@@ -372,6 +388,16 @@
       <table>
         <thead><tr><th>Time (Israel)</th><th>Decision</th><th>Direction</th><th>Score</th><th>Missing</th><th>Conflicts</th></tr></thead>
         <tbody id="historyBody"><tr><td colspan="6" class="empty">No history yet.</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="section-title">Trade History <span id="pnlTotal" class="pnl-total"></span></div>
+  <div class="history-wrap">
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Closed (Israel)</th><th>Direction</th><th>Size</th><th>Entry</th><th>Exit</th><th>Reason</th><th>P&amp;L</th></tr></thead>
+        <tbody id="tradeHistoryBody"><tr><td colspan="7" class="empty">No closed trades yet.</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -1115,13 +1141,67 @@ async function refreshHistory() {
   `).join('');
 }
 
+// Tier 2.3 — Open Position card. Read-only (no secret needed, just
+// GET /trades/open) — the trade itself was already opened as a side
+// effect of the Risk "size" stage, not by anything clicked here.
+async function refreshOpenPosition() {
+  const symbol = symbolEl.value, timeframe = timeframeEl.value;
+  const res = await api('GET', `/trades/open?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}`);
+  const el = $('positionCardBody');
+  if (!res.ok || !res.data || !res.data.length) {
+    $('positionBadge').innerHTML = '';
+    $('positionTime').textContent = '';
+    el.innerHTML = `<span class="empty">No open position — opens automatically when Risk sizes an approved trade.</span>`;
+    return;
+  }
+  const t = res.data[0];
+  $('positionTime').textContent = fmtAgo(t.opened_at || t.created_at);
+  const badgeClass = t.status === 'pending_fill' ? 'pending_fill' : dirClass(t.direction);
+  $('positionBadge').innerHTML = `<span class="badge ${badgeClass}">${escapeHtml(t.status)}</span>`;
+  el.innerHTML = renderKeyData({
+    direction: t.direction,
+    size: t.size,
+    order_type: t.order_type,
+    entry_price: t.entry_price,
+    fill_price: t.fill_price,
+    stop_loss: t.stop_loss,
+    targets: t.targets,
+  });
+}
+
+async function refreshTradeHistory() {
+  const symbol = symbolEl.value, timeframe = timeframeEl.value;
+  const res = await api('GET', `/trades/history?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&limit=20`);
+  const body = $('tradeHistoryBody');
+  const totalEl = $('pnlTotal');
+  if (!res.ok || !res.data || !res.data.length) {
+    body.innerHTML = `<tr><td colspan="7" class="empty">No closed trades yet.</td></tr>`;
+    totalEl.textContent = '';
+    return;
+  }
+  const total = res.data.reduce((sum, t) => sum + (t.pnl_usd || 0), 0);
+  totalEl.textContent = `${total >= 0 ? '+' : ''}$${total.toFixed(2)} total`;
+  totalEl.className = 'pnl-total ' + (total >= 0 ? 'pos' : 'neg');
+  body.innerHTML = res.data.map(t => `
+    <tr>
+      <td>${escapeHtml(fmtIsraelTime(t.closed_at))}</td>
+      <td><span class="badge ${dirClass(t.direction)}">${escapeHtml(t.direction)}</span></td>
+      <td>${t.size}</td>
+      <td>${t.fill_price}</td>
+      <td>${t.exit_price}</td>
+      <td>${escapeHtml(t.exit_reason)}</td>
+      <td class="pnl-cell ${t.pnl_usd >= 0 ? 'pos' : 'neg'}">${t.pnl_usd >= 0 ? '+' : ''}$${Number(t.pnl_usd).toFixed(2)}</td>
+    </tr>
+  `).join('');
+}
+
 async function refreshAll() {
   // Agent cards first: renderSessionClock reads lastTimingData, which the
   // Timing card's fetch sets as a side effect. The four charts are fully
   // independent (their own bars + their own per-timeframe Analysis
   // opinion), so they run alongside everything else.
   await refreshAllAgentCards();
-  await Promise.all([refreshDecisionLive(), refreshCandidateInfo(), refreshRisk(), refreshHistory(), refreshAllCharts(), refreshSystemStatus()]);
+  await Promise.all([refreshDecisionLive(), refreshCandidateInfo(), refreshRisk(), refreshHistory(), refreshAllCharts(), refreshSystemStatus(), refreshOpenPosition(), refreshTradeHistory()]);
   renderSessionClock();
   $('lastUpdated').textContent = 'updated ' + new Date().toLocaleTimeString();
 }
@@ -1157,7 +1237,12 @@ $('runAllBtn').addEventListener('click', async () => {
 $('runRisk').addEventListener('click', async () => {
   const btn = $('runRisk');
   btn.disabled = true;
+  // Risk's "size" stage opens a paper trade as a side effect when it
+  // approves/modifies — refresh the position/history views too so a
+  // newly-opened trade shows up immediately, not just on the next
+  // 30s auto-refresh tick.
   await refreshRisk();
+  await Promise.all([refreshOpenPosition(), refreshTradeHistory()]);
   btn.disabled = false;
 });
 

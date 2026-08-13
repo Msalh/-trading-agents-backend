@@ -105,6 +105,20 @@ sizes the position from the actual stop distance. Same
 /agents/risk/evaluate and /agents/execution/plan endpoints as before;
 the endpoints now inspect the candidate to run the right stage.
 
+Tier 2.3 (paper fill/P&L lifecycle): everything through Tier 2.2
+produced an opinion about what SHOULD happen; nothing tracked what
+actually happened. app/paper_trades.py closes that gap — the moment
+Risk's size stage approves/modifies a candidate, a paper trade opens
+(immediately for a market/ready-now order, or "pending_fill" for a
+limit waiting on price). Every new bar for that symbol/timeframe —
+regardless of Timing/kill-zone gating, since price doesn't pause
+outside a kill zone — advances every live trade: fills a pending
+limit, and closes an open trade on a stop or (nearest) target hit,
+realizing P&L in dollars. Risk's gate stage now checks the LIVE open-
+trade count instead of the old hand-updated CURRENT_OPEN_POSITIONS env
+var. New read endpoints: GET /trades/open, /trades/history,
+/trades/{trade_id}.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -133,6 +147,7 @@ from app.macro_agent import MacroAgentError, run_macro
 from app.models import MarketStateOut, MarketStatePayload, WebhookAck
 from app.news_agent import NewsAgentError, run_news
 from app.outcomes import HORIZON_MINUTES_DEFAULT, compute_outcomes_for_decision
+from app.paper_trades import get_open_trade_count, open_trade_from_candidate, process_new_bar
 from app.risk_agent import evaluate_risk_gate, size_position
 from app.scheduler import (
     MACRO_SYMBOL,
@@ -149,9 +164,12 @@ from app.storage import (
     get_latest,
     get_latest_candidate,
     get_latest_opinion,
+    get_open_or_pending_trades,
     get_recent,
     get_recent_decisions,
     get_recent_opinions,
+    get_recent_trades,
+    get_trade_by_id,
     init_db,
     save_decision,
     save_event,
@@ -336,6 +354,25 @@ def _run_auto_analysis_and_coordinator(symbol: str, timeframe: str) -> None:
         logging.getLogger("webhook").error("auto-analysis failed: %s", e)
 
 
+def _process_paper_trades(symbol: str, timeframe: str, bar: dict) -> None:
+    """Advances every live paper trade against a freshly-arrived bar.
+    Deliberately NOT gated by the Timing/kill-zone check that gates
+    Analysis — a trade that's already open can hit its stop or target
+    at any hour, session or not, and this only reads OHLC already
+    stored, no LLM/cost involved. Runs as its own background task so
+    it never waits on (or is blocked by) the separate, slower
+    Analysis/Coordinator task."""
+    try:
+        changed = process_new_bar(symbol=symbol, timeframe=timeframe, bar=bar)
+        if changed:
+            logging.getLogger("webhook").info(
+                "paper trades updated: %s",
+                [(t["trade_id"], t["status"], t.get("exit_reason")) for t in changed],
+            )
+    except Exception as e:  # noqa: BLE001 - background task, log and move on
+        logging.getLogger("webhook").error("paper trade processing failed: %s", e)
+
+
 @app.post("/webhook/tradingview", response_model=WebhookAck)
 def receive_market_state(
     payload: MarketStatePayload,
@@ -363,6 +400,17 @@ def receive_market_state(
     if is_new and analysis_would_run:
         background_tasks.add_task(
             _run_auto_analysis_and_coordinator, payload.symbol, payload.timeframe
+        )
+
+    # Paper trade monitoring runs on every new bar, independent of the
+    # Timing gate above — an already-open trade's stop/target doesn't
+    # wait for a kill zone. Cheap (no LLM), so no reason to gate it.
+    if is_new:
+        background_tasks.add_task(
+            _process_paper_trades,
+            payload.symbol,
+            payload.timeframe,
+            payload.model_dump(exclude={"secret"}),
         )
 
     return WebhookAck(
@@ -581,6 +629,36 @@ def candidate_by_id(candidate_id: str) -> dict:
     return candidate
 
 
+@app.get("/trades/open")
+def trades_open(
+    symbol: str = Query(...),
+    timeframe: str = Query(...),
+) -> list[dict]:
+    """Trades still live — status "pending_fill" (limit order waiting
+    for price) or "open" (filled, position live). Read-only, no
+    secret needed — same pattern as /candidates/*."""
+    return get_open_or_pending_trades(symbol=symbol, timeframe=timeframe)
+
+
+@app.get("/trades/history")
+def trades_history(
+    symbol: str = Query(...),
+    timeframe: str = Query(...),
+    limit: int = Query(default=20, le=200),
+) -> list[dict]:
+    """Closed trades, newest first, with realized pnl_usd and
+    exit_reason ("stop_hit" | "target_hit")."""
+    return get_recent_trades(symbol=symbol, timeframe=timeframe, limit=limit)
+
+
+@app.get("/trades/{trade_id}")
+def trade_by_id(trade_id: str) -> dict:
+    trade = get_trade_by_id(trade_id)
+    if trade is None:
+        raise HTTPException(status_code=404, detail=f"no trade found with id={trade_id}")
+    return trade
+
+
 @app.get("/coordinator/history")
 def coordinator_history(
     symbol: str = Query(...),
@@ -642,7 +720,16 @@ def risk_evaluate(
         actual entry_price/stop_loss instead of an ATR estimate.
     Either way the result overwrites this candidate's risk_json — a
     candidate carries exactly one current Risk opinion, not a gate
-    opinion and a size opinion side by side."""
+    opinion and a size opinion side by side.
+
+    Tier 2.3: the gate stage's position-limit check now uses the LIVE
+    count of open/pending paper trades (app/paper_trades.py) instead
+    of only the static CURRENT_OPEN_POSITIONS env var. And when the
+    size stage approves or modifies, a paper trade is opened right
+    here as a side effect — that's the natural commit point: Risk
+    deciding a real size IS the decision to actually take the trade
+    (paper-only, so there's no reason to gate that behind a further
+    manual step)."""
     _check_secret(x_webhook_secret)
     try:
         candidate = get_current_candidate(symbol=symbol, timeframe=timeframe)
@@ -650,6 +737,7 @@ def risk_evaluate(
         raise HTTPException(status_code=404, detail=str(e))
 
     execution = candidate["execution"]
+    trade = None
     if execution is not None and execution.get("status") == "planned":
         risk_opinion = size_position(
             symbol=symbol,
@@ -657,11 +745,16 @@ def risk_evaluate(
             entry_price=execution["entry_price"],
             stop_loss=execution["stop_loss"],
         )
+        if risk_opinion.decision in ("approve", "modify"):
+            candidate_for_trade = {**candidate, "risk": risk_opinion.to_dict()}
+            trade = open_trade_from_candidate(candidate_for_trade)
     else:
+        open_positions = get_open_trade_count(symbol=symbol, timeframe=timeframe)
         risk_opinion = evaluate_risk_gate(
             symbol=symbol,
             timeframe=timeframe,
             coordinator_decision=candidate["decision"],
+            current_open_positions=open_positions,
         )
 
     record_risk_result(candidate["candidate_id"], risk_opinion.to_dict())
@@ -678,6 +771,7 @@ def risk_evaluate(
         "candidate_id": candidate["candidate_id"],
         "coordinator_decision": candidate["decision"],
         "risk_opinion": risk_opinion.to_dict(),
+        "trade": trade,
     }
 
 

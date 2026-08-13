@@ -91,6 +91,23 @@ def test_gate_never_references_atr(risk_module):
     assert "atr_points" not in result.key_data
 
 
+def test_gate_uses_explicit_open_positions_over_env_var(risk_module):
+    """Tier 2.3: the caller (main.py) passes the live open-trade count
+    explicitly — it must win over the static env var even when they
+    disagree, since the env var is now only a fallback."""
+    ra = risk_module(MAX_OPEN_POSITIONS="1", CURRENT_OPEN_POSITIONS="0")  # env says room available
+    result = ra.evaluate_risk_gate("TEST", "5m", {"decision": "enter_long"}, current_open_positions=1)
+    assert result.decision == "reject"
+    assert "max_positions_reached" in result.flags
+    assert result.key_data["current_open_positions"] == 1
+
+
+def test_gate_falls_back_to_env_var_when_not_passed(risk_module):
+    ra = risk_module(MAX_OPEN_POSITIONS="1", CURRENT_OPEN_POSITIONS="1")
+    result = ra.evaluate_risk_gate("TEST", "5m", {"decision": "enter_long"})
+    assert result.decision == "reject"
+
+
 # ---------------------------------------------------------------------------
 # Stage 2: size_position — sized from the REAL entry/stop, not ATR
 # ---------------------------------------------------------------------------

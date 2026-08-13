@@ -138,6 +138,31 @@ Standalone test endpoints:
     plan.
   - Paper-only — never places a real order.
 
+### Trades (paper fill/P&L lifecycle, Tier 2.3) — read-only, no secret needed
+A paper trade opens automatically the moment `/agents/risk/evaluate`'s
+size stage returns `approve`/`modify` — there's no separate "open
+trade" endpoint to call. Every new webhook bar (regardless of Timing/
+kill-zone gating — price doesn't pause outside a kill zone) advances
+every live trade: fills a `pending_fill` limit order once price
+reaches it, and closes an `open` trade on a stop or nearest-target
+hit, computing `pnl_usd = |exit − fill| × $2/pt × size` (sign per
+direction). A bar that spans both stop and target in one move is
+treated as the stop having been hit first (conservative — OHLC bars
+don't carry true intrabar order). Only the nearest target is checked;
+a multi-target plan fully closes at the first one reached, no partial
+scale-out modeling yet.
+- `GET /trades/open?symbol=MNQ1!&timeframe=5m` — trades still live
+  (`pending_fill` or `open`).
+- `GET /trades/history?symbol=MNQ1!&timeframe=5m&limit=20` — closed
+  trades, newest first, with `exit_price` / `exit_reason`
+  (`stop_hit` | `target_hit`) / `pnl_usd`.
+- `GET /trades/{trade_id}` — a single trade by id.
+
+`CURRENT_OPEN_POSITIONS` is now a fallback only — Risk's gate stage
+uses the LIVE count from this table (`get_open_trade_count`) by
+default, so `MAX_OPEN_POSITIONS` is enforced against reality instead
+of a hand-updated number.
+
 ---
 
 ## Coordinator
@@ -170,8 +195,8 @@ Most recent N persisted decisions, newest first.
 | `ACCOUNT_BALANCE` | no | `50000` | static/manual, Sprint 7 |
 | `MAX_DRAWDOWN` | no | `2000` | |
 | `CURRENT_DRAWDOWN_USED` | no | `0` | update by hand as the real account changes |
-| `MAX_OPEN_POSITIONS` | no | `1` | |
-| `CURRENT_OPEN_POSITIONS` | no | `0` | update by hand |
+| `MAX_OPEN_POSITIONS` | no | `1` | enforced against the live open-paper-trade count as of Tier 2.3 |
+| `CURRENT_OPEN_POSITIONS` | no | `0` | Tier 2.3: fallback only — normally superseded by the live paper-trade count |
 | `BASE_POSITION_SIZE` | no | `1` | contracts |
 | `RISK_FRACTION_PER_TRADE` | no | `0.5` | fraction of remaining drawdown room risked per trade |
 
@@ -187,7 +212,11 @@ Most recent N persisted decisions, newest first.
 5. GET  /coordinator/decide?...       -> enter_long / enter_short / no_trade
 6. GET  /agents/risk/evaluate?...     -> gate stage: pending_execution / reject / no_action
 7. GET  /agents/execution/plan?...    -> order_type / entry_price / stop_loss / targets
-8. GET  /agents/risk/evaluate?...     -> size stage: approve / modify / reject (sized from step 7's stop)
+8. GET  /agents/risk/evaluate?...     -> size stage: approve / modify / reject
+                                          -- a paper trade opens automatically here on approve/modify
+9. GET  /trades/open?...              -> confirm the position opened
+   (later, on subsequent bars)
+10. GET /trades/history?...           -> once a stop/target is hit, the trade shows up here closed with pnl_usd
 ```
 
 In production with `ENABLE_SCHEDULER=true`, steps 1–4 happen on
@@ -195,4 +224,6 @@ their own (webhook + background scheduler) — only 5–8 need manual
 triggering (or a future automation once the pipeline is trusted).
 Note step 6 is called twice across the lifecycle (steps 6 and 8) —
 same endpoint, different stage depending on whether Execution has
-run yet.
+run yet. Steps 9–10 need no manual trigger at all — trade opening and
+fill/close monitoring both happen automatically as side effects of
+step 8 and every subsequent webhook bar, respectively.

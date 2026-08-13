@@ -42,6 +42,12 @@ Both stages are read through the same /agents/risk/evaluate endpoint
 (see main.py) — it inspects the candidate to decide which stage to
 run, so calling it twice across one candidate's lifecycle (once before
 Execution, once after) is the intended flow.
+
+Tier 2.3 (paper fill/P&L lifecycle, app/paper_trades.py): the gate
+stage's position-limit check now takes the live count of open/pending
+paper trades from the caller instead of only the static
+CURRENT_OPEN_POSITIONS env var — see evaluate_risk_gate's
+current_open_positions parameter.
 """
 
 import os
@@ -93,7 +99,8 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _account_snapshot() -> dict:
+def _account_snapshot(current_open_positions: int | None = None) -> dict:
+    open_positions = CURRENT_OPEN_POSITIONS if current_open_positions is None else current_open_positions
     remaining_room = MAX_DRAWDOWN - CURRENT_DRAWDOWN_USED
     return {
         "account_balance": ACCOUNT_BALANCE,
@@ -101,13 +108,26 @@ def _account_snapshot() -> dict:
         "current_drawdown_used": CURRENT_DRAWDOWN_USED,
         "remaining_drawdown_room": round(remaining_room, 2),
         "max_open_positions": MAX_OPEN_POSITIONS,
-        "current_open_positions": CURRENT_OPEN_POSITIONS,
+        "current_open_positions": open_positions,
     }
 
 
-def evaluate_risk_gate(symbol: str, timeframe: str, coordinator_decision: dict) -> RiskOpinion:
+def evaluate_risk_gate(
+    symbol: str,
+    timeframe: str,
+    coordinator_decision: dict,
+    current_open_positions: int | None = None,
+) -> RiskOpinion:
     """Stage 1. No stop price involved — this only decides whether
-    it's worth letting Execution spend a paid LLM call at all."""
+    it's worth letting Execution spend a paid LLM call at all.
+
+    Tier 2.3: current_open_positions is now the LIVE count of paper
+    trades still pending_fill/open (see app/paper_trades.py), passed
+    in by the caller (main.py) — not read from this module's static
+    CURRENT_OPEN_POSITIONS env var, which used to require updating by
+    hand and could silently drift from reality. The env var is kept
+    only as a fallback default for callers that don't track paper
+    trades (e.g. standalone tests, or a future non-paper deployment)."""
     now_iso = _now_iso()
     trade_decision = coordinator_decision.get("decision")
 
@@ -126,9 +146,10 @@ def evaluate_risk_gate(symbol: str, timeframe: str, coordinator_decision: dict) 
             flags=[],
         )
 
-    account_snapshot = _account_snapshot()
+    open_positions = CURRENT_OPEN_POSITIONS if current_open_positions is None else current_open_positions
+    account_snapshot = _account_snapshot(open_positions)
 
-    if CURRENT_OPEN_POSITIONS >= MAX_OPEN_POSITIONS:
+    if open_positions >= MAX_OPEN_POSITIONS:
         return RiskOpinion(
             agent="risk",
             timestamp=now_iso,
@@ -139,7 +160,7 @@ def evaluate_risk_gate(symbol: str, timeframe: str, coordinator_decision: dict) 
             original_size=BASE_POSITION_SIZE,
             suggested_size=None,
             reasoning=(
-                f"Already at the open-position limit ({CURRENT_OPEN_POSITIONS}/"
+                f"Already at the open-position limit ({open_positions}/"
                 f"{MAX_OPEN_POSITIONS}) — no room for a new position regardless of size."
             ),
             key_data=account_snapshot,
