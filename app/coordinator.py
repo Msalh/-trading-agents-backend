@@ -206,7 +206,12 @@ def _is_stale(opinion_timestamp: str | None, max_age_minutes: int) -> bool:
     return age_minutes > max_age_minutes
 
 
-def _gather_opinions(symbol: str, timeframe: str) -> tuple[dict, list[str], list[str]]:
+def _gather_opinions(
+    symbol: str,
+    timeframe: str,
+    bar: dict | None = None,
+    analysis_opinion: dict | None = None,
+) -> tuple[dict, list[str], list[str]]:
     """Collect the latest opinion from each agent. Analysis is keyed
     by symbol+timeframe (bar-dependent); News/Macro are keyed by
     symbol+"global" (not bar-dependent); Timing is computed fresh
@@ -215,6 +220,19 @@ def _gather_opinions(symbol: str, timeframe: str) -> tuple[dict, list[str], list
     never subject to the staleness check below, though the market
     bar it's derived from has no freshness check of its own either —
     a known gap if the webhook stops delivering, tracked as Tier 2).
+
+    Tier 3.1 (causal integrity): bar/analysis_opinion let a caller pin
+    both to an exact, already-known value instead of this function
+    independently re-querying "latest" for each — that independent
+    re-querying was the root cause of the original review's causal-
+    integrity finding (Timing's bar, Analysis's opinion, and the
+    candidate's stored bar could each resolve to a different moment if
+    a new webhook landed in between). The webhook-triggered auto-
+    analysis path (main.py) now always passes both, anchored to the
+    exact triggering event. The manual/on-demand path (GET
+    /coordinator/decide — no specific triggering event exists) leaves
+    both None and gets the old "whatever's latest right now" behavior,
+    unchanged.
 
     Returns (opinions, missing_agents, stale_agents) — three disjoint
     sets: an agent is in exactly one of "present in opinions",
@@ -229,7 +247,10 @@ def _gather_opinions(symbol: str, timeframe: str) -> tuple[dict, list[str], list
         ("news", "global", _MAX_AGE_MINUTES["news"]),
         ("macro", "global", _MAX_AGE_MINUTES["macro"]),
     ):
-        opinion = get_latest_opinion(agent=agent_name, symbol=symbol, timeframe=timeframe_key)
+        if agent_name == "analysis" and analysis_opinion is not None:
+            opinion = analysis_opinion
+        else:
+            opinion = get_latest_opinion(agent=agent_name, symbol=symbol, timeframe=timeframe_key)
         if opinion is None:
             missing_agents.append(agent_name)
         elif _is_stale(opinion.get("timestamp"), max_age):
@@ -237,7 +258,7 @@ def _gather_opinions(symbol: str, timeframe: str) -> tuple[dict, list[str], list
         else:
             opinions[agent_name] = opinion
 
-    latest_bar = get_latest(symbol=symbol, timeframe=timeframe)
+    latest_bar = bar if bar is not None else get_latest(symbol=symbol, timeframe=timeframe)
     if latest_bar is not None:
         timing = evaluate_timing(latest_bar["timestamp"])
         opinions["timing"] = timing.to_dict()
@@ -447,8 +468,19 @@ def _score_opinions(
     )
 
 
-def compute_decision(symbol: str, timeframe: str) -> CoordinatorDecision:
-    opinions, missing_agents, stale_agents = _gather_opinions(symbol=symbol, timeframe=timeframe)
+def compute_decision(
+    symbol: str,
+    timeframe: str,
+    bar: dict | None = None,
+    analysis_opinion: dict | None = None,
+) -> CoordinatorDecision:
+    """Tier 3.1: bar/analysis_opinion are optional anchors — see
+    _gather_opinions' docstring. Omitted by every existing caller
+    except app/candidates.py's create_candidate(), so this stays a
+    fully backward-compatible default ("use whatever's latest")."""
+    opinions, missing_agents, stale_agents = _gather_opinions(
+        symbol=symbol, timeframe=timeframe, bar=bar, analysis_opinion=analysis_opinion
+    )
     return _score_opinions(
         symbol=symbol,
         timeframe=timeframe,

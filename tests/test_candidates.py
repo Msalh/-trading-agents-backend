@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 
 import pytest
 
+from app.models import MarketStatePayload
+
 
 @pytest.fixture
 def fresh_storage(monkeypatch):
@@ -153,3 +155,139 @@ def test_new_candidate_created_by_later_run_does_not_retroactively_gain_earlier_
     second = candidates.create_candidate(symbol="TEST", timeframe="5m")
     assert second["candidate_id"] != first["candidate_id"]
     assert second["risk"] is None  # brand new, not inherited from `first`
+
+
+# ---------------------------------------------------------------------------
+# Tier 3.1: causal integrity — event-anchored candidates, write-once
+# risk/execution attach after a paper trade is committed.
+# ---------------------------------------------------------------------------
+
+def _bar(event_id, timestamp, close=100.0):
+    return {
+        "schema_version": "1.0",
+        "event_id": event_id,
+        "symbol": "TEST",
+        "source": "pine",
+        "timeframe": "5m",
+        "timestamp": timestamp,
+        "bar_status": "closed",
+        "event_type": "bar_closed",
+        "open": close, "high": close + 1, "low": close - 1, "close": close,
+        "session_name": "RTH", "is_rth": True, "trading_date": timestamp[:10],
+    }
+
+
+def test_create_candidate_uses_the_explicit_bar_anchor_not_latest(fresh_storage):
+    """The webhook-triggered path passes bar= explicitly. Even if a
+    NEWER bar has already landed in storage by the time this runs
+    (simulating a second webhook arriving mid-flight), the candidate
+    must freeze the anchor bar it was given, not silently pick up
+    whatever's newest — this is the actual causal-integrity fix."""
+    storage, coordinator, candidates = fresh_storage
+    _seed_bullish_scenario(storage)
+
+    old_bar = _bar("evt-old", "2026-08-13T10:00:00Z", close=100.0)
+    new_bar = _bar("evt-new", "2026-08-13T10:05:00Z", close=999.0)
+    storage.save_event(MarketStatePayload(**old_bar, secret="x"))
+    storage.save_event(MarketStatePayload(**new_bar, secret="x"))
+
+    candidate = candidates.create_candidate(symbol="TEST", timeframe="5m", bar=old_bar)
+    assert candidate["bar"]["event_id"] == "evt-old"
+    assert candidate["bar"]["close"] == 100.0
+
+
+def test_create_candidate_uses_the_explicit_analysis_opinion_not_latest(fresh_storage):
+    """Same guarantee for the Analysis opinion actually scored: even if
+    a DIFFERENT (newer) Analysis opinion already exists in storage, the
+    candidate scores exactly the opinion it was handed."""
+    storage, coordinator, candidates = fresh_storage
+    storage.save_opinion("analysis", "TEST", "5m", "t-newer", _opinion("bearish", 90, [1.0]))
+    storage.save_opinion("news", "TEST", "global", "t1", _opinion("bullish", 60))
+    storage.save_opinion("macro", "TEST", "global", "t1", _opinion("neutral", 50))
+
+    anchor_opinion = _opinion("bullish", 80, [105.0])
+    candidate = candidates.create_candidate(
+        symbol="TEST", timeframe="5m", analysis_opinion=anchor_opinion
+    )
+    assert candidate["decision"]["opinions_used"]["analysis"]["direction"] == "bullish"
+    assert candidate["decision"]["opinions_used"]["analysis"]["confidence"] == 80
+
+
+def test_create_candidate_without_anchor_still_falls_back_to_latest(fresh_storage):
+    """The manual /coordinator/decide path (no bar= passed) keeps the
+    pre-Tier-3.1 behavior exactly — this is what backward compat means
+    here."""
+    storage, coordinator, candidates = fresh_storage
+    _seed_bullish_scenario(storage)
+    candidate = candidates.create_candidate(symbol="TEST", timeframe="5m")
+    assert candidate["decision"]["decision"] == "enter_long"
+
+
+def test_risk_history_preserves_gate_opinion_after_size_overwrites_current(fresh_storage):
+    """The original review finding: sizing used to destroy the gate
+    opinion because both shared one column. risk_history_json must
+    keep both, in order, even though candidate["risk"] (the current/
+    display value) becomes the size opinion."""
+    storage, coordinator, candidates = fresh_storage
+    _seed_bullish_scenario(storage)
+    candidate = candidates.create_candidate(symbol="TEST", timeframe="5m")
+    cid = candidate["candidate_id"]
+
+    candidates.record_risk_result(cid, {"decision": "pending_execution", "stage": "gate"})
+    candidates.record_risk_result(cid, {"decision": "approve", "stage": "size", "suggested_size": 1})
+
+    current = candidates.get_current_candidate(symbol="TEST", timeframe="5m")
+    assert current["risk"]["stage"] == "size"  # current/display value is the latest
+    assert [r["stage"] for r in current["risk_history"]] == ["gate", "size"]  # nothing lost
+
+
+def test_execution_history_preserves_a_retried_attempt(fresh_storage):
+    storage, coordinator, candidates = fresh_storage
+    _seed_bullish_scenario(storage)
+    candidate = candidates.create_candidate(symbol="TEST", timeframe="5m")
+    cid = candidate["candidate_id"]
+
+    candidates.record_execution_result(cid, {"status": "invalid", "validation_error": "bad stop"})
+    candidates.record_execution_result(cid, {"status": "planned", "entry_price": 100.5})
+
+    current = candidates.get_current_candidate(symbol="TEST", timeframe="5m")
+    assert current["execution"]["status"] == "planned"
+    assert [e["status"] for e in current["execution_history"]] == ["invalid", "planned"]
+
+
+def test_record_risk_result_locked_once_a_trade_is_committed(fresh_storage):
+    """The second review's core finding: once a paper trade exists for
+    a candidate, Risk/Execution must never be allowed to silently
+    rewrite that candidate's recorded state out from under the trade
+    that was actually taken."""
+    storage, coordinator, candidates = fresh_storage
+    _seed_bullish_scenario(storage)
+    candidate = candidates.create_candidate(symbol="TEST", timeframe="5m")
+    cid = candidate["candidate_id"]
+
+    candidates.record_risk_result(cid, {"decision": "approve", "suggested_size": 1})
+    trade = {
+        "trade_id": "t1", "candidate_id": cid, "symbol": "TEST", "timeframe": "5m",
+        "direction": "bullish", "size": 1, "order_type": "market",
+        "entry_price": 100.0, "stop_loss": 95.0, "targets": [110.0],
+        "status": "open", "opened_at": _now_iso(), "fill_price": 100.0,
+    }
+    storage.save_paper_trade(trade)
+
+    assert candidates.get_committed_trade(cid)["trade_id"] == "t1"
+    with pytest.raises(candidates.CandidateLockedError):
+        candidates.record_risk_result(cid, {"decision": "modify", "suggested_size": 5})
+    with pytest.raises(candidates.CandidateLockedError):
+        candidates.record_execution_result(cid, {"status": "planned", "entry_price": 250.0})
+
+    # unchanged — still the original approve/size=1, not the rejected rewrite attempt
+    unchanged = candidates.get_current_candidate(symbol="TEST", timeframe="5m")
+    assert unchanged["risk"]["suggested_size"] == 1
+    assert unchanged["execution"] is None
+
+
+def test_get_committed_trade_returns_none_before_any_trade_exists(fresh_storage):
+    storage, coordinator, candidates = fresh_storage
+    _seed_bullish_scenario(storage)
+    candidate = candidates.create_candidate(symbol="TEST", timeframe="5m")
+    assert candidates.get_committed_trade(candidate["candidate_id"]) is None

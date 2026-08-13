@@ -1,0 +1,133 @@
+"""
+Unit tests for app.storage's Tier 3.1 (causal integrity) additions:
+get_by_event_id/get_recent_as_of (bar anchoring), and the write-once
+behavior of attach_risk_result/attach_execution_result. Storage-level
+tests only for the plumbing that isn't already exercised end-to-end via
+tests/test_candidates.py.
+
+Run with: pytest tests/test_storage.py -v
+"""
+
+import importlib
+import os
+import tempfile
+
+import pytest
+
+from app.models import MarketStatePayload
+
+
+@pytest.fixture
+def fresh_storage(monkeypatch):
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.close()
+    monkeypatch.setenv("DB_PATH", tmp.name)
+
+    import app.storage as storage
+    importlib.reload(storage)
+    storage.init_db()
+
+    yield storage
+
+    os.unlink(tmp.name)
+
+
+def _bar(event_id, timestamp, close=100.0):
+    return MarketStatePayload(
+        schema_version="1.0", event_id=event_id, symbol="TEST", source="pine",
+        timeframe="5m", timestamp=timestamp, bar_status="closed", event_type="bar_closed",
+        secret="x", open=close, high=close + 1, low=close - 1, close=close,
+        session_name="RTH", is_rth=True, trading_date=timestamp[:10],
+    )
+
+
+def test_get_by_event_id_returns_the_exact_bar(fresh_storage):
+    storage = fresh_storage
+    storage.save_event(_bar("evt-1", "2026-08-13T10:00:00Z", close=111.0))
+    storage.save_event(_bar("evt-2", "2026-08-13T10:05:00Z", close=222.0))
+
+    bar = storage.get_by_event_id("evt-1")
+    assert bar["event_id"] == "evt-1"
+    assert bar["close"] == 111.0
+
+
+def test_get_by_event_id_returns_none_for_unknown_id(fresh_storage):
+    storage = fresh_storage
+    assert storage.get_by_event_id("does-not-exist") is None
+
+
+def test_get_recent_as_of_excludes_bars_after_the_anchor(fresh_storage):
+    """The core anchoring guarantee: bars that arrived AFTER the anchor
+    timestamp must never leak into a window bounded by it — this is
+    what keeps a delayed/queued Analysis run from silently peeking at
+    a bar newer than the one that actually triggered it."""
+    storage = fresh_storage
+    storage.save_event(_bar("evt-1", "2026-08-13T10:00:00Z"))
+    storage.save_event(_bar("evt-2", "2026-08-13T10:05:00Z"))
+    storage.save_event(_bar("evt-3", "2026-08-13T10:10:00Z"))  # "arrives later"
+
+    window = storage.get_recent_as_of("TEST", "5m", as_of_timestamp="2026-08-13T10:05:00Z", limit=10)
+    event_ids = {b["event_id"] for b in window}
+    assert event_ids == {"evt-1", "evt-2"}
+    assert "evt-3" not in event_ids
+
+
+def test_get_recent_as_of_respects_limit(fresh_storage):
+    storage = fresh_storage
+    for i in range(5):
+        storage.save_event(_bar(f"evt-{i}", f"2026-08-13T10:0{i}:00Z"))
+
+    window = storage.get_recent_as_of("TEST", "5m", as_of_timestamp="2026-08-13T10:04:00Z", limit=2)
+    assert len(window) == 2
+
+
+def test_attach_risk_result_not_found_for_unknown_candidate(fresh_storage):
+    storage = fresh_storage
+    assert storage.attach_risk_result("no-such-id", {"decision": "approve"}) == "not_found"
+
+
+def test_attach_risk_result_ok_then_locked_after_trade_committed(fresh_storage):
+    storage = fresh_storage
+    storage.save_candidate(
+        candidate_id="c1", symbol="TEST", timeframe="5m", bar=None,
+        decision={"decision": "enter_long"},
+    )
+    assert storage.attach_risk_result("c1", {"decision": "approve", "stage": "gate"}) == "ok"
+
+    storage.save_paper_trade({
+        "trade_id": "t1", "candidate_id": "c1", "symbol": "TEST", "timeframe": "5m",
+        "direction": "bullish", "size": 1, "order_type": "market",
+        "entry_price": 100.0, "stop_loss": 95.0, "targets": [110.0],
+        "status": "open", "opened_at": "2026-08-13T10:00:00Z", "fill_price": 100.0,
+    })
+
+    assert storage.attach_risk_result("c1", {"decision": "modify", "stage": "size"}) == "locked"
+    # unchanged by the rejected attempt
+    candidate = storage.get_candidate_by_id("c1")
+    assert candidate["risk"]["decision"] == "approve"
+
+
+def test_attach_execution_result_appends_history_without_losing_prior_entries(fresh_storage):
+    storage = fresh_storage
+    storage.save_candidate(
+        candidate_id="c1", symbol="TEST", timeframe="5m", bar=None,
+        decision={"decision": "enter_long"},
+    )
+    storage.attach_execution_result("c1", {"status": "invalid", "validation_error": "bad"})
+    storage.attach_execution_result("c1", {"status": "planned", "entry_price": 100.5})
+
+    candidate = storage.get_candidate_by_id("c1")
+    assert candidate["execution"]["status"] == "planned"
+    assert [e["status"] for e in candidate["execution_history"]] == ["invalid", "planned"]
+
+
+def test_init_db_migration_is_idempotent_on_an_existing_db(fresh_storage):
+    """Calling init_db() twice (e.g. app restart) must not error even
+    though the ALTER TABLE columns already exist from the first call."""
+    storage = fresh_storage
+    storage.init_db()  # fixture already called it once; a second call must not raise
+    storage.save_candidate(
+        candidate_id="c1", symbol="TEST", timeframe="5m", bar=None,
+        decision={"decision": "no_trade"},
+    )
+    assert storage.get_candidate_by_id("c1")["risk_history"] == []

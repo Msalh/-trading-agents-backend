@@ -146,6 +146,13 @@ Analysis won't auto-run even during nominal kill-zone clock hours) and
     only, same relationship `CURRENT_OPEN_POSITIONS` already has to the
     live open-position count. `key_data` also gains `daily_loss_limit` /
     `daily_loss_used` / `remaining_daily_loss_room`.
+  - As of Tier 3.1: once a paper trade has been committed from this
+    candidate, its Risk result is **locked** — calling this again
+    returns `{"locked": true, "risk_opinion": <the original, unchanged
+    opinion>, "trade": <the already-committed trade>}` instead of
+    recomputing gate/size math and overwriting the candidate. A
+    candidate's `risk_json` can never end up describing a size the
+    committed trade doesn't actually have.
 
 ### Execution (LLM, geometry only — no size)
 - `GET /agents/execution/plan?symbol=MNQ1!&timeframe=5m`
@@ -163,6 +170,11 @@ Analysis won't auto-run even during nominal kill-zone clock hours) and
     with `validation_error` set instead of being treated as a normal
     plan.
   - Paper-only — never places a real order.
+  - As of Tier 3.1: same lock as Risk above — once a trade exists for
+    this candidate, this returns `{"locked": true, "execution_opinion":
+    <unchanged>, "trade": <the committed trade>}` WITHOUT calling the
+    LLM at all (checked before `plan_execution()` runs, so a re-call
+    never spends a paid Execution call it can't use).
 
 ### Trades (paper fill/P&L lifecycle, Tier 2.3) — read-only, no secret needed
 A paper trade opens automatically the moment `/agents/risk/evaluate`'s
@@ -288,6 +300,22 @@ on its own.
 
 ### `GET /coordinator/history?symbol=MNQ1!&timeframe=5m&limit=20`
 Most recent N persisted decisions, newest first.
+
+As of Tier 3.1 (causal integrity), the webhook-triggered `persist=true`
+path anchors the whole candidate to the exact bar that triggered it —
+the market_state event's own `event_id` — instead of independently
+re-querying "the latest bar" and "the latest Analysis opinion" at each
+step. This closes a real gap: a second webhook landing while an
+earlier one's background Analysis run was still in flight could
+previously make the frozen candidate's bar, its Timing context, and
+its Analysis opinion each describe a different moment. A candidate
+object (as returned by `/candidates/{id}` and friends) now also
+carries `risk_history`/`execution_history` — append-only lists of
+every Risk/Execution result ever attached, so e.g. the original gate
+opinion (`stage: "gate"`) is still visible even after the size opinion
+(`stage: "size"`) becomes the current `risk` value. `risk`/`execution`
+on the candidate always remain "whatever the most recent stage
+produced," unchanged in shape from before this tier.
 
 ---
 

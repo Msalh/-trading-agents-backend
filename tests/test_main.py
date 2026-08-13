@@ -140,3 +140,135 @@ def test_account_risk_reflects_a_closed_losing_trade(client):
     body = r.json()
     assert body["current_drawdown_used"] == 40.0
     assert body["closed_trades_considered"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Tier 3.1: causal integrity
+# ---------------------------------------------------------------------------
+
+def test_auto_analysis_anchors_to_triggering_event_not_a_newer_bar(client, monkeypatch):
+    """The actual causal-integrity regression test: even though a NEWER
+    bar already exists in storage by the time this runs (simulating a
+    second webhook landing while the first's background task was still
+    queued), the anchored run must only ever see bars at-or-before its
+    own event_id's bar, and the resulting candidate must freeze that
+    same anchor bar — never the newer one."""
+    import app.main as main
+    import app.storage as storage
+
+    client.post("/webhook/tradingview", json=_payload("2026-08-11T14:00:00Z", "2026-08-11", event_id="evt-old"))
+    client.post("/webhook/tradingview", json=_payload("2026-08-11T14:05:00Z", "2026-08-11", event_id="evt-new"))
+
+    captured = {}
+
+    def fake_run_analysis(symbol, timeframe, bars):
+        captured["bars"] = bars
+        from app.analysis_agent import AnalysisOpinion
+        return AnalysisOpinion(
+            agent="analysis", timestamp="2026-08-11T14:00:05Z", symbol=symbol, timeframe=timeframe,
+            direction="bullish", confidence=70, reasoning="test", key_data={"key_levels": []}, flags=[],
+        )
+
+    monkeypatch.setattr(main, "run_analysis", fake_run_analysis)
+
+    main._run_auto_analysis_and_coordinator("MNQ1!", "5m", "evt-old")
+
+    seen_event_ids = {b["event_id"] for b in captured["bars"]}
+    assert "evt-old" in seen_event_ids
+    assert "evt-new" not in seen_event_ids  # the whole point of anchoring
+
+    candidate = storage.get_latest_candidate(symbol="MNQ1!", timeframe="5m")
+    assert candidate["bar"]["event_id"] == "evt-old"
+
+
+def test_auto_analysis_logs_and_returns_when_anchor_bar_missing(client, monkeypatch, caplog):
+    """Defensive path: an event_id that doesn't resolve to a stored bar
+    (shouldn't normally happen) must not crash the background task."""
+    import app.main as main
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("run_analysis should never be reached without an anchor bar")
+
+    monkeypatch.setattr(main, "run_analysis", fail_if_called)
+    main._run_auto_analysis_and_coordinator("MNQ1!", "5m", "no-such-event-id")  # must not raise
+
+
+def test_risk_and_execution_locked_after_trade_committed(client, monkeypatch):
+    """End-to-end: once Risk's size stage commits a paper trade from a
+    candidate, re-calling /agents/execution/plan or /agents/risk/evaluate
+    on that same still-current candidate must short-circuit to the
+    trade's real, already-committed state — never spend a second paid
+    Execution call, and never let the candidate's recorded risk/
+    execution describe something other than what was actually taken."""
+    import app.main as main
+    import app.storage as storage
+    from datetime import datetime, timezone
+
+    headers = {"X-Webhook-Secret": "test-secret"}
+    client.post("/webhook/tradingview", json=_payload("2026-08-11T14:00:00Z", "2026-08-11", event_id="evt-1"))
+
+    def _opinion(direction, confidence):
+        # Fresh (current-time) timestamps — the bar itself can be an
+        # old fixed test date (Timing only reads its time-of-day/
+        # day-of-week), but opinion freshness IS checked against the
+        # real clock (ANALYSIS_MAX_AGE_MINUTES/NEWS_MACRO_MAX_AGE_MINUTES).
+        return {
+            "direction": direction, "confidence": confidence, "reasoning": "t",
+            "key_data": {"key_levels": []}, "flags": [],
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+
+    storage.save_opinion("analysis", "MNQ1!", "5m", "t1", _opinion("bullish", 90))
+    storage.save_opinion("news", "MNQ1!", "global", "t1", _opinion("bullish", 80))
+    storage.save_opinion("macro", "MNQ1!", "global", "t1", _opinion("bullish", 70))
+
+    r = client.get("/coordinator/decide", params={"symbol": "MNQ1!", "timeframe": "5m"}, headers=headers)
+    assert r.json()["decision"] == "enter_long"
+
+    r = client.get("/agents/risk/evaluate", params={"symbol": "MNQ1!", "timeframe": "5m"}, headers=headers)
+    assert r.json()["risk_opinion"]["decision"] == "pending_execution"
+
+    call_count = {"n": 0}
+
+    def fake_plan_execution(**kwargs):
+        call_count["n"] += 1
+        from app.execution_agent import ExecutionOpinion
+        return ExecutionOpinion(
+            agent="execution", timestamp="2026-08-11T14:00:01Z", symbol="MNQ1!", timeframe="5m",
+            status="planned", direction="bullish", order_type="market",
+            entry_price=100.0, stop_loss=95.0, targets=[110.0], ready_now=True,
+            reasoning="t", flags=[], validation_error=None,
+        )
+
+    monkeypatch.setattr(main, "plan_execution", fake_plan_execution)
+
+    r = client.get("/agents/execution/plan", params={"symbol": "MNQ1!", "timeframe": "5m"}, headers=headers)
+    assert r.json()["execution_opinion"]["status"] == "planned"
+    assert call_count["n"] == 1
+
+    r = client.get("/agents/risk/evaluate", params={"symbol": "MNQ1!", "timeframe": "5m"}, headers=headers)
+    body = r.json()
+    assert body["risk_opinion"]["decision"] == "approve"
+    assert body["trade"] is not None
+    trade_id = body["trade"]["trade_id"]
+
+    # Re-run execution: must NOT call plan_execution again (no wasted
+    # LLM spend), must report locked and return the SAME trade.
+    r = client.get("/agents/execution/plan", params={"symbol": "MNQ1!", "timeframe": "5m"}, headers=headers)
+    body = r.json()
+    assert body["locked"] is True
+    assert body["trade"]["trade_id"] == trade_id
+    assert call_count["n"] == 1
+
+    # Re-run risk: same guarantee.
+    r = client.get("/agents/risk/evaluate", params={"symbol": "MNQ1!", "timeframe": "5m"}, headers=headers)
+    body = r.json()
+    assert body["locked"] is True
+    assert body["trade"]["trade_id"] == trade_id
+    assert body["risk_opinion"]["decision"] == "approve"
+
+    # And the candidate's persisted state genuinely still matches the
+    # trade that was actually committed.
+    candidate = storage.get_latest_candidate(symbol="MNQ1!", timeframe="5m")
+    assert candidate["execution"]["entry_price"] == 100.0
+    assert candidate["risk"]["decision"] == "approve"

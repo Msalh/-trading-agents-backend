@@ -55,6 +55,7 @@ from app.storage import (
     get_latest,
     get_latest_candidate,
     get_recent_candidates,
+    get_trade_by_candidate_id,
     save_candidate,
 )
 
@@ -70,25 +71,58 @@ class CandidateError(Exception):
     pass
 
 
+class CandidateLockedError(CandidateError):
+    """Tier 3.1: raised when Risk/Execution tries to attach a result to
+    a candidate that already has a committed paper trade. See
+    _attach_candidate_result in app/storage.py for the full reasoning
+    — the short version is that once a trade exists, its entry/stop/
+    size is fixed, and letting the candidate's risk_json/execution_json
+    keep changing after that would describe a trade that was never
+    actually taken."""
+
+    pass
+
+
 def _new_candidate_id() -> str:
     return str(uuid.uuid4())
 
 
-def create_candidate(symbol: str, timeframe: str) -> dict:
+def create_candidate(
+    symbol: str,
+    timeframe: str,
+    bar: dict | None = None,
+    analysis_opinion: dict | None = None,
+) -> dict:
     """The only place a CoordinatorDecision gets turned into a
     persisted candidate. Computes the decision fresh (capturing
     opinions_used atomically — see coordinator.py), grabs the bar it
     was anchored to, and saves all of it as one new immutable row.
-    Always creates a row, even for no_trade/insufficient_data."""
-    decision: CoordinatorDecision = compute_decision(symbol=symbol, timeframe=timeframe)
-    bar = get_latest(symbol=symbol, timeframe=timeframe)
+    Always creates a row, even for no_trade/insufficient_data.
+
+    Tier 3.1 (causal integrity): bar/analysis_opinion let a caller —
+    the webhook's auto-analysis background task — pin this candidate
+    to the EXACT bar and Analysis opinion that triggered it, computed
+    once and threaded through to compute_decision() too. Before this,
+    the bar used for Timing (inside compute_decision), the Analysis
+    opinion scored, and the bar stored on the candidate row were each
+    an INDEPENDENT "get the latest" query — three separate reads that
+    could each return a different bar if another webhook landed in
+    between. Now there is at most one "latest" lookup for the whole
+    call (only when bar is omitted — the manual /coordinator/decide
+    path, where there's no specific triggering event to anchor to),
+    and it's reused everywhere instead of being re-queried."""
+    anchor_bar = bar if bar is not None else get_latest(symbol=symbol, timeframe=timeframe)
+
+    decision: CoordinatorDecision = compute_decision(
+        symbol=symbol, timeframe=timeframe, bar=anchor_bar, analysis_opinion=analysis_opinion
+    )
 
     candidate_id = _new_candidate_id()
     save_candidate(
         candidate_id=candidate_id,
         symbol=symbol,
         timeframe=timeframe,
-        bar=bar,
+        bar=anchor_bar,
         decision=decision.to_dict(),
     )
     return get_candidate_by_id(candidate_id)
@@ -125,15 +159,34 @@ def get_current_candidate(symbol: str, timeframe: str) -> dict:
 
 
 def record_risk_result(candidate_id: str, risk_opinion: dict) -> None:
-    ok = attach_risk_result(candidate_id, risk_opinion)
-    if not ok:
+    result = attach_risk_result(candidate_id, risk_opinion)
+    if result == "not_found":
         raise CandidateError(f"no candidate found with id={candidate_id}")
+    if result == "locked":
+        raise CandidateLockedError(
+            f"candidate {candidate_id} already has a committed paper trade — "
+            "its Risk result can no longer be changed"
+        )
 
 
 def record_execution_result(candidate_id: str, execution_opinion: dict) -> None:
-    ok = attach_execution_result(candidate_id, execution_opinion)
-    if not ok:
+    result = attach_execution_result(candidate_id, execution_opinion)
+    if result == "not_found":
         raise CandidateError(f"no candidate found with id={candidate_id}")
+    if result == "locked":
+        raise CandidateLockedError(
+            f"candidate {candidate_id} already has a committed paper trade — "
+            "its Execution result can no longer be changed"
+        )
+
+
+def get_committed_trade(candidate_id: str) -> dict | None:
+    """Tier 3.1: the one place callers (main.py) should check whether
+    a candidate is already past the write-once boundary, BEFORE doing
+    any real work (a paid Execution LLM call, a Risk sizing pass) that
+    would only get rejected anyway — see _attach_candidate_result in
+    app/storage.py for why the rejection itself exists."""
+    return get_trade_by_candidate_id(candidate_id)
 
 
 def get_candidate_history(symbol: str, timeframe: str, limit: int = 20) -> list[dict]:

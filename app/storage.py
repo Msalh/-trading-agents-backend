@@ -66,7 +66,9 @@ CREATE TABLE IF NOT EXISTS trade_candidates (
     bar_json TEXT,
     decision_json TEXT NOT NULL,
     risk_json TEXT,
-    execution_json TEXT
+    execution_json TEXT,
+    risk_history_json TEXT,
+    execution_history_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_candidates_symbol_timeframe_created
     ON trade_candidates (symbol, timeframe, created_at DESC);
@@ -109,6 +111,18 @@ def init_db() -> None:
     conn = get_connection()
     try:
         conn.executescript(_SCHEMA)
+        # Tier 3.1: trade_candidates predates this migration on any
+        # already-deployed DB (Railway's volume) — CREATE TABLE IF NOT
+        # EXISTS above only applies to brand-new databases, so existing
+        # tables need these two columns added explicitly. Idempotent:
+        # SQLite raises "duplicate column name" if they're already
+        # there, which is exactly the "already migrated" case.
+        for column in ("risk_history_json", "execution_history_json"):
+            try:
+                conn.execute(f"ALTER TABLE trade_candidates ADD COLUMN {column} TEXT")
+            except sqlite3.OperationalError as e:
+                if "duplicate column name" not in str(e):
+                    raise
         conn.commit()
     finally:
         conn.close()
@@ -169,6 +183,47 @@ def get_recent(symbol: str, timeframe: str, limit: int = 20) -> list[dict]:
             LIMIT ?
             """,
             (symbol, timeframe, limit),
+        ).fetchall()
+        return [json.loads(r["payload_json"]) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_by_event_id(event_id: str) -> Optional[dict]:
+    """Tier 3.1 (causal integrity). Fetch the EXACT bar a webhook
+    delivery stored, by its own event_id — as opposed to get_latest(),
+    which returns whatever the newest row happens to be at the moment
+    it's called. The auto-analysis background task anchors itself to
+    this instead of "latest" so a second bar arriving while the task
+    is queued/running can never make it analyze or freeze a different
+    bar than the one that actually triggered it."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT payload_json FROM market_state WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()
+        return json.loads(row["payload_json"]) if row else None
+    finally:
+        conn.close()
+
+
+def get_recent_as_of(symbol: str, timeframe: str, as_of_timestamp: str, limit: int = 20) -> list[dict]:
+    """Same as get_recent(), but bounded to bars whose own timestamp is
+    at or before as_of_timestamp — Tier 3.1's other half of anchoring:
+    even if newer bars have landed by the time this actually runs, the
+    Analysis window used stays exactly what it would have been at the
+    anchor moment, never accidentally peeking at future bars."""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT payload_json FROM market_state
+            WHERE symbol = ? AND timeframe = ? AND timestamp <= ?
+            ORDER BY timestamp DESC
+            LIMIT ?
+            """,
+            (symbol, timeframe, as_of_timestamp, limit),
         ).fetchall()
         return [json.loads(r["payload_json"]) for r in rows]
     finally:
@@ -404,6 +459,7 @@ def save_candidate(
 
 
 def _row_to_candidate(row: sqlite3.Row) -> dict:
+    row_keys = row.keys()
     return {
         "candidate_id": row["candidate_id"],
         "symbol": row["symbol"],
@@ -413,6 +469,23 @@ def _row_to_candidate(row: sqlite3.Row) -> dict:
         "decision": json.loads(row["decision_json"]),
         "risk": json.loads(row["risk_json"]) if row["risk_json"] else None,
         "execution": json.loads(row["execution_json"]) if row["execution_json"] else None,
+        # Tier 3.1: full append-only transition history — "risk"/
+        # "execution" above stay the CURRENT stage's result for
+        # backward compatibility (dashboard/tests read them as a single
+        # opinion), but nothing is ever lost when a later stage's
+        # result is attached: the gate opinion is still here after the
+        # size opinion lands, every execution attempt is still here
+        # even if a retry replaced the current one.
+        "risk_history": (
+            json.loads(row["risk_history_json"])
+            if "risk_history_json" in row_keys and row["risk_history_json"]
+            else []
+        ),
+        "execution_history": (
+            json.loads(row["execution_history_json"])
+            if "execution_history_json" in row_keys and row["execution_history_json"]
+            else []
+        ),
     }
 
 
@@ -462,35 +535,72 @@ def get_recent_candidates(symbol: str, timeframe: str, limit: int = 20) -> list[
         conn.close()
 
 
-def attach_risk_result(candidate_id: str, risk_opinion: dict) -> bool:
+def _attach_candidate_result(
+    candidate_id: str, opinion: dict, current_column: str, history_column: str
+) -> str:
+    """Shared write-once-after-commit logic for attach_risk_result/
+    attach_execution_result — Tier 3.1 (causal integrity, part 2).
+
+    Before a paper trade exists for a candidate, both Risk and
+    Execution results are free to be (re-)attached as many times as
+    the two-stage gate/size flow (or a retried Execution call) needs —
+    each attach APPENDS to that field's history rather than discarding
+    the previous one, so e.g. the original gate opinion is still
+    visible after the size opinion lands.
+
+    Once a paper trade HAS been opened from this candidate
+    (open_trade_from_candidate — see app/paper_trades.py), the trade's
+    entry/stop/size is fixed and can never itself be edited. Letting
+    Risk or Execution attach a NEW/different opinion after that point
+    would make the candidate's risk_json/execution_json describe a
+    trade that was never actually taken — the exact "candidate says B,
+    committed trade is A" mismatch flagged in the second external
+    review. So once committed, this refuses (returns "locked") instead
+    of silently overwriting.
+
+    Returns "ok", "not_found", or "locked"."""
+    conn = get_connection()
+    try:
+        committed = conn.execute(
+            "SELECT 1 FROM paper_trades WHERE candidate_id = ? LIMIT 1", (candidate_id,)
+        ).fetchone()
+        if committed is not None:
+            return "locked"
+
+        row = conn.execute(
+            f"SELECT {history_column} FROM trade_candidates WHERE candidate_id = ?",
+            (candidate_id,),
+        ).fetchone()
+        if row is None:
+            return "not_found"
+
+        history = json.loads(row[history_column]) if row[history_column] else []
+        history.append(opinion)
+        conn.execute(
+            f"UPDATE trade_candidates SET {current_column} = ?, {history_column} = ? "
+            "WHERE candidate_id = ?",
+            (json.dumps(opinion), json.dumps(history), candidate_id),
+        )
+        conn.commit()
+        return "ok"
+    finally:
+        conn.close()
+
+
+def attach_risk_result(candidate_id: str, risk_opinion: dict) -> str:
     """Writes the Risk evaluation onto the SAME candidate row it was
-    evaluated against — not a new record. Returns False if the
-    candidate_id doesn't exist (caller should treat that as an error,
-    never silently create a new row)."""
-    conn = get_connection()
-    try:
-        cur = conn.execute(
-            "UPDATE trade_candidates SET risk_json = ? WHERE candidate_id = ?",
-            (json.dumps(risk_opinion), candidate_id),
-        )
-        conn.commit()
-        return cur.rowcount > 0
-    finally:
-        conn.close()
+    evaluated against — not a new record. Returns "ok", "not_found"
+    (no such candidate_id — caller should treat that as an error, never
+    silently create a new row), or "locked" (a paper trade already
+    exists for this candidate — see _attach_candidate_result)."""
+    return _attach_candidate_result(candidate_id, risk_opinion, "risk_json", "risk_history_json")
 
 
-def attach_execution_result(candidate_id: str, execution_opinion: dict) -> bool:
+def attach_execution_result(candidate_id: str, execution_opinion: dict) -> str:
     """Same pattern as attach_risk_result, for the Execution plan."""
-    conn = get_connection()
-    try:
-        cur = conn.execute(
-            "UPDATE trade_candidates SET execution_json = ? WHERE candidate_id = ?",
-            (json.dumps(execution_opinion), candidate_id),
-        )
-        conn.commit()
-        return cur.rowcount > 0
-    finally:
-        conn.close()
+    return _attach_candidate_result(
+        candidate_id, execution_opinion, "execution_json", "execution_history_json"
+    )
 
 
 # ---------------------------------------------------------------------------

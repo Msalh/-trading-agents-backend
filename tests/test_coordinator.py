@@ -553,3 +553,59 @@ def test_no_news_opinion_no_urgent_dampening(fresh_storage):
 
     decision = coordinator.compute_decision(symbol="TEST", timeframe="5m")
     assert "news_urgent_dampened" not in decision.conflict_flags
+
+
+# ---------------------------------------------------------------------------
+# Tier 3.1: causal integrity — compute_decision()/_gather_opinions()
+# accept explicit bar/analysis_opinion anchors instead of always
+# independently re-querying "latest".
+# ---------------------------------------------------------------------------
+
+def test_compute_decision_uses_explicit_bar_anchor_for_timing(fresh_storage):
+    """A weekend timestamp should veto the score via Timing's
+    market_closed flag — proving the explicitly-passed bar= is what
+    actually drives Timing, not whatever get_latest() would return."""
+    storage, coordinator = fresh_storage
+    storage.save_opinion("analysis", "TEST", "5m", "t1", _opinion("bullish", 90))
+    storage.save_opinion("news", "TEST", "global", "t1", _opinion("bullish", 80))
+    storage.save_opinion("macro", "TEST", "global", "t1", _opinion("bullish", 70))
+
+    # A Saturday in NY time -> Timing's market_closed veto.
+    weekend_bar = {"timestamp": "2026-08-15T15:00:00Z"}
+    decision = coordinator.compute_decision(symbol="TEST", timeframe="5m", bar=weekend_bar)
+
+    assert decision.score == 0.0
+    assert "timing_market_closed" in decision.conflict_flags
+
+
+def test_compute_decision_uses_explicit_analysis_opinion_over_stored(fresh_storage):
+    """Even if a DIFFERENT Analysis opinion is sitting in storage, the
+    explicitly-passed analysis_opinion is what gets scored — this is
+    the exact guarantee that keeps a candidate's frozen decision
+    consistent with the specific Analysis run that triggered it."""
+    storage, coordinator = fresh_storage
+    storage.save_opinion("analysis", "TEST", "5m", "t-stored", _opinion("bearish", 90))
+    storage.save_opinion("news", "TEST", "global", "t1", _opinion("bullish", 60))
+    storage.save_opinion("macro", "TEST", "global", "t1", _opinion("neutral", 50))
+
+    anchored_opinion = _opinion("bullish", 80)
+    decision = coordinator.compute_decision(
+        symbol="TEST", timeframe="5m", analysis_opinion=anchored_opinion
+    )
+
+    assert decision.opinions_used["analysis"]["direction"] == "bullish"
+    assert decision.opinions_used["analysis"]["confidence"] == 80
+
+
+def test_compute_decision_without_anchors_falls_back_to_latest(fresh_storage):
+    """No behavior change for existing callers (the manual
+    /coordinator/decide endpoint, and every test above this one in
+    this file) that never pass bar=/analysis_opinion=."""
+    storage, coordinator = fresh_storage
+    storage.save_opinion("analysis", "TEST", "5m", "t1", _opinion("bullish", 80))
+    storage.save_opinion("news", "TEST", "global", "t1", _opinion("bullish", 60))
+    storage.save_opinion("macro", "TEST", "global", "t1", _opinion("neutral", 50))
+
+    decision = coordinator.compute_decision(symbol="TEST", timeframe="5m")
+    assert decision.decision == "enter_long"
+    assert "timing" not in decision.opinions_used  # no bar in storage, as before

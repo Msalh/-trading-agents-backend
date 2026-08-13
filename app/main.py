@@ -231,6 +231,42 @@ parameter (rejects with flag "daily_loss_limit_reached"). New
 read-only endpoint GET /account/risk exposes both live figures without
 triggering a risk evaluation.
 
+Tier 3.1 (causal integrity, second external review, Aug 2026): the
+"immutable, atomically-bound" candidate the Tier 2.1 changelog
+promised wasn't actually either. (1) create_candidate() and its
+webhook-triggered caller each independently asked storage for "the
+latest bar"/"the latest opinion" at different points — a second
+webhook landing mid-flight could make the frozen candidate's bar,
+Timing context, and Analysis opinion each describe a different
+moment. Fixed: the webhook now passes its own event_id through to
+_run_auto_analysis_and_coordinator(), which fetches that EXACT bar
+once (get_by_event_id), bounds the Analysis window to it
+(get_recent_as_of), and threads both the anchor bar and the resulting
+Analysis opinion straight into create_candidate() — nothing is
+re-queried as "latest" more than once per webhook. compute_decision()
+and create_candidate() both gained optional bar/analysis_opinion
+parameters for this; the manual /coordinator/decide path (no specific
+triggering event) is unaffected, still using "latest". (2) risk_json/
+execution_json were plain overwrite-in-place columns with no
+protection once a paper trade had actually been committed from a
+candidate — re-calling /agents/risk/evaluate or /agents/execution/plan
+after that point could silently rewrite the candidate to describe a
+size/geometry the committed trade never actually had. Fixed:
+app/storage.py's attach_risk_result/attach_execution_result now
+refuse ("locked") once get_trade_by_candidate_id() finds a committed
+trade, and both endpoints check for that up front and short-circuit
+to the trade's real, already-committed state instead of recomputing.
+Every attach before that point now APPENDS to a new risk_history_json/
+execution_history_json column instead of only keeping the latest — so
+the original gate opinion is still visible after the size opinion
+lands, and a retried Execution call doesn't erase the attempt before
+it. Not in scope for this tier (tracked for a later one): fully
+transactional position-limit reservation (the count-then-insert gate
+in paper_trades.py is still two separate operations), paper fill
+realism (ready_now/market fills, no order expiry, no
+commissions/slippage), and event-time vs. processing-time trade
+timestamps — see the second review's Priority 2/3 findings.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -249,8 +285,10 @@ from app.account_risk import compute_current_drawdown_used, compute_daily_loss_u
 from app.analysis_agent import AnalysisAgentError, run_analysis
 from app.candidates import (
     CandidateError,
+    CandidateLockedError,
     create_candidate,
     get_candidate_history,
+    get_committed_trade,
     get_current_candidate,
     record_execution_result,
     record_risk_result,
@@ -285,6 +323,7 @@ from app.scheduler import (
 )
 from app.storage import (
     get_all_closed_trades_chronological,
+    get_by_event_id,
     get_candidate_by_id,
     get_last_opinion_timestamps,
     get_last_webhook_received,
@@ -293,6 +332,7 @@ from app.storage import (
     get_latest_opinion,
     get_open_or_pending_trades,
     get_recent,
+    get_recent_as_of,
     get_recent_decisions,
     get_recent_opinions,
     get_recent_trades,
@@ -438,16 +478,39 @@ def health_check() -> dict:
     return {"status": "ok"}
 
 
-def _run_auto_analysis_and_coordinator(symbol: str, timeframe: str) -> None:
+def _run_auto_analysis_and_coordinator(symbol: str, timeframe: str, event_id: str) -> None:
     """Runs Analysis + Coordinator for a freshly-arrived bar. Called via
     BackgroundTasks so the webhook can ack TradingView immediately —
     the LLM call is the slow part, and TradingView's own delivery
     timeout is short enough that waiting for it inline caused
     legitimate "request took too long and timed out" failures at
     TradingView even though the work itself completed successfully
-    a few seconds later."""
+    a few seconds later.
+
+    Tier 3.1 (causal integrity): event_id anchors this entire run to
+    the EXACT bar that triggered it. Before this, the function only
+    took symbol/timeframe and asked for "the latest 10 bars" whenever
+    it happened to actually run — on 5m/15m/1h feeds with a slow LLM
+    call and BackgroundTasks queuing, a second bar can genuinely land
+    before this one finishes, and "latest" would silently mean a
+    different, newer bar than the one that triggered this run. Now the
+    anchor bar is fetched once by its own event_id, the Analysis
+    window is bounded to bars at-or-before it (get_recent_as_of), and
+    both the anchor bar and the resulting Analysis opinion are passed
+    straight into create_candidate() instead of it re-querying "latest"
+    a second and third time."""
+    anchor_bar = get_by_event_id(event_id)
+    if anchor_bar is None:
+        # Shouldn't happen — save_event() just inserted this exact
+        # event_id moments before this task was scheduled. Logged, not
+        # raised: a background task has nothing to return an error to.
+        logging.getLogger("webhook").error("auto-analysis: anchor bar not found for event_id=%s", event_id)
+        return
+
     try:
-        recent_bars = get_recent(symbol=symbol, timeframe=timeframe, limit=10)
+        recent_bars = get_recent_as_of(
+            symbol=symbol, timeframe=timeframe, as_of_timestamp=anchor_bar["timestamp"], limit=10
+        )
         recent_bars.reverse()
         opinion = run_analysis(symbol=symbol, timeframe=timeframe, bars=recent_bars)
         save_opinion(
@@ -460,16 +523,20 @@ def _run_auto_analysis_and_coordinator(symbol: str, timeframe: str) -> None:
 
         # Auto-build a trade candidate right after a fresh Analysis
         # opinion lands — this is what actually populates candidate
-        # history on its own. create_candidate() computes the
-        # Coordinator decision internally (capturing exactly which
-        # opinions it used) and freezes it together with the bar into
-        # one immutable row; Risk/Execution will act on THIS row, not
-        # on independently-fetched "latest" pieces. Still also writes
-        # to the older coordinator_decisions table for backward
-        # compatibility with the dashboard's existing Decision History
-        # view, until it's updated to read from candidate history.
+        # history on its own. create_candidate() is now given the SAME
+        # anchor_bar and the SAME opinion just computed above (rather
+        # than independently re-fetching "latest" bar/opinion), so the
+        # candidate's bar, its Timing context, and the Analysis
+        # opinion it was scored from are all guaranteed to describe the
+        # one triggering event, not three independently-resolved
+        # "latest" reads. Still also writes to the older
+        # coordinator_decisions table for backward compatibility with
+        # the dashboard's existing Decision History view, until it's
+        # updated to read from candidate history.
         try:
-            candidate = create_candidate(symbol=symbol, timeframe=timeframe)
+            candidate = create_candidate(
+                symbol=symbol, timeframe=timeframe, bar=anchor_bar, analysis_opinion=opinion.to_dict()
+            )
             save_decision(
                 symbol=symbol,
                 timeframe=timeframe,
@@ -536,7 +603,7 @@ def receive_market_state(
     # run after, off the request/response path entirely.
     if is_new and analysis_would_run:
         background_tasks.add_task(
-            _run_auto_analysis_and_coordinator, payload.symbol, payload.timeframe
+            _run_auto_analysis_and_coordinator, payload.symbol, payload.timeframe, payload.event_id
         )
 
     # Paper trade monitoring runs on every new bar, independent of the
@@ -1064,12 +1131,30 @@ def risk_evaluate(
     here as a side effect — that's the natural commit point: Risk
     deciding a real size IS the decision to actually take the trade
     (paper-only, so there's no reason to gate that behind a further
-    manual step)."""
+    manual step).
+
+    Tier 3.1 (causal integrity): once a paper trade has been committed
+    from this candidate, its risk_json is locked — calling this again
+    (a dashboard double-click, a retry) no longer re-runs the gate/size
+    math and overwrites it. It short-circuits and returns the ALREADY-
+    COMMITTED risk opinion and trade unchanged, so the candidate can
+    never end up describing a different size/decision than the trade
+    that was actually taken from it."""
     _check_secret(x_webhook_secret)
     try:
         candidate = get_current_candidate(symbol=symbol, timeframe=timeframe)
     except CandidateError as e:
         raise HTTPException(status_code=404, detail=str(e))
+
+    existing_trade = get_committed_trade(candidate["candidate_id"])
+    if existing_trade is not None:
+        return {
+            "candidate_id": candidate["candidate_id"],
+            "coordinator_decision": candidate["decision"],
+            "risk_opinion": candidate["risk"],
+            "trade": existing_trade,
+            "locked": True,
+        }
 
     # Tier 2.10: live account-level figures, computed fresh from real
     # closed paper trades for every call — same "pass the live value
@@ -1081,8 +1166,8 @@ def risk_evaluate(
     daily_loss_used = compute_daily_loss_used(now_iso, trades=closed_trades)
 
     execution = candidate["execution"]
-    trade = None
-    if execution is not None and execution.get("status") == "planned":
+    is_size_stage = execution is not None and execution.get("status") == "planned"
+    if is_size_stage:
         risk_opinion = size_position(
             symbol=symbol,
             timeframe=timeframe,
@@ -1091,9 +1176,6 @@ def risk_evaluate(
             current_drawdown_used=current_drawdown_used,
             daily_loss_used=daily_loss_used,
         )
-        if risk_opinion.decision in ("approve", "modify"):
-            candidate_for_trade = {**candidate, "risk": risk_opinion.to_dict()}
-            trade = open_trade_from_candidate(candidate_for_trade)
     else:
         open_positions = get_open_trade_count(symbol=symbol, timeframe=timeframe)
         risk_opinion = evaluate_risk_gate(
@@ -1105,7 +1187,30 @@ def risk_evaluate(
             daily_loss_used=daily_loss_used,
         )
 
-    record_risk_result(candidate["candidate_id"], risk_opinion.to_dict())
+    # Tier 3.1: attach BEFORE committing a trade from it — the
+    # candidate's recorded risk_json is what the trade gets built from,
+    # not an in-memory value that happens to match. If another request
+    # committed a trade for this same candidate in the tiny window
+    # since existing_trade was checked above, attach_risk_result's
+    # write-once guard catches it here and this falls back to
+    # returning that trade's real state instead of a second one.
+    try:
+        record_risk_result(candidate["candidate_id"], risk_opinion.to_dict())
+    except CandidateLockedError:
+        locked_candidate = get_candidate_by_id(candidate["candidate_id"])
+        return {
+            "candidate_id": candidate["candidate_id"],
+            "coordinator_decision": candidate["decision"],
+            "risk_opinion": locked_candidate["risk"],
+            "trade": get_committed_trade(candidate["candidate_id"]),
+            "locked": True,
+        }
+
+    trade = None
+    if is_size_stage and risk_opinion.decision in ("approve", "modify"):
+        candidate_for_trade = {**candidate, "risk": risk_opinion.to_dict()}
+        trade = open_trade_from_candidate(candidate_for_trade)
+
     # Also written to the older agent_opinions table — /system/status
     # and the dashboard's existing Risk display still read from there.
     save_opinion(
@@ -1145,12 +1250,28 @@ def execution_plan(
     LLM call on a trade Risk has already ruled out. This call no
     longer needs or uses a size — it proposes geometry only; call
     /agents/risk/evaluate again afterward to size the position from
-    the entry_price/stop_loss this produces."""
+    the entry_price/stop_loss this produces.
+
+    Tier 3.1 (causal integrity): once a paper trade has been committed
+    from this candidate, its execution_json is locked. Re-calling this
+    (e.g. a double-click after the trade already opened) short-circuits
+    BEFORE spending a paid LLM call, returning the existing execution
+    plan unchanged — never a second, different geometry for a trade
+    whose real entry/stop/size are already fixed."""
     _check_secret(x_webhook_secret)
     try:
         candidate = get_current_candidate(symbol=symbol, timeframe=timeframe)
     except CandidateError as e:
         raise HTTPException(status_code=404, detail=str(e))
+
+    existing_trade = get_committed_trade(candidate["candidate_id"])
+    if existing_trade is not None:
+        return {
+            "candidate_id": candidate["candidate_id"],
+            "execution_opinion": candidate["execution"],
+            "trade": existing_trade,
+            "locked": True,
+        }
 
     risk = candidate["risk"]
     if risk is None:
@@ -1182,7 +1303,19 @@ def execution_plan(
     except ExecutionAgentError as e:
         raise HTTPException(status_code=502, detail=str(e))
 
-    record_execution_result(candidate["candidate_id"], execution_opinion.to_dict())
+    # Tier 3.1: defense-in-depth for the tiny race window between the
+    # existing_trade check above and this attach — see risk_evaluate's
+    # matching comment for the same pattern.
+    try:
+        record_execution_result(candidate["candidate_id"], execution_opinion.to_dict())
+    except CandidateLockedError:
+        locked_candidate = get_candidate_by_id(candidate["candidate_id"])
+        return {
+            "candidate_id": candidate["candidate_id"],
+            "execution_opinion": locked_candidate["execution"],
+            "trade": get_committed_trade(candidate["candidate_id"]),
+            "locked": True,
+        }
     save_opinion(
         agent="execution",
         symbol=symbol,
