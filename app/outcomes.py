@@ -1,21 +1,37 @@
 """
 Outcome tracking — evaluates whether a past Coordinator decision was
-directionally correct, at several time horizons after the decision.
+directionally correct.
 
-Deliberately computed on-demand (a query, not a background job or a
-stored column) — market_state bars are already retained, so this is
-just a lookup + comparison against data we already have. No new
-scheduling, no write-back races with the decisions table.
+Sprint 14 (original): computed on-demand (a query, not a background
+job or a stored column) whether price actually moved the predicted
+way at several fixed time horizons after the decision, by comparing
+market_state bars already stored — no new scheduling, no persisted
+column. This was always a HYPOTHETICAL estimate: it existed because,
+at the time, no decision ever became a real, trackable trade — there
+was nothing better to measure against.
+
+Tier 2.3 rebuild: that's no longer true. app/paper_trades.py now
+opens and closes real paper trades with a real, computed pnl_usd. For
+any candidate that actually became a trade, that closed trade's P&L
+IS the outcome — an exact answer, not a proxy. The horizon estimate
+below is kept and still computed, but only as a FALLBACK for
+candidates that never became a trade at all (rejected by Risk, never
+manually run, Execution failed, etc.) — useful for near-miss analysis
+("would this have worked out anyway?") even though it's not a real
+result. compute_outcome_for_candidate() is the entry point that
+chooses between the two and labels which one it used via a "source"
+field ("actual_trade" | "hypothetical") so a caller never confuses
+a guess for a fact.
 
 Only enter_long / enter_short decisions have anything to evaluate —
 no_trade and insufficient_data made no directional call, so there's
-nothing to score them against.
+nothing to score them against, in either mode.
 """
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from app.storage import get_bar_at_or_after, get_bar_at_or_before
+from app.storage import get_bar_at_or_after, get_bar_at_or_before, get_trade_by_candidate_id
 
 HORIZON_MINUTES_DEFAULT = [15, 30, 60]
 
@@ -98,7 +114,12 @@ def compute_outcomes_for_decision(
 ) -> dict[int, dict] | None:
     """Returns {horizon_minutes: outcome_dict} for a directional
     decision, or None if the decision was no_trade/insufficient_data
-    (nothing to evaluate)."""
+    (nothing to evaluate). Kept for backward compatibility with
+    /coordinator/history/outcomes, which reads the older
+    coordinator_decisions table (no candidate_id, so it can never
+    check for a real trade) — new callers should use
+    compute_outcome_for_candidate() instead, which prefers real trade
+    P&L when it's available."""
     if decision.get("decision") not in _DIRECTION_TO_DECISION:
         return None
 
@@ -112,4 +133,118 @@ def compute_outcomes_for_decision(
             horizon_minutes=h,
         ).to_dict()
         for h in horizons
+    }
+
+
+def compute_outcome_for_candidate(candidate: dict, horizons: list[int] = None) -> dict | None:
+    """Tier 2.3: the rebuilt entry point. Returns None for
+    no_trade/insufficient_data candidates — same "nothing to score"
+    rule as before. Otherwise checks whether this candidate ever
+    became a real paper trade (linked by candidate_id):
+
+      - A closed trade exists -> real outcome. "outcome" is
+        "win"/"loss"/"breakeven" from the trade's actual pnl_usd, no
+        estimation involved.
+      - A trade exists but hasn't closed yet (pending_fill/open) ->
+        "outcome": "pending" — genuinely unresolved, not a data gap.
+      - No trade was ever opened for this candidate -> falls back to
+        the original hypothetical horizon-based price estimate, so
+        near-miss candidates (rejected by Risk, never acted on) are
+        still visible for threshold-tuning analysis. Clearly labeled
+        "source": "hypothetical" so it's never mistaken for a real
+        result.
+    """
+    decision = candidate["decision"]
+    if decision.get("decision") not in _DIRECTION_TO_DECISION:
+        return None
+
+    trade = get_trade_by_candidate_id(candidate["candidate_id"])
+
+    if trade is not None and trade["status"] == "closed":
+        pnl = trade["pnl_usd"]
+        outcome = "win" if pnl > 0 else ("loss" if pnl < 0 else "breakeven")
+        return {
+            "source": "actual_trade",
+            "trade_id": trade["trade_id"],
+            "status": "closed",
+            "exit_reason": trade["exit_reason"],
+            "fill_price": trade["fill_price"],
+            "exit_price": trade["exit_price"],
+            "pnl_usd": pnl,
+            "outcome": outcome,
+        }
+
+    if trade is not None:
+        # pending_fill or open — a real trade exists, it just hasn't
+        # resolved yet. Distinct from "hypothetical": this candidate
+        # DID become a trade, we just don't know the ending yet.
+        return {
+            "source": "actual_trade",
+            "trade_id": trade["trade_id"],
+            "status": trade["status"],
+            "outcome": "pending",
+        }
+
+    horizons_dict = compute_outcomes_for_decision(
+        symbol=candidate["symbol"],
+        timeframe=candidate["timeframe"],
+        decision=decision,
+        horizons=horizons,
+    )
+    return {
+        "source": "hypothetical",
+        "status": "no_trade_opened",
+        "horizons": horizons_dict,
+    }
+
+
+def summarize_outcomes(outcomes: list[dict | None]) -> dict:
+    """Aggregates a list of compute_outcome_for_candidate() results
+    (None entries — no_trade/insufficient_data candidates — are
+    ignored) into the numbers actually useful for
+    COORDINATOR_THRESHOLD tuning: real win rate/P&L from closed
+    trades, kept separate from hypothetical horizon accuracy for
+    candidates that never became a trade. The two are never blended
+    into one number — a hypothetical guess and a real result answer
+    different questions."""
+    closed = [o for o in outcomes if o and o.get("source") == "actual_trade" and o.get("status") == "closed"]
+    pending_trades = [o for o in outcomes if o and o.get("source") == "actual_trade" and o.get("status") != "closed"]
+    hypothetical = [o for o in outcomes if o and o.get("source") == "hypothetical"]
+
+    wins = [o for o in closed if o["outcome"] == "win"]
+    losses = [o for o in closed if o["outcome"] == "loss"]
+    total_pnl = round(sum(o["pnl_usd"] for o in closed), 2) if closed else 0.0
+
+    real = {
+        "closed_trades": len(closed),
+        "wins": len(wins),
+        "losses": len(losses),
+        "breakeven": len(closed) - len(wins) - len(losses),
+        "win_rate": round(len(wins) / len(closed), 3) if closed else None,
+        "total_pnl_usd": total_pnl,
+        "avg_pnl_usd": round(total_pnl / len(closed), 2) if closed else None,
+        "still_open_or_pending": len(pending_trades),
+    }
+
+    horizon_accuracy: dict[int, dict] = {}
+    for o in hypothetical:
+        for h_str, h_outcome in (o.get("horizons") or {}).items():
+            h = int(h_str)
+            bucket = horizon_accuracy.setdefault(h, {"correct": 0, "incorrect": 0, "flat": 0, "pending": 0, "no_data": 0})
+            bucket[h_outcome["outcome"]] = bucket.get(h_outcome["outcome"], 0) + 1
+
+    hypothetical_summary = {}
+    for h, counts in horizon_accuracy.items():
+        resolved = counts["correct"] + counts["incorrect"]
+        hypothetical_summary[h] = {
+            **counts,
+            "accuracy": round(counts["correct"] / resolved, 3) if resolved else None,
+        }
+
+    return {
+        "real_trades": real,
+        "hypothetical_never_traded": {
+            "candidates": len(hypothetical),
+            "by_horizon_minutes": hypothetical_summary,
+        },
     }

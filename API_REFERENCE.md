@@ -163,6 +163,35 @@ uses the LIVE count from this table (`get_open_trade_count`) by
 default, so `MAX_OPEN_POSITIONS` is enforced against reality instead
 of a hand-updated number.
 
+### Outcomes (Tier 2.4 rebuild) — read-only, no secret needed
+Prefers a real closed paper trade's actual P&L over the original
+Sprint 14 hypothetical price-horizon estimate — the estimate is now
+only a fallback for candidates that never became a trade at all
+(rejected by Risk, never manually run, Execution failed, etc.).
+- `GET /candidates/history/outcomes?symbol=MNQ1!&timeframe=5m&limit=20&horizons=15,30,60`
+  — per-candidate outcome. Each result adds an `outcome` field:
+  `null` for `no_trade`/`insufficient_data` candidates (nothing to
+  score); `{"source": "actual_trade", "status": "closed", "outcome":
+  "win"|"loss"|"breakeven", "pnl_usd": ..., "exit_reason": ...}` for a
+  candidate that became a real, resolved trade; `{"source":
+  "actual_trade", "status": "open"|"pending_fill", "outcome":
+  "pending"}` for one still live; or `{"source": "hypothetical",
+  "horizons": {...}}` (the old per-horizon `correct`/`incorrect`/
+  `flat`/`pending`/`no_data` estimate) for a candidate that never
+  became a trade. `horizons` only affects the hypothetical fallback.
+- `GET /candidates/history/outcomes/summary?symbol=MNQ1!&timeframe=5m&limit=100`
+  — aggregated: real win rate / total & average `pnl_usd` / count
+  still open from closed trades, and hypothetical direction-accuracy
+  per horizon for never-traded candidates — kept as two separate
+  sections, never blended into one number. Replaces manually pulling
+  and tallying `/coordinator/history` rows by hand for
+  `COORDINATOR_THRESHOLD` tuning.
+- `GET /coordinator/history/outcomes` (Sprint 14, unchanged) still
+  works exactly as before — it reads the older `coordinator_decisions`
+  table, which has no `candidate_id` to link a real trade to, so it's
+  hypothetical-only regardless. Kept for anyone already depending on
+  its shape; new analysis should use `/candidates/history/outcomes`.
+
 ---
 
 ## Coordinator

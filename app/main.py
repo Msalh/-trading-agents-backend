@@ -119,6 +119,24 @@ trade count instead of the old hand-updated CURRENT_OPEN_POSITIONS env
 var. New read endpoints: GET /trades/open, /trades/history,
 /trades/{trade_id}.
 
+Tier 2.4 (outcome tracker rebuild): the original Sprint 14 outcome
+tracker (app/outcomes.py) could only ever estimate whether a decision
+"probably" worked out, by comparing price at fixed time horizons —
+the only option available before any decision could become a real,
+trackable trade. Now that Tier 2.3 gives every acted-on candidate a
+real closed paper trade with real P&L, that's ground truth and should
+be preferred over a guess. compute_outcome_for_candidate() checks for
+a real trade first (closed -> actual win/loss/pnl_usd; still open ->
+"pending") and only falls back to the old horizon estimate for
+candidates that never became a trade at all — labeled
+"source": "hypothetical" so a guess is never mistaken for a fact. New
+endpoints: GET /candidates/history/outcomes (per-candidate) and
+GET /candidates/history/outcomes/summary (aggregated win rate/total
+P&L vs. hypothetical horizon accuracy, replacing manual by-hand
+tallying of decision history for COORDINATOR_THRESHOLD tuning). The
+older /coordinator/history/outcomes is unchanged — it reads a table
+with no candidate_id, so it can never link to a real trade either way.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -146,7 +164,12 @@ from app.execution_agent import ExecutionAgentError, plan_execution
 from app.macro_agent import MacroAgentError, run_macro
 from app.models import MarketStateOut, MarketStatePayload, WebhookAck
 from app.news_agent import NewsAgentError, run_news
-from app.outcomes import HORIZON_MINUTES_DEFAULT, compute_outcomes_for_decision
+from app.outcomes import (
+    HORIZON_MINUTES_DEFAULT,
+    compute_outcome_for_candidate,
+    compute_outcomes_for_decision,
+    summarize_outcomes,
+)
 from app.paper_trades import get_open_trade_count, open_trade_from_candidate, process_new_bar
 from app.risk_agent import evaluate_risk_gate, size_position
 from app.scheduler import (
@@ -619,6 +642,62 @@ def candidates_history(
     limit: int = Query(default=20, le=200),
 ) -> list[dict]:
     return get_candidate_history(symbol=symbol, timeframe=timeframe, limit=limit)
+
+
+@app.get("/candidates/history/outcomes")
+def candidates_history_outcomes(
+    symbol: str = Query(...),
+    timeframe: str = Query(...),
+    limit: int = Query(default=20, le=200),
+    horizons: str = Query(
+        default="15,30,60",
+        description="comma-separated minutes — only used as a fallback for candidates that never became a real trade",
+    ),
+) -> list[dict]:
+    """Tier 2.3 rebuild of outcome tracking (supersedes
+    /coordinator/history/outcomes for anything going forward — that
+    older endpoint is kept as-is since it reads a table with no
+    candidate_id to link a real trade to). For each directional
+    candidate, prefers a real closed paper trade's actual pnl_usd
+    over the original hypothetical price-horizon estimate — the
+    estimate is now only used as a fallback for candidates that never
+    became a trade at all. no_trade/insufficient_data candidates get
+    outcome=None, same "nothing to score" rule as before."""
+    try:
+        horizon_list = [int(h.strip()) for h in horizons.split(",") if h.strip()]
+    except ValueError:
+        raise HTTPException(status_code=400, detail="horizons must be comma-separated integers")
+
+    candidates = get_candidate_history(symbol=symbol, timeframe=timeframe, limit=limit)
+    results = []
+    for candidate in candidates:
+        outcome = compute_outcome_for_candidate(candidate, horizons=horizon_list)
+        results.append({**candidate, "outcome": outcome})
+    return results
+
+
+@app.get("/candidates/history/outcomes/summary")
+def candidates_history_outcomes_summary(
+    symbol: str = Query(...),
+    timeframe: str = Query(...),
+    limit: int = Query(default=100, le=500),
+    horizons: str = Query(default="15,30,60"),
+) -> dict:
+    """Aggregated version of the above — real win rate/total P&L from
+    closed trades, plus hypothetical horizon accuracy for candidates
+    that never became a trade, kept as two separate sections (never
+    blended into one number). Built for the same COORDINATOR_THRESHOLD
+    tuning use case /coordinator/history/outcomes was originally
+    built for — replaces manually pulling and tallying decision-
+    history rows by hand."""
+    try:
+        horizon_list = [int(h.strip()) for h in horizons.split(",") if h.strip()]
+    except ValueError:
+        raise HTTPException(status_code=400, detail="horizons must be comma-separated integers")
+
+    candidates = get_candidate_history(symbol=symbol, timeframe=timeframe, limit=limit)
+    outcomes = [compute_outcome_for_candidate(c, horizons=horizon_list) for c in candidates]
+    return summarize_outcomes(outcomes)
 
 
 @app.get("/candidates/{candidate_id}")
