@@ -48,6 +48,22 @@ stage's position-limit check now takes the live count of open/pending
 paper trades from the caller instead of only the static
 CURRENT_OPEN_POSITIONS env var — see evaluate_risk_gate's
 current_open_positions parameter.
+
+Tier 2.10 (account-level risk controls, app/account_risk.py): two more
+account-level gaps closed the same way Tier 2.3 closed the open-
+position one. First, CURRENT_DRAWDOWN_USED was always a hand-updated
+env var that could silently drift from reality — both evaluate_risk_gate()
+and size_position() now accept an optional current_drawdown_used
+parameter, with callers (main.py) passing the LIVE peak-to-trough
+figure computed from real closed paper trades
+(account_risk.compute_current_drawdown_used()); the env var is kept
+only as the fallback default, exactly like CURRENT_OPEN_POSITIONS.
+Second, a new DAILY_LOSS_LIMIT — a faster, time-boxed circuit breaker
+distinct from the account-wide MAX_DRAWDOWN, so one very bad trading
+day can't quietly consume the whole drawdown budget. Both stages
+accept an optional daily_loss_used parameter the same way, defaulting
+to 0.0 when not supplied (there's no prior env var for this — it's a
+new control, not a migration of an existing manual one).
 """
 
 import os
@@ -63,6 +79,9 @@ MAX_OPEN_POSITIONS = int(os.environ.get("MAX_OPEN_POSITIONS", "1"))
 CURRENT_OPEN_POSITIONS = int(os.environ.get("CURRENT_OPEN_POSITIONS", "0"))
 BASE_POSITION_SIZE = int(os.environ.get("BASE_POSITION_SIZE", "1"))
 RISK_FRACTION_PER_TRADE = float(os.environ.get("RISK_FRACTION_PER_TRADE", "0.5"))
+# Tier 2.10: a time-boxed circuit breaker distinct from MAX_DRAWDOWN —
+# no prior env var to stay compatible with, since this control is new.
+DAILY_LOSS_LIMIT = float(os.environ.get("DAILY_LOSS_LIMIT", "1000"))
 
 
 @dataclass
@@ -99,14 +118,24 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _account_snapshot(current_open_positions: int | None = None) -> dict:
+def _account_snapshot(
+    current_open_positions: int | None = None,
+    current_drawdown_used: float | None = None,
+    daily_loss_used: float | None = None,
+) -> dict:
     open_positions = CURRENT_OPEN_POSITIONS if current_open_positions is None else current_open_positions
-    remaining_room = MAX_DRAWDOWN - CURRENT_DRAWDOWN_USED
+    drawdown_used = CURRENT_DRAWDOWN_USED if current_drawdown_used is None else current_drawdown_used
+    loss_used_today = 0.0 if daily_loss_used is None else daily_loss_used
+    remaining_room = MAX_DRAWDOWN - drawdown_used
+    remaining_daily_loss_room = DAILY_LOSS_LIMIT - loss_used_today
     return {
         "account_balance": ACCOUNT_BALANCE,
         "max_drawdown": MAX_DRAWDOWN,
-        "current_drawdown_used": CURRENT_DRAWDOWN_USED,
+        "current_drawdown_used": drawdown_used,
         "remaining_drawdown_room": round(remaining_room, 2),
+        "daily_loss_limit": DAILY_LOSS_LIMIT,
+        "daily_loss_used": loss_used_today,
+        "remaining_daily_loss_room": round(remaining_daily_loss_room, 2),
         "max_open_positions": MAX_OPEN_POSITIONS,
         "current_open_positions": open_positions,
     }
@@ -117,6 +146,8 @@ def evaluate_risk_gate(
     timeframe: str,
     coordinator_decision: dict,
     current_open_positions: int | None = None,
+    current_drawdown_used: float | None = None,
+    daily_loss_used: float | None = None,
 ) -> RiskOpinion:
     """Stage 1. No stop price involved — this only decides whether
     it's worth letting Execution spend a paid LLM call at all.
@@ -127,7 +158,13 @@ def evaluate_risk_gate(
     CURRENT_OPEN_POSITIONS env var, which used to require updating by
     hand and could silently drift from reality. The env var is kept
     only as a fallback default for callers that don't track paper
-    trades (e.g. standalone tests, or a future non-paper deployment)."""
+    trades (e.g. standalone tests, or a future non-paper deployment).
+
+    Tier 2.10: current_drawdown_used and daily_loss_used follow the
+    exact same pattern — main.py passes the LIVE values computed by
+    app/account_risk.py from real closed paper trades; the module-level
+    CURRENT_DRAWDOWN_USED env var and 0.0 (respectively) are the
+    fallback defaults for callers that don't compute them."""
     now_iso = _now_iso()
     trade_decision = coordinator_decision.get("decision")
 
@@ -147,7 +184,7 @@ def evaluate_risk_gate(
         )
 
     open_positions = CURRENT_OPEN_POSITIONS if current_open_positions is None else current_open_positions
-    account_snapshot = _account_snapshot(open_positions)
+    account_snapshot = _account_snapshot(open_positions, current_drawdown_used, daily_loss_used)
 
     if open_positions >= MAX_OPEN_POSITIONS:
         return RiskOpinion(
@@ -165,6 +202,26 @@ def evaluate_risk_gate(
             ),
             key_data=account_snapshot,
             flags=["max_positions_reached"],
+        )
+
+    remaining_daily_loss_room = account_snapshot["remaining_daily_loss_room"]
+    if remaining_daily_loss_room <= 0:
+        return RiskOpinion(
+            agent="risk",
+            timestamp=now_iso,
+            symbol=symbol,
+            timeframe=timeframe,
+            stage="gate",
+            decision="reject",
+            original_size=BASE_POSITION_SIZE,
+            suggested_size=None,
+            reasoning=(
+                f"Today's realized loss (${account_snapshot['daily_loss_used']:.2f}) has reached "
+                f"the ${DAILY_LOSS_LIMIT:.2f} daily loss limit — no new trades until the next "
+                "trading day, regardless of remaining overall drawdown room."
+            ),
+            key_data=account_snapshot,
+            flags=["daily_loss_limit_reached"],
         )
 
     remaining_room = account_snapshot["remaining_drawdown_room"]
@@ -193,8 +250,8 @@ def evaluate_risk_gate(
         original_size=BASE_POSITION_SIZE,
         suggested_size=None,
         reasoning=(
-            "Position limits and drawdown room are both clear — proceeding to Execution "
-            "to determine the actual entry/stop before sizing this trade."
+            "Position limits, daily loss limit, and drawdown room are all clear — proceeding "
+            "to Execution to determine the actual entry/stop before sizing this trade."
         ),
         key_data=account_snapshot,
         flags=[],
@@ -206,13 +263,24 @@ def size_position(
     timeframe: str,
     entry_price: float,
     stop_loss: float,
+    current_drawdown_used: float | None = None,
+    daily_loss_used: float | None = None,
 ) -> RiskOpinion:
     """Stage 2. Sizes the position from Execution's real proposed stop
     distance — never ATR. Callers (see main.py) are responsible for
     only reaching this stage once the gate has cleared and Execution
-    has produced a validated (status="planned") order."""
+    has produced a validated (status="planned") order.
+
+    Tier 2.10: current_drawdown_used/daily_loss_used accept the same
+    live-computed values evaluate_risk_gate() does — re-checked here
+    too (not just at the gate) since Execution's LLM call happens in
+    between the two stages, during which another trade could close and
+    change either figure. Mirrors the existing double-check pattern
+    remaining_room already used before this tier."""
     now_iso = _now_iso()
-    account_snapshot = _account_snapshot()
+    account_snapshot = _account_snapshot(
+        current_drawdown_used=current_drawdown_used, daily_loss_used=daily_loss_used
+    )
     remaining_room = account_snapshot["remaining_drawdown_room"]
 
     risk_per_unit = abs(entry_price - stop_loss)
@@ -232,6 +300,26 @@ def size_position(
             ),
             key_data=account_snapshot,
             flags=["invalid_stop_distance"],
+        )
+
+    remaining_daily_loss_room = account_snapshot["remaining_daily_loss_room"]
+    if remaining_daily_loss_room <= 0:
+        return RiskOpinion(
+            agent="risk",
+            timestamp=now_iso,
+            symbol=symbol,
+            timeframe=timeframe,
+            stage="size",
+            decision="reject",
+            original_size=BASE_POSITION_SIZE,
+            suggested_size=None,
+            reasoning=(
+                f"Today's realized loss (${account_snapshot['daily_loss_used']:.2f}) reached the "
+                f"${DAILY_LOSS_LIMIT:.2f} daily loss limit between the gate check and now — "
+                "no new trades until the next trading day."
+            ),
+            key_data=account_snapshot,
+            flags=["daily_loss_limit_reached"],
         )
 
     if remaining_room <= 0:

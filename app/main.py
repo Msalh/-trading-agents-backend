@@ -212,6 +212,25 @@ CME/Globex trading-day/timestamp consistency check):
      "analysis_news_conflict_urgent_dampened" flag, agreement+urgent
      reports the new "news_urgent_dampened".
 
+Tier 2.10 (account-level risk controls): CURRENT_DRAWDOWN_USED has
+always been a hand-updated env var that could silently drift from
+reality — the same problem Tier 2.3 already fixed for open-position
+count. New app/account_risk.py computes it live instead, as the
+standard peak-to-trough figure over the account-wide (all symbols)
+cumulative realized P&L from real closed paper trades.
+evaluate_risk_gate() and size_position() both gained a
+current_drawdown_used parameter following the exact same pattern
+current_open_positions already used (Tier 2.3): main.py passes the
+live-computed value, the env var is now only the fallback default.
+Also new: DAILY_LOSS_LIMIT, a faster, time-boxed circuit breaker
+distinct from the account-wide MAX_DRAWDOWN — no new trades for the
+rest of the trading day once today's realized losses (bucketed by the
+same CME/Globex trading-day convention Tier 2.9 established) cross
+this threshold, checked at both Risk stages via a new daily_loss_used
+parameter (rejects with flag "daily_loss_limit_reached"). New
+read-only endpoint GET /account/risk exposes both live figures without
+triggering a risk evaluation.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -226,6 +245,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from app.account_risk import compute_current_drawdown_used, compute_daily_loss_used
 from app.analysis_agent import AnalysisAgentError, run_analysis
 from app.candidates import (
     CandidateError,
@@ -248,7 +268,13 @@ from app.outcomes import (
 )
 from app.paper_trades import get_open_trade_count, open_trade_from_candidate, process_new_bar
 from app.replay import replay_candidate, replay_candidates_for_symbol, summarize_replay
-from app.risk_agent import evaluate_risk_gate, size_position
+from app.risk_agent import (
+    ACCOUNT_BALANCE,
+    DAILY_LOSS_LIMIT,
+    MAX_DRAWDOWN,
+    evaluate_risk_gate,
+    size_position,
+)
 from app.scheduler import (
     MACRO_SYMBOL,
     MACRO_TIMEFRAME,
@@ -258,6 +284,7 @@ from app.scheduler import (
     stop_scheduler,
 )
 from app.storage import (
+    get_all_closed_trades_chronological,
     get_candidate_by_id,
     get_last_opinion_timestamps,
     get_last_webhook_received,
@@ -939,6 +966,34 @@ def trade_by_id(trade_id: str) -> dict:
     return trade
 
 
+@app.get("/account/risk")
+def account_risk_status() -> dict:
+    """Tier 2.10: the account-wide risk snapshot — live-computed from
+    real closed paper trades (app/account_risk.py), the same figures
+    /agents/risk/evaluate uses internally to gate/size trades, exposed
+    here read-only so the dashboard (or anyone) can see current
+    drawdown/daily-loss status without triggering a risk evaluation.
+    Account-wide by design (not scoped to a symbol/timeframe) — the
+    account's risk budget is one account-wide number regardless of how
+    many symbols end up trading against it. No secret needed, same
+    pattern as /trades/* and /candidates/*."""
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    closed_trades = get_all_closed_trades_chronological()
+    current_drawdown_used = compute_current_drawdown_used(trades=closed_trades)
+    daily_loss_used = compute_daily_loss_used(now_iso, trades=closed_trades)
+    return {
+        "as_of": now_iso,
+        "account_balance": ACCOUNT_BALANCE,
+        "max_drawdown": MAX_DRAWDOWN,
+        "current_drawdown_used": current_drawdown_used,
+        "remaining_drawdown_room": round(MAX_DRAWDOWN - current_drawdown_used, 2),
+        "daily_loss_limit": DAILY_LOSS_LIMIT,
+        "daily_loss_used": daily_loss_used,
+        "remaining_daily_loss_room": round(DAILY_LOSS_LIMIT - daily_loss_used, 2),
+        "closed_trades_considered": len(closed_trades),
+    }
+
+
 @app.get("/coordinator/history")
 def coordinator_history(
     symbol: str = Query(...),
@@ -1016,6 +1071,15 @@ def risk_evaluate(
     except CandidateError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
+    # Tier 2.10: live account-level figures, computed fresh from real
+    # closed paper trades for every call — same "pass the live value
+    # in, env var is only the fallback" pattern Tier 2.3 already
+    # established for current_open_positions.
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    closed_trades = get_all_closed_trades_chronological()
+    current_drawdown_used = compute_current_drawdown_used(trades=closed_trades)
+    daily_loss_used = compute_daily_loss_used(now_iso, trades=closed_trades)
+
     execution = candidate["execution"]
     trade = None
     if execution is not None and execution.get("status") == "planned":
@@ -1024,6 +1088,8 @@ def risk_evaluate(
             timeframe=timeframe,
             entry_price=execution["entry_price"],
             stop_loss=execution["stop_loss"],
+            current_drawdown_used=current_drawdown_used,
+            daily_loss_used=daily_loss_used,
         )
         if risk_opinion.decision in ("approve", "modify"):
             candidate_for_trade = {**candidate, "risk": risk_opinion.to_dict()}
@@ -1035,6 +1101,8 @@ def risk_evaluate(
             timeframe=timeframe,
             coordinator_decision=candidate["decision"],
             current_open_positions=open_positions,
+            current_drawdown_used=current_drawdown_used,
+            daily_loss_used=daily_loss_used,
         )
 
     record_risk_result(candidate["candidate_id"], risk_opinion.to_dict())

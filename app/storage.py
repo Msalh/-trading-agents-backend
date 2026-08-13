@@ -621,6 +621,24 @@ def get_recent_trades(symbol: str, timeframe: str, limit: int = 20) -> list[dict
         conn.close()
 
 
+def get_all_closed_trades_chronological() -> list[dict]:
+    """ALL closed paper trades across every symbol/timeframe, oldest
+    first — Tier 2.10 (account-level risk controls) needs this for
+    account-wide drawdown/daily-loss math, which is deliberately not
+    scoped to one symbol the same way get_recent_trades() is: the
+    account's risk budget (ACCOUNT_BALANCE/MAX_DRAWDOWN) is a single
+    account-wide number regardless of how many symbols end up trading
+    against it."""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM paper_trades WHERE status = 'closed' ORDER BY closed_at ASC"
+        ).fetchall()
+        return [_row_to_trade(r) for r in rows]
+    finally:
+        conn.close()
+
+
 def update_trade_fill(trade_id: str, fill_price: float, opened_at: str) -> bool:
     """A pending_fill limit order's price has been reached — marks it
     open at the limit price (standard paper-trading assumption: filled

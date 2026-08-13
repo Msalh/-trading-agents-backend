@@ -122,21 +122,30 @@ Analysis won't auto-run even during nominal kill-zone clock hours) and
     stages depending on the candidate's state — call it twice across
     one candidate's lifecycle:
     1. **Gate** (no Execution attached yet, or Execution hasn't
-       produced a valid plan): checks position limits and drawdown
-       room only — no stop price needed. Returns `pending_execution`
-       (clear to let Execution run), `reject` (hard block:
-       `max_positions_reached` / `drawdown_exhausted`), or `no_action`
-       (Coordinator isn't directional).
+       produced a valid plan): checks position limits, the daily loss
+       limit, and drawdown room only — no stop price needed. Returns
+       `pending_execution` (clear to let Execution run), `reject`
+       (hard block: `max_positions_reached` / `daily_loss_limit_reached`
+       / `drawdown_exhausted`), or `no_action` (Coordinator isn't
+       directional).
     2. **Size** (Execution has attached a validated `status="planned"`
        order to this same candidate): sizes the position from
        Execution's actual `entry_price`/`stop_loss` —
        `risk_per_contract = |entry - stop| × $2/pt` — never from ATR.
-       Returns `approve` / `modify` / `reject`.
+       Re-checks the daily loss limit and drawdown room too (Execution's
+       LLM call happens in between the two stages, during which either
+       could change). Returns `approve` / `modify` / `reject`.
   - Response includes `stage: "gate" | "size"` alongside `decision` so
     callers can tell which pass produced the result.
   - Returns 404 if no trade candidate exists yet, or the latest one is
     older than `CANDIDATE_MAX_AGE_MINUTES` — call `/coordinator/decide`
     first.
+  - As of Tier 2.10, `key_data.current_drawdown_used` is the LIVE
+    peak-to-trough drawdown computed from real closed paper trades
+    (`app/account_risk.py`) — `CURRENT_DRAWDOWN_USED` is now a fallback
+    only, same relationship `CURRENT_OPEN_POSITIONS` already has to the
+    live open-position count. `key_data` also gains `daily_loss_limit` /
+    `daily_loss_used` / `remaining_daily_loss_room`.
 
 ### Execution (LLM, geometry only — no size)
 - `GET /agents/execution/plan?symbol=MNQ1!&timeframe=5m`
@@ -179,6 +188,36 @@ scale-out modeling yet.
 uses the LIVE count from this table (`get_open_trade_count`) by
 default, so `MAX_OPEN_POSITIONS` is enforced against reality instead
 of a hand-updated number.
+
+### Account Risk (Tier 2.10) — read-only, no secret needed
+
+### `GET /account/risk`
+The account-wide risk snapshot — the same live-computed figures
+`/agents/risk/evaluate` uses internally to gate/size trades, exposed
+here so the current drawdown/daily-loss status is visible without
+triggering a risk evaluation. Deliberately account-wide, not scoped to
+a symbol/timeframe — the account's risk budget is a single number
+regardless of how many symbols end up trading against it.
+```json
+{
+  "as_of": "2026-08-13T14:00:00Z",
+  "account_balance": 50000.0,
+  "max_drawdown": 2000.0,
+  "current_drawdown_used": 340.0,
+  "remaining_drawdown_room": 1660.0,
+  "daily_loss_limit": 1000.0,
+  "daily_loss_used": 120.0,
+  "remaining_daily_loss_room": 880.0,
+  "closed_trades_considered": 14
+}
+```
+`current_drawdown_used` is the standard peak-to-trough figure over the
+account-wide cumulative realized P&L curve from every closed paper
+trade (not just net losses — being $500 up from a $700 peak is $200 of
+drawdown, even though the account is still net positive overall).
+`daily_loss_used` sums realized P&L for trades closed on the current
+NY/CME trading day only (same session-rollover convention as
+`app/trading_calendar.py`, Tier 2.9), floored at zero on a winning day.
 
 ### Outcomes (Tier 2.4 rebuild) — read-only, no secret needed
 Prefers a real closed paper trade's actual P&L over the original
@@ -339,11 +378,12 @@ flipped?" before reading individual replayed candidates.
 | `COORDINATOR_THRESHOLD` | no | `25` | placeholder — needs tuning against real history |
 | `ACCOUNT_BALANCE` | no | `50000` | static/manual, Sprint 7 |
 | `MAX_DRAWDOWN` | no | `2000` | |
-| `CURRENT_DRAWDOWN_USED` | no | `0` | update by hand as the real account changes |
+| `CURRENT_DRAWDOWN_USED` | no | `0` | Tier 2.10: fallback only — normally superseded by the live peak-to-trough figure computed from real closed paper trades |
 | `MAX_OPEN_POSITIONS` | no | `1` | enforced against the live open-paper-trade count as of Tier 2.3 |
 | `CURRENT_OPEN_POSITIONS` | no | `0` | Tier 2.3: fallback only — normally superseded by the live paper-trade count |
 | `BASE_POSITION_SIZE` | no | `1` | contracts |
 | `RISK_FRACTION_PER_TRADE` | no | `0.5` | fraction of remaining drawdown room risked per trade |
+| `DAILY_LOSS_LIMIT` | no | `1000` | Tier 2.10: new time-boxed circuit breaker, live-computed from trades closed on the current NY/CME trading day — no manual updating needed |
 
 ---
 

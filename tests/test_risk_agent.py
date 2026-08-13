@@ -27,6 +27,7 @@ def risk_module(monkeypatch):
             "CURRENT_OPEN_POSITIONS": "0",
             "BASE_POSITION_SIZE": "1",
             "RISK_FRACTION_PER_TRADE": "0.5",
+            "DAILY_LOSS_LIMIT": "1000",
         }
         defaults.update(env_overrides)
         for k, v in defaults.items():
@@ -106,6 +107,91 @@ def test_gate_falls_back_to_env_var_when_not_passed(risk_module):
     ra = risk_module(MAX_OPEN_POSITIONS="1", CURRENT_OPEN_POSITIONS="1")
     result = ra.evaluate_risk_gate("TEST", "5m", {"decision": "enter_long"})
     assert result.decision == "reject"
+
+
+# ---------------------------------------------------------------------------
+# Tier 2.10: account-level risk controls — live drawdown + daily loss limit
+# ---------------------------------------------------------------------------
+
+def test_gate_uses_explicit_drawdown_over_env_var(risk_module):
+    """Same pattern as current_open_positions: the caller's live-
+    computed value must win over the static CURRENT_DRAWDOWN_USED env
+    var, in both directions (env says exhausted, live says fine; and
+    the reverse, tested below)."""
+    ra = risk_module(CURRENT_DRAWDOWN_USED="2000")  # env says fully exhausted
+    result = ra.evaluate_risk_gate(
+        "TEST", "5m", {"decision": "enter_long"}, current_drawdown_used=0.0
+    )
+    assert result.decision == "pending_execution"
+    assert result.key_data["current_drawdown_used"] == 0.0
+
+
+def test_gate_explicit_drawdown_can_also_reject_when_env_says_fine(risk_module):
+    ra = risk_module(CURRENT_DRAWDOWN_USED="0")  # env says no drawdown at all
+    result = ra.evaluate_risk_gate(
+        "TEST", "5m", {"decision": "enter_long"}, current_drawdown_used=2000.0
+    )
+    assert result.decision == "reject"
+    assert "drawdown_exhausted" in result.flags
+
+
+def test_gate_rejects_when_daily_loss_limit_reached(risk_module):
+    ra = risk_module(DAILY_LOSS_LIMIT="500")
+    result = ra.evaluate_risk_gate(
+        "TEST", "5m", {"decision": "enter_long"}, daily_loss_used=500.0
+    )
+    assert result.decision == "reject"
+    assert "daily_loss_limit_reached" in result.flags
+
+
+def test_gate_daily_loss_limit_checked_before_overall_drawdown(risk_module):
+    """When both the daily loss limit AND overall drawdown are
+    exhausted simultaneously, the faster/more specific circuit breaker
+    (daily loss) is the one reported."""
+    ra = risk_module(MAX_DRAWDOWN="2000", DAILY_LOSS_LIMIT="1000")
+    result = ra.evaluate_risk_gate(
+        "TEST", "5m", {"decision": "enter_long"},
+        current_drawdown_used=2000.0,
+        daily_loss_used=1000.0,
+    )
+    assert "daily_loss_limit_reached" in result.flags
+    assert "drawdown_exhausted" not in result.flags
+
+
+def test_gate_defaults_daily_loss_used_to_zero_when_not_passed(risk_module):
+    """No prior env var for this (it's a new control) -- omitting the
+    parameter entirely must not reject, ever."""
+    ra = risk_module(DAILY_LOSS_LIMIT="500")
+    result = ra.evaluate_risk_gate("TEST", "5m", {"decision": "enter_long"})
+    assert result.decision == "pending_execution"
+    assert result.key_data["daily_loss_used"] == 0.0
+
+
+def test_size_rejects_when_daily_loss_limit_reached(risk_module):
+    ra = risk_module(DAILY_LOSS_LIMIT="500")
+    result = ra.size_position(
+        "TEST", "5m", entry_price=20000.0, stop_loss=19975.0, daily_loss_used=500.0
+    )
+    assert result.decision == "reject"
+    assert "daily_loss_limit_reached" in result.flags
+
+
+def test_size_uses_explicit_drawdown_over_env_var(risk_module):
+    ra = risk_module(CURRENT_DRAWDOWN_USED="2000")  # env says exhausted
+    result = ra.size_position(
+        "TEST", "5m", entry_price=20000.0, stop_loss=19975.0, current_drawdown_used=0.0
+    )
+    assert result.decision == "approve"
+
+
+def test_account_snapshot_reports_remaining_daily_loss_room(risk_module):
+    ra = risk_module(DAILY_LOSS_LIMIT="1000")
+    result = ra.evaluate_risk_gate(
+        "TEST", "5m", {"decision": "enter_long"}, daily_loss_used=300.0
+    )
+    assert result.key_data["daily_loss_limit"] == 1000.0
+    assert result.key_data["daily_loss_used"] == 300.0
+    assert result.key_data["remaining_daily_loss_room"] == 700.0
 
 
 # ---------------------------------------------------------------------------
