@@ -244,3 +244,98 @@ def test_opinions_used_captures_exact_snapshot(fresh_storage):
     assert "analysis" in decision.opinions_used
     assert "news" in decision.opinions_used
     assert decision.opinions_used["analysis"]["confidence"] == 80
+
+
+# --- Tier 2.5 (replay/versioning: config_version + _score_opinions) ------
+
+
+def test_config_version_records_live_config(fresh_storage):
+    """Every decision now records exactly which weights/threshold/
+    min_available_weight it was scored under — not whatever the env
+    vars happen to be whenever this is read back later."""
+    storage, coordinator = fresh_storage
+    storage.save_opinion("analysis", "TEST", "5m", "t1", _opinion("bullish", 80))
+    decision = coordinator.compute_decision(symbol="TEST", timeframe="5m")
+
+    assert decision.config_version["weights"] == coordinator.WEIGHTS
+    assert decision.config_version["threshold"] == coordinator.DECISION_THRESHOLD
+    assert decision.config_version["min_available_weight"] == coordinator.MIN_AVAILABLE_WEIGHT
+
+
+def test_config_version_present_even_on_insufficient_data(fresh_storage):
+    storage, coordinator = fresh_storage
+    decision = coordinator.compute_decision(symbol="TEST", timeframe="5m")
+    assert decision.decision == "insufficient_data"
+    assert decision.config_version["threshold"] == coordinator.DECISION_THRESHOLD
+
+
+def test_score_opinions_matches_compute_decision_under_live_config(fresh_storage):
+    """compute_decision() is now just _gather_opinions() +
+    _score_opinions(live config) — calling _score_opinions() directly
+    with the same gathered snapshot and the same live config must
+    produce an identical result."""
+    storage, coordinator = fresh_storage
+    storage.save_opinion("analysis", "TEST", "5m", "t1", _opinion("bullish", 80))
+    storage.save_opinion("news", "TEST", "global", "t1", _opinion("bullish", 60))
+
+    opinions, missing, stale = coordinator._gather_opinions(symbol="TEST", timeframe="5m")
+    direct = coordinator._score_opinions(
+        symbol="TEST", timeframe="5m",
+        opinions=opinions, missing_agents=missing, stale_agents=stale,
+        weights=coordinator.WEIGHTS,
+        threshold=coordinator.DECISION_THRESHOLD,
+        min_available_weight=coordinator.MIN_AVAILABLE_WEIGHT,
+    )
+    via_compute = coordinator.compute_decision(symbol="TEST", timeframe="5m")
+
+    assert direct.decision == via_compute.decision
+    assert direct.score == pytest.approx(via_compute.score, abs=0.01)
+
+
+def test_score_opinions_hypothetical_weights_override_live_config(fresh_storage):
+    """The whole point of the extraction: replay a frozen opinions
+    snapshot under a DIFFERENT hypothetical config without touching
+    any env var or the live WEIGHTS dict."""
+    storage, coordinator = fresh_storage
+    storage.save_opinion("analysis", "TEST", "5m", "t1", _opinion("bullish", 50))
+    opinions, missing, stale = coordinator._gather_opinions(symbol="TEST", timeframe="5m")
+
+    # Live config: analysis alone (40%) is below the 60% minimum -> insufficient_data
+    live = coordinator._score_opinions(
+        symbol="TEST", timeframe="5m",
+        opinions=opinions, missing_agents=missing, stale_agents=stale,
+        weights=coordinator.WEIGHTS, threshold=coordinator.DECISION_THRESHOLD,
+        min_available_weight=coordinator.MIN_AVAILABLE_WEIGHT,
+    )
+    assert live.decision == "insufficient_data"
+
+    # Hypothetical: give analysis 100% weight and lower the minimum -> now enough
+    hypothetical_weights = {"analysis": 1.0}
+    replayed = coordinator._score_opinions(
+        symbol="TEST", timeframe="5m",
+        opinions=opinions, missing_agents=missing, stale_agents=stale,
+        weights=hypothetical_weights, threshold=25.0, min_available_weight=0.5,
+    )
+    assert replayed.decision == "enter_long"
+    assert replayed.config_version["weights"] == hypothetical_weights
+    # live WEIGHTS untouched by the hypothetical call
+    assert coordinator.WEIGHTS == {"analysis": 0.40, "news": 0.25, "timing": 0.20, "macro": 0.15}
+
+
+def test_score_opinions_tolerates_weights_missing_an_agent(fresh_storage):
+    """weights.get(agent, 0), not weights[agent] — a hypothetical
+    weights dict that omits an agent (e.g. asking 'what if timing had
+    zero weight') must not KeyError, it should just contribute 0."""
+    storage, coordinator = fresh_storage
+    storage.save_opinion("analysis", "TEST", "5m", "t1", _opinion("bullish", 80))
+    storage.save_opinion("news", "TEST", "global", "t1", _opinion("bullish", 60))
+    opinions, missing, stale = coordinator._gather_opinions(symbol="TEST", timeframe="5m")
+
+    partial_weights = {"analysis": 0.5}  # news deliberately omitted
+    decision = coordinator._score_opinions(
+        symbol="TEST", timeframe="5m",
+        opinions=opinions, missing_agents=missing, stale_agents=stale,
+        weights=partial_weights, threshold=10.0, min_available_weight=0.1,
+    )
+    assert decision.contributions["news"]["weight"] == 0
+    assert decision.contributions["news"]["contribution"] == 0

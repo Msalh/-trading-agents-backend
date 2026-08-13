@@ -208,6 +208,68 @@ Most recent N persisted decisions, newest first.
 
 ---
 
+## Replay / versioning (Tier 2.5) — read-only, no secret needed
+
+`COORDINATOR_THRESHOLD`, the four agent weights, and
+`MIN_AVAILABLE_WEIGHT` have all changed via env vars over the
+project's life; every `CoordinatorDecision` now carries a
+`config_version` field (`{"weights": {...}, "threshold": ...,
+"min_available_weight": ...}`) recording exactly which config
+produced it. Replay re-scores a trade candidate's already-frozen
+`opinions_used`/`missing_agents`/`stale_agents` (Tier 2.1) against
+either the current live config or an explicit hypothetical override —
+entirely offline, no new market data, no LLM calls, and it never
+mutates the original candidate or opens a trade.
+
+`weights` (when provided) must be a JSON object string, e.g.
+`{"analysis":0.5,"news":0.2,"timing":0.2,"macro":0.1}` — an agent
+omitted from it is scored as weight 0, a valid way to ask "what if
+this agent didn't count at all." `threshold` / `min_available_weight`
+are plain numbers. Any of the three left out falls back to the
+CURRENT live value (not the candidate's original config) — asking
+"what would this decide under today's threshold but the original
+weights" is a valid, distinct question from either extreme.
+
+### `GET /candidates/{candidate_id}/replay?weights=...&threshold=...&min_available_weight=...&include_outcome=false&horizons=15,30,60`
+Single-candidate replay. Returns:
+```json
+{
+  "candidate_id": "...",
+  "symbol": "MNQ1!", "timeframe": "5m",
+  "original_decision_timestamp": "...",
+  "original": {"decision": "...", "direction": "...", "score": ..., "threshold": ..., "config_version": {...} },
+  "replayed": { "...": "full CoordinatorDecision.to_dict(), including its own config_version" },
+  "changed": true,
+  "replayed_hypothetical_outcome": { "15": {...}, "30": {...} }
+}
+```
+`original.config_version` is `null` for a candidate created before
+this tier ever recorded one — never an empty object pretending to be
+a real (if empty) config. `replayed_hypothetical_outcome` is only
+present when `include_outcome=true` AND the replayed decision is
+directional (nothing to evaluate for `no_trade`/`insufficient_data`)
+— it's the Sprint 14 horizon price-direction estimate, never a real
+trade; replay never opens one. 404 if `candidate_id` doesn't exist.
+
+### `GET /candidates/history/replay?symbol=MNQ1!&timeframe=5m&limit=50&only_changed=false&weights=...&threshold=...&min_available_weight=...`
+Bulk version over recent candidate history (same ordering as
+`/candidates/history`, newest first) — a list of the objects above.
+`only_changed=true` filters to candidates whose replayed decision
+differs from what actually happened, the ones worth reading when
+tuning a config change.
+
+### `GET /candidates/history/replay/summary?symbol=MNQ1!&timeframe=5m&limit=100&weights=...&threshold=...&min_available_weight=...`
+Aggregated transition counts:
+```json
+{"total_candidates": 100, "changed": 7, "unchanged": 93,
+ "transitions": {"insufficient_data -> enter_long": 5, "no_trade -> enter_short": 2}}
+```
+The at-a-glance answer to "if `COORDINATOR_THRESHOLD` had been 35
+this whole time, how many of the last 100 decisions would have
+flipped?" before reading individual replayed candidates.
+
+---
+
 ## Environment variables
 
 | Variable | Required | Default | Notes |

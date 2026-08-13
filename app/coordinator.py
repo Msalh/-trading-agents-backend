@@ -111,6 +111,12 @@ class CoordinatorDecision:
     conflict_flags: list[str]
     summary: str
     opinions_used: dict = field(default_factory=dict)
+    # Tier 2.5 (versioning): the exact weights/threshold/min_available_weight
+    # this decision was scored under — resolved ONCE at scoring time, not
+    # whatever the env vars happen to be whenever this is read back later.
+    # Without this, a replay has no reliable way to know what config
+    # actually produced a historical decision.
+    config_version: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -127,6 +133,7 @@ class CoordinatorDecision:
             "conflict_flags": self.conflict_flags,
             "summary": self.summary,
             "opinions_used": self.opinions_used,
+            "config_version": self.config_version,
         }
 
 
@@ -191,19 +198,45 @@ def _gather_opinions(symbol: str, timeframe: str) -> tuple[dict, list[str], list
     return opinions, missing_agents, stale_agents
 
 
-def compute_decision(symbol: str, timeframe: str) -> CoordinatorDecision:
-    opinions, missing_agents, stale_agents = _gather_opinions(symbol=symbol, timeframe=timeframe)
+def _score_opinions(
+    symbol: str,
+    timeframe: str,
+    opinions: dict,
+    missing_agents: list[str],
+    stale_agents: list[str],
+    weights: dict,
+    threshold: float,
+    min_available_weight: float,
+) -> CoordinatorDecision:
+    """The actual scoring math — pulled out of compute_decision so it
+    can run against ANY opinions/missing/stale snapshot under ANY
+    weights/threshold/min_available_weight, not just the live env-var
+    config against a fresh DB read. This is what makes replay
+    (app/replay.py, Tier 2.5) possible: a trade candidate already
+    freezes opinions_used/missing_agents/stale_agents (Tier 2.1), so
+    re-running this function against that frozen snapshot with a
+    hypothetical config recomputes exactly what the Coordinator would
+    have decided — entirely offline, no new data, no LLM calls.
 
-    available_weight = sum(WEIGHTS[a] for a in opinions)
+    weights.get(agent, 0) (not weights[agent]) deliberately tolerates
+    a replay's hypothetical weights dict omitting an agent — that's a
+    valid way to ask "what if this agent's weight were 0", not a bug
+    to guard against."""
+    available_weight = sum(weights.get(a, 0) for a in opinions)
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    config_version = {
+        "weights": dict(weights),
+        "threshold": threshold,
+        "min_available_weight": min_available_weight,
+    }
 
-    if available_weight < MIN_AVAILABLE_WEIGHT:
+    if available_weight < min_available_weight:
         reason = (
             "No agent opinions available yet — nothing to aggregate."
             if available_weight == 0
             else (
                 f"Only {available_weight:.0%} of total agent weight is currently available "
-                f"(minimum {MIN_AVAILABLE_WEIGHT:.0%} required) — not enough combined evidence "
+                f"(minimum {min_available_weight:.0%} required) — not enough combined evidence "
                 f"to trade on, regardless of how confident the available agents are."
             )
         )
@@ -212,7 +245,7 @@ def compute_decision(symbol: str, timeframe: str) -> CoordinatorDecision:
             timeframe=timeframe,
             timestamp=now_iso,
             score=0.0,
-            threshold=DECISION_THRESHOLD,
+            threshold=threshold,
             decision="insufficient_data",
             direction="neutral",
             contributions={},
@@ -221,6 +254,7 @@ def compute_decision(symbol: str, timeframe: str) -> CoordinatorDecision:
             conflict_flags=[],
             summary=reason,
             opinions_used=opinions,
+            config_version=config_version,
         )
 
     contributions = {}
@@ -228,7 +262,7 @@ def compute_decision(symbol: str, timeframe: str) -> CoordinatorDecision:
     for agent, opinion in opinions.items():
         direction_value = _DIRECTION_VALUE.get(opinion.get("direction", "neutral"), 0)
         confidence = opinion.get("confidence", 0)
-        weight = WEIGHTS[agent]
+        weight = weights.get(agent, 0)
         contribution = direction_value * confidence * weight
         weighted_sum += contribution
         contributions[agent] = {
@@ -259,17 +293,17 @@ def compute_decision(symbol: str, timeframe: str) -> CoordinatorDecision:
         elif opposing:
             conflict_flags.append("analysis_news_conflict")
 
-    if score > DECISION_THRESHOLD:
+    if score > threshold:
         decision = "enter_long"
         direction = "bullish"
-    elif score < -DECISION_THRESHOLD:
+    elif score < -threshold:
         decision = "enter_short"
         direction = "bearish"
     else:
         decision = "no_trade"
         direction = "neutral"
 
-    summary_bits = [f"score={score:.1f} (threshold={DECISION_THRESHOLD})"]
+    summary_bits = [f"score={score:.1f} (threshold={threshold})"]
     if missing_agents:
         summary_bits.append(f"missing: {', '.join(missing_agents)}")
     if stale_agents:
@@ -283,7 +317,7 @@ def compute_decision(symbol: str, timeframe: str) -> CoordinatorDecision:
         timeframe=timeframe,
         timestamp=now_iso,
         score=score,
-        threshold=DECISION_THRESHOLD,
+        threshold=threshold,
         decision=decision,
         direction=direction,
         contributions=contributions,
@@ -292,4 +326,19 @@ def compute_decision(symbol: str, timeframe: str) -> CoordinatorDecision:
         conflict_flags=conflict_flags,
         summary=summary,
         opinions_used=opinions,
+        config_version=config_version,
+    )
+
+
+def compute_decision(symbol: str, timeframe: str) -> CoordinatorDecision:
+    opinions, missing_agents, stale_agents = _gather_opinions(symbol=symbol, timeframe=timeframe)
+    return _score_opinions(
+        symbol=symbol,
+        timeframe=timeframe,
+        opinions=opinions,
+        missing_agents=missing_agents,
+        stale_agents=stale_agents,
+        weights=WEIGHTS,
+        threshold=DECISION_THRESHOLD,
+        min_available_weight=MIN_AVAILABLE_WEIGHT,
     )

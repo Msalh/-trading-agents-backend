@@ -137,10 +137,30 @@ tallying of decision history for COORDINATOR_THRESHOLD tuning). The
 older /coordinator/history/outcomes is unchanged — it reads a table
 with no candidate_id, so it can never link to a real trade either way.
 
+Tier 2.5 (replay/versioning): COORDINATOR_THRESHOLD, the four agent
+WEIGHTS, and MIN_AVAILABLE_WEIGHT have all changed via env vars over
+this project's lifetime, and nothing recorded which config produced
+a given historical decision. coordinator.py now exposes the scoring
+math as a standalone _score_opinions() function (pulled out of
+compute_decision(), which now just calls it with the live env-var
+config), and every CoordinatorDecision carries a new config_version
+field recording exactly which weights/threshold/min_available_weight
+it was scored under. app/replay.py uses this to re-score a trade
+candidate's already-frozen opinions_used (Tier 2.1) under either the
+current live config or an explicit hypothetical override — entirely
+offline, no new data, no LLM calls, never mutating the original
+candidate. New endpoints: GET /candidates/{candidate_id}/replay
+(single candidate), GET /candidates/history/replay (bulk, with
+only_changed filtering), and GET /candidates/history/replay/summary
+(aggregated decision-transition counts) — built for config-tuning
+questions like "if the threshold had been 35 this whole time, how
+many of the last 100 decisions would have flipped?".
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
 
+import json
 import logging
 import os
 from datetime import datetime, timezone
@@ -171,6 +191,7 @@ from app.outcomes import (
     summarize_outcomes,
 )
 from app.paper_trades import get_open_trade_count, open_trade_from_candidate, process_new_bar
+from app.replay import replay_candidate, replay_candidates_for_symbol, summarize_replay
 from app.risk_agent import evaluate_risk_gate, size_position
 from app.scheduler import (
     MACRO_SYMBOL,
@@ -700,12 +721,125 @@ def candidates_history_outcomes_summary(
     return summarize_outcomes(outcomes)
 
 
+def _parse_replay_horizons(horizons: str) -> list[int]:
+    try:
+        return [int(h.strip()) for h in horizons.split(",") if h.strip()]
+    except ValueError:
+        raise HTTPException(status_code=400, detail="horizons must be comma-separated integers")
+
+
+def _parse_replay_weights(weights: str | None) -> dict | None:
+    """None means "use the live WEIGHTS config" — distinct from an
+    empty dict, which would be a real (if unusual) request to zero
+    out every agent's weight."""
+    if weights is None:
+        return None
+    try:
+        parsed = json.loads(weights)
+    except json.JSONDecodeError:
+        raise HTTPException(
+            status_code=400,
+            detail='weights must be a JSON object string, e.g. {"analysis":0.4,"news":0.25,"timing":0.2,"macro":0.15}',
+        )
+    if not isinstance(parsed, dict):
+        raise HTTPException(status_code=400, detail="weights must be a JSON object")
+    return parsed
+
+
+# NOTE: both of these must be registered BEFORE /candidates/{candidate_id}
+# (and before /candidates/{candidate_id}/replay below) — FastAPI matches
+# routes in registration order, and /candidates/{candidate_id}/replay
+# would otherwise swallow "/candidates/history/replay" by treating
+# "history" as the candidate_id path param (hit this during Tier 2.5
+# smoke testing; same class of ordering issue /candidates/history/outcomes
+# above already had to avoid relative to /candidates/{candidate_id}).
+@app.get("/candidates/history/replay")
+def candidates_history_replay(
+    symbol: str = Query(...),
+    timeframe: str = Query(...),
+    limit: int = Query(default=50, le=500),
+    weights: str = Query(default=None),
+    threshold: float = Query(default=None),
+    min_available_weight: float = Query(default=None),
+    only_changed: bool = Query(default=False, description="only return candidates whose replayed decision differs from what actually happened"),
+    include_outcome: bool = Query(default=False),
+    horizons: str = Query(default="15,30,60"),
+) -> list[dict]:
+    """Bulk version of the single-candidate replay below, over recent
+    candidate history — the tool for config-tuning questions like "if
+    COORDINATOR_THRESHOLD had been 35 this whole time, how many of the
+    last 100 decisions would have flipped?"."""
+    return replay_candidates_for_symbol(
+        symbol=symbol,
+        timeframe=timeframe,
+        weights=_parse_replay_weights(weights),
+        threshold=threshold,
+        min_available_weight=min_available_weight,
+        limit=limit,
+        only_changed=only_changed,
+        include_outcome=include_outcome,
+        outcome_horizons=_parse_replay_horizons(horizons) if include_outcome else None,
+    )
+
+
+@app.get("/candidates/history/replay/summary")
+def candidates_history_replay_summary(
+    symbol: str = Query(...),
+    timeframe: str = Query(...),
+    limit: int = Query(default=100, le=500),
+    weights: str = Query(default=None),
+    threshold: float = Query(default=None),
+    min_available_weight: float = Query(default=None),
+) -> dict:
+    """Aggregated transition counts (changed/unchanged, and
+    original-decision -> replayed-decision breakdown) — the at-a-
+    glance answer before reading individual replayed candidates."""
+    results = replay_candidates_for_symbol(
+        symbol=symbol,
+        timeframe=timeframe,
+        weights=_parse_replay_weights(weights),
+        threshold=threshold,
+        min_available_weight=min_available_weight,
+        limit=limit,
+    )
+    return summarize_replay(results)
+
+
 @app.get("/candidates/{candidate_id}")
 def candidate_by_id(candidate_id: str) -> dict:
     candidate = get_candidate_by_id(candidate_id)
     if candidate is None:
         raise HTTPException(status_code=404, detail=f"no candidate found with id={candidate_id}")
     return candidate
+
+
+@app.get("/candidates/{candidate_id}/replay")
+def candidate_replay(
+    candidate_id: str,
+    weights: str = Query(default=None, description='JSON object, e.g. {"analysis":0.4,"news":0.25,"timing":0.2,"macro":0.15} — omit to use the current live weights'),
+    threshold: float = Query(default=None, description="omit to use the current live COORDINATOR_THRESHOLD"),
+    min_available_weight: float = Query(default=None, description="omit to use the current live MIN_AVAILABLE_WEIGHT"),
+    include_outcome: bool = Query(default=False, description="also compute the hypothetical horizon outcome for the replayed decision"),
+    horizons: str = Query(default="15,30,60"),
+) -> dict:
+    """Tier 2.5: re-scores ONE candidate's frozen opinions_used under a
+    config — the live config by default, or an explicit hypothetical
+    override for weights/threshold/min_available_weight. Never mutates
+    the original candidate or opens a trade; purely a read-only
+    recompute for answering "what would the Coordinator have decided
+    here under a different config?"."""
+    candidate = get_candidate_by_id(candidate_id)
+    if candidate is None:
+        raise HTTPException(status_code=404, detail=f"no candidate found with id={candidate_id}")
+
+    return replay_candidate(
+        candidate,
+        weights=_parse_replay_weights(weights),
+        threshold=threshold,
+        min_available_weight=min_available_weight,
+        include_outcome=include_outcome,
+        outcome_horizons=_parse_replay_horizons(horizons) if include_outcome else None,
+    )
 
 
 @app.get("/trades/open")
