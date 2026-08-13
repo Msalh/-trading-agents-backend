@@ -364,6 +364,33 @@ new data, no trade side effects — computed from the same 79 (at last
 check) historical candidates already sitting in production, no new
 data collection required.
 
+Tier 3.6 (deduplicated per-agent accuracy): running Tier 3.5 against
+production surfaced results strange enough to chase down before
+trusting them — most notably Macro reading exactly 0/34 correct at the
+30-minute horizon. Reviewed the scoring code end to end looking for a
+sign/logic bug (_score_opinions, get_bar_at_or_before/after, each
+agent's own "bullish means price rises" convention) and found none —
+the real issue is a measurement one. News/Macro run on a schedule
+independent of individual market bars and stay eligible for reuse
+across every webhook bar for up to NEWS_MACRO_MAX_AGE_MINUTES (default
+90) — confirmed directly against production data that a single News or
+Macro opinion legitimately backs 4+ consecutive candidates. Tier 3.5's
+by-agent endpoint tallied one data point per CANDIDATE, so a single
+LLM call getting reused a dozen times looked like a dozen independent
+data points — inflating the apparent sample size and letting one
+unlucky (or lucky) call swing the whole aggregate.
+compute_per_agent_accuracy() now returns two sibling views:
+"by_candidate" (the original Tier 3.5 tally, unchanged in method) and
+"by_distinct_opinion" (each unique (symbol, timeframe,
+opinion_timestamp, direction) tuple scored exactly once, regardless of
+reuse), plus "distinct_opinion_counts" so a caller can see directly
+how much duplication a given "by_candidate" figure was resting on.
+This is an additive change to a same-session, not-yet-externally-
+depended-on endpoint (Tier 3.5 shipped and was queried against
+production in this same investigation, nothing else consumes it yet),
+so the response shape changed in place rather than versioning a new
+endpoint.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -996,7 +1023,18 @@ def candidates_history_outcomes_by_agent(
     any individual agent actually beating chance on its own, or is
     there no signal anywhere to weight toward? Entirely offline, same
     hypothetical horizon estimate the rest of this file already uses —
-    not a real backtest."""
+    not a real backtest.
+
+    Tier 3.6: News/Macro opinions are reused across every candidate
+    that falls within their freshness window (NEWS_MACRO_MAX_AGE_MINUTES),
+    so scoring "one tally per candidate" can badly inflate the apparent
+    sample size behind an accuracy figure. Response now has two
+    sibling sections instead of one flat {agent: {...}} object:
+    "by_candidate" (the original Tier 3.5 view) and
+    "by_distinct_opinion" (each unique agent opinion scored exactly
+    once, regardless of reuse) — plus "distinct_opinion_counts" so a
+    caller can see how much duplication a "by_candidate" number rests
+    on. See app/outcomes.compute_per_agent_accuracy()'s docstring."""
     try:
         horizon_list = [int(h.strip()) for h in horizons.split(",") if h.strip()]
     except ValueError:

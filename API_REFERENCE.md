@@ -306,35 +306,62 @@ only a fallback for candidates that never became a trade at all
   its shape; new analysis should use `/candidates/history/outcomes`.
 
 ### `GET /candidates/history/outcomes/by-agent?symbol=MNQ1!&timeframe=5m&limit=100&horizons=15,30,60`
-Tier 3.5 (per-agent signal quality). A `COORDINATOR_THRESHOLD` sweep
-(`/candidates/history/replay/threshold-sweep` above) can only ever
-speak to the Coordinator's *blended* decision — it can't tell "one
-agent has real signal but is outweighed by noisier ones" apart from
-"no individual agent beats chance either." This endpoint answers that
-directly: for every recent candidate, scores each individual
-Analysis/News/Macro directional opinion (Timing excluded — always
-`"neutral"` by design, never a directional call to score) against the
-same hypothetical horizon price-direction estimate the rest of this
-section already uses, entirely independent of what the blended
-decision ended up being — a bullish Analysis opinion is scored here
-even if the Coordinator's overall decision was `no_trade`. Anchored to
-each agent's own opinion timestamp when present, falling back to the
-candidate's decision timestamp for older data recorded before
-per-opinion timestamps existed.
+Tier 3.5 (per-agent signal quality), extended in Tier 3.6 (see below).
+A `COORDINATOR_THRESHOLD` sweep (`/candidates/history/replay/threshold-sweep`
+above) can only ever speak to the Coordinator's *blended* decision — it
+can't tell "one agent has real signal but is outweighed by noisier
+ones" apart from "no individual agent beats chance either." This
+endpoint answers that directly: for every recent candidate, scores
+each individual Analysis/News/Macro directional opinion (Timing
+excluded — always `"neutral"` by design, never a directional call to
+score) against the same hypothetical horizon price-direction estimate
+the rest of this section already uses, entirely independent of what
+the blended decision ended up being — a bullish Analysis opinion is
+scored here even if the Coordinator's overall decision was `no_trade`.
+Anchored to each agent's own opinion timestamp when present, falling
+back to the candidate's decision timestamp for older data recorded
+before per-opinion timestamps existed.
 ```json
 {
-  "analysis": {"15": {"correct": 18, "incorrect": 22, "flat": 0, "pending": 0, "no_data": 0, "accuracy": 0.45}},
-  "news":     {"15": {"correct": 14, "incorrect": 26, "flat": 0, "pending": 0, "no_data": 0, "accuracy": 0.35}},
-  "macro":    {"15": {"correct": 20, "incorrect": 20, "flat": 0, "pending": 0, "no_data": 0, "accuracy": 0.5}}
+  "by_candidate": {
+    "analysis": {"15": {"correct": 16, "incorrect": 45, "flat": 0, "pending": 0, "no_data": 0, "accuracy": 0.262}},
+    "news":     {"15": {"correct": 11, "incorrect": 35, "flat": 0, "pending": 0, "no_data": 0, "accuracy": 0.239}},
+    "macro":    {"15": {"correct": 5,  "incorrect": 29, "flat": 0, "pending": 0, "no_data": 0, "accuracy": 0.147}}
+  },
+  "by_distinct_opinion": {
+    "analysis": {"15": {"correct": 12, "incorrect": 31, "flat": 0, "pending": 0, "no_data": 0, "accuracy": 0.279}},
+    "news":     {"15": {"correct": 4,  "incorrect": 9,  "flat": 0, "pending": 0, "no_data": 0, "accuracy": 0.308}},
+    "macro":    {"15": {"correct": 2,  "incorrect": 7,  "flat": 0, "pending": 0, "no_data": 0, "accuracy": 0.222}}
+  },
+  "distinct_opinion_counts": {"analysis": 43, "news": 13, "macro": 9}
 }
 ```
-All three agent keys are always present, even if a given agent never
-issued a directional (non-neutral) opinion in the fetched window — its
-counts are all zero and `accuracy` is `null` rather than the key being
-absent. Entirely offline, no LLM calls, no trade side effects; same
-caveat as every hypothetical estimate in this project: this is a
-price-direction proxy at a fixed time horizon, not a real backtest.
-400 if `horizons` doesn't parse as comma-separated integers.
+Both agent-keyed sections always carry all three agent keys, even if a
+given agent never issued a directional (non-neutral) opinion in the
+fetched window — its counts are all zero and `accuracy` is `null`
+rather than the key being absent. Entirely offline, no LLM calls, no
+trade side effects; same caveat as every hypothetical estimate in this
+project: this is a price-direction proxy at a fixed time horizon, not
+a real backtest. 400 if `horizons` doesn't parse as comma-separated
+integers.
+
+**Tier 3.6 — why two sections.** News and Macro run on their own
+schedule (`NEWS_INTERVAL_MINUTES`/`MACRO_INTERVAL_MINUTES`) and stay
+eligible for reuse across every webhook bar until
+`NEWS_MACRO_MAX_AGE_MINUTES` (default 90) — one LLM call can
+legitimately be the frozen `opinions_used` entry for a dozen-plus
+consecutive candidates. `by_candidate` tallies one data point per
+candidate (matches what the Coordinator literally saw at each
+decision), so a single unlucky or lucky call can dominate that
+aggregate and make the sample size look far larger than the number of
+independent calls actually made. `by_distinct_opinion` scores each
+unique `(symbol, timeframe, opinion_timestamp, direction)` tuple
+exactly once regardless of reuse — the more honest read on whether an
+agent shows real signal. `distinct_opinion_counts` reports how many
+truly independent calls back each agent's numbers, so a caller can see
+directly how much duplication a `by_candidate` figure was resting on
+(Analysis, which only stays fresh for `ANALYSIS_MAX_AGE_MINUTES`,
+default 15, is reused far less than News/Macro in practice).
 
 ---
 

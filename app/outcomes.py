@@ -36,6 +36,30 @@ threshold value getting hypothetical accuracy anywhere near 50%
 (coin-flip) — this exists to help tell whether that's a WEIGHTING
 problem (one agent has real signal, drowned out by noisier ones) or
 whether no individual agent beats chance either.
+
+Tier 3.6 (deduplicated per-agent accuracy): running Tier 3.5 against
+production surfaced a below-50% pattern strange enough to warrant
+follow-up (e.g. macro reading 0/34 correct at the 30-minute horizon) —
+investigating it surfaced a real measurement problem, not a sign/logic
+bug (reviewed _score_opinions, get_bar_at_or_before/after, and every
+agent's own "bullish means price rises" convention; all consistent).
+News/Macro run on a schedule independent of individual market bars
+(NEWS_INTERVAL_MINUTES/MACRO_INTERVAL_MINUTES, default 60) and stay
+eligible for reuse across every webhook bar until
+NEWS_MACRO_MAX_AGE_MINUTES (default 90) — a single LLM call can
+legitimately be "the" news/macro opinion for a dozen-plus consecutive
+candidates. compute_per_agent_accuracy() (Tier 3.5) scored each
+CANDIDATE's copy of an opinion as its own data point, so one unlucky
+(or lucky) call gets counted once per candidate that reused it while
+still fresh — inflating the apparent sample size far past the number
+of independent LLM calls actually made, and letting a handful of calls
+swing the whole aggregate. compute_per_agent_accuracy() now returns
+both views side by side: "by_candidate" (the original Tier 3.5
+behavior, unchanged) and "by_distinct_opinion" (each unique
+(symbol, timeframe, opinion_timestamp, direction) tuple scored exactly
+once, regardless of how many candidates reused it), plus
+"distinct_opinion_counts" so a caller can see directly how much
+duplication a given "by_candidate" number was resting on.
 """
 
 from dataclasses import dataclass
@@ -295,8 +319,22 @@ _DIRECTIONAL_AGENT_NAMES = ("analysis", "news", "macro")
 _OPINION_DIRECTION_TO_DECISION = {"bullish": "enter_long", "bearish": "enter_short"}
 
 
+def _empty_horizon_counts(horizons: list[int]) -> dict[int, dict[str, int]]:
+    return {h: {"correct": 0, "incorrect": 0, "flat": 0, "pending": 0, "no_data": 0} for h in horizons}
+
+
+def _finalize_agent_counts(per_agent_counts: dict[str, dict[int, dict[str, int]]]) -> dict:
+    summary = {}
+    for agent, by_horizon in per_agent_counts.items():
+        summary[agent] = {}
+        for h, counts in by_horizon.items():
+            resolved = counts["correct"] + counts["incorrect"]
+            summary[agent][h] = {**counts, "accuracy": round(counts["correct"] / resolved, 3) if resolved else None}
+    return summary
+
+
 def compute_per_agent_accuracy(candidates: list[dict], horizons: list[int] = None) -> dict:
-    """Tier 3.5: a different question than everything else in this
+    """Tier 3.5/3.6: a different question than everything else in this
     module asks. compute_outcome_for_candidate() and summarize_outcomes()
     evaluate the COORDINATOR's blended decision — this evaluates each
     individual agent's own directional call in isolation, independent
@@ -320,15 +358,33 @@ def compute_per_agent_accuracy(candidates: list[dict], horizons: list[int] = Non
     missing agents are silently skipped — nothing to score, same "no
     directional call, no evaluation" rule the rest of this file uses.
 
+    Tier 3.6: News/Macro opinions stay eligible for reuse across many
+    consecutive candidates (NEWS_MACRO_MAX_AGE_MINUTES, default 90) --
+    the SAME LLM call, same opinion_timestamp, can end up scored once
+    per candidate that reused it while still fresh, letting one
+    unlucky (or lucky) call dominate the aggregate and making the
+    apparent sample size look far larger than the number of actually-
+    independent calls made. Every opinion is now identified by
+    (symbol, timeframe, opinion_timestamp, direction) and scored via a
+    cache so a repeated opinion is only ever evaluated against the
+    market once; the result is tallied into BOTH "by_candidate" (the
+    original Tier 3.5 view -- one tally per candidate, matches what
+    the Coordinator actually saw at decision time for each candidate)
+    and "by_distinct_opinion" (one tally per unique opinion, however
+    many candidates reused it) -- the latter is the more honest read
+    on whether an agent shows real signal, since it isn't inflated by
+    duplication.
+
     Entirely offline — reuses compute_outcome_at_horizon() against
     already-stored bars, no LLM calls, no new data. Returns
-    {agent: {horizon_minutes: {correct, incorrect, flat, pending,
-    no_data, accuracy}}}."""
+    {"by_candidate": {agent: {horizon_minutes: {correct, incorrect,
+    flat, pending, no_data, accuracy}}}, "by_distinct_opinion": (same
+    shape), "distinct_opinion_counts": {agent: int}}."""
     horizons = horizons or HORIZON_MINUTES_DEFAULT
-    per_agent_counts: dict[str, dict[int, dict[str, int]]] = {
-        agent: {h: {"correct": 0, "incorrect": 0, "flat": 0, "pending": 0, "no_data": 0} for h in horizons}
-        for agent in _DIRECTIONAL_AGENT_NAMES
-    }
+    per_candidate_counts = {agent: _empty_horizon_counts(horizons) for agent in _DIRECTIONAL_AGENT_NAMES}
+    distinct_counts = {agent: _empty_horizon_counts(horizons) for agent in _DIRECTIONAL_AGENT_NAMES}
+    seen_opinion_keys: dict[str, set] = {agent: set() for agent in _DIRECTIONAL_AGENT_NAMES}
+    outcome_cache: dict[tuple, str] = {}
 
     for candidate in candidates:
         symbol, timeframe = candidate["symbol"], candidate["timeframe"]
@@ -345,20 +401,28 @@ def compute_per_agent_accuracy(candidates: list[dict], horizons: list[int] = Non
             if not anchor_timestamp:
                 continue
 
+            opinion_key = (symbol, timeframe, anchor_timestamp, pseudo_decision)
+            is_first_sighting = opinion_key not in seen_opinion_keys[agent]
+            seen_opinion_keys[agent].add(opinion_key)
+
             for h in horizons:
-                result = compute_outcome_at_horizon(
-                    symbol=symbol, timeframe=timeframe,
-                    decision_timestamp=anchor_timestamp, decision_direction=pseudo_decision,
-                    horizon_minutes=h,
-                )
-                bucket = per_agent_counts[agent][h]
-                bucket[result.outcome] = bucket.get(result.outcome, 0) + 1
+                cache_key = opinion_key + (h,)
+                if cache_key not in outcome_cache:
+                    outcome_cache[cache_key] = compute_outcome_at_horizon(
+                        symbol=symbol, timeframe=timeframe,
+                        decision_timestamp=anchor_timestamp, decision_direction=pseudo_decision,
+                        horizon_minutes=h,
+                    ).outcome
+                outcome = outcome_cache[cache_key]
 
-    summary = {}
-    for agent, by_horizon in per_agent_counts.items():
-        summary[agent] = {}
-        for h, counts in by_horizon.items():
-            resolved = counts["correct"] + counts["incorrect"]
-            summary[agent][h] = {**counts, "accuracy": round(counts["correct"] / resolved, 3) if resolved else None}
+                bucket = per_candidate_counts[agent][h]
+                bucket[outcome] = bucket.get(outcome, 0) + 1
+                if is_first_sighting:
+                    bucket = distinct_counts[agent][h]
+                    bucket[outcome] = bucket.get(outcome, 0) + 1
 
-    return summary
+    return {
+        "by_candidate": _finalize_agent_counts(per_candidate_counts),
+        "by_distinct_opinion": _finalize_agent_counts(distinct_counts),
+        "distinct_opinion_counts": {agent: len(keys) for agent, keys in seen_opinion_keys.items()},
+    }

@@ -302,7 +302,15 @@ def test_summarize_computes_hypothetical_accuracy_per_horizon(fresh_env):
 
 
 # ---------------------------------------------------------------------------
-# compute_per_agent_accuracy (Tier 3.5)
+# compute_per_agent_accuracy (Tier 3.5 / 3.6)
+#
+# Response shape as of Tier 3.6: {"by_candidate": {agent: {horizon:
+# {...}}}, "by_distinct_opinion": (same shape), "distinct_opinion_counts":
+# {agent: int}}. Most tests below assert against "by_candidate" (the
+# original Tier 3.5 tally, one data point per candidate) since that's
+# what most of these scenarios exercise; the dedup-specific tests near
+# the end assert "by_distinct_opinion" and "distinct_opinion_counts"
+# directly.
 # ---------------------------------------------------------------------------
 
 def test_per_agent_accuracy_scores_each_agent_against_its_own_call(fresh_env):
@@ -324,10 +332,15 @@ def test_per_agent_accuracy_scores_each_agent_against_its_own_call(fresh_env):
     )
 
     summary = outcomes.compute_per_agent_accuracy([c], horizons=[15])
-    assert summary["analysis"][15]["correct"] == 1
-    assert summary["analysis"][15]["accuracy"] == 1.0
-    assert summary["news"][15]["incorrect"] == 1
-    assert summary["news"][15]["accuracy"] == 0.0
+    by_candidate = summary["by_candidate"]
+    assert by_candidate["analysis"][15]["correct"] == 1
+    assert by_candidate["analysis"][15]["accuracy"] == 1.0
+    assert by_candidate["news"][15]["incorrect"] == 1
+    assert by_candidate["news"][15]["accuracy"] == 0.0
+    # A single, never-reused opinion each -- by_distinct_opinion must agree exactly.
+    assert summary["by_distinct_opinion"]["analysis"][15] == by_candidate["analysis"][15]
+    assert summary["by_distinct_opinion"]["news"][15] == by_candidate["news"][15]
+    assert summary["distinct_opinion_counts"] == {"analysis": 1, "news": 1, "macro": 0}
 
 
 def test_per_agent_accuracy_skips_neutral_opinions(fresh_env):
@@ -343,17 +356,18 @@ def test_per_agent_accuracy_skips_neutral_opinions(fresh_env):
     )
 
     summary = outcomes.compute_per_agent_accuracy([c], horizons=[15])
-    counts = summary["analysis"][15]
+    counts = summary["by_candidate"]["analysis"][15]
     assert counts["correct"] == 0 and counts["incorrect"] == 0
     assert counts["accuracy"] is None
+    assert summary["distinct_opinion_counts"]["analysis"] == 0
 
 
 def test_per_agent_accuracy_skips_missing_agents_but_still_reports_all_three_keys(fresh_env):
     """A candidate with only an `analysis` opinion never touches
-    news/macro -- they must still appear in the returned summary (all
-    zero counts, accuracy None), not be silently absent, since a
-    caller comparing agents needs every agent's key present even when
-    a given dataset never exercised it."""
+    news/macro -- they must still appear in both sections of the
+    returned summary (all zero counts, accuracy None), not be silently
+    absent, since a caller comparing agents needs every agent's key
+    present even when a given dataset never exercised it."""
     storage, pt, outcomes = fresh_env
     decision_time = datetime.now(timezone.utc) - timedelta(minutes=30)
     horizon_time = decision_time + timedelta(minutes=15)
@@ -366,9 +380,12 @@ def test_per_agent_accuracy_skips_missing_agents_but_still_reports_all_three_key
     )
 
     summary = outcomes.compute_per_agent_accuracy([c], horizons=[15])
-    assert set(summary.keys()) == {"analysis", "news", "macro"}
-    assert summary["news"][15] == {"correct": 0, "incorrect": 0, "flat": 0, "pending": 0, "no_data": 0, "accuracy": None}
-    assert summary["macro"][15] == {"correct": 0, "incorrect": 0, "flat": 0, "pending": 0, "no_data": 0, "accuracy": None}
+    empty = {"correct": 0, "incorrect": 0, "flat": 0, "pending": 0, "no_data": 0, "accuracy": None}
+    for section in ("by_candidate", "by_distinct_opinion"):
+        assert set(summary[section].keys()) == {"analysis", "news", "macro"}
+        assert summary[section]["news"][15] == empty
+        assert summary[section]["macro"][15] == empty
+    assert summary["distinct_opinion_counts"] == {"analysis": 1, "news": 0, "macro": 0}
 
 
 def test_per_agent_accuracy_falls_back_to_decision_timestamp_when_opinion_has_none(fresh_env):
@@ -388,7 +405,7 @@ def test_per_agent_accuracy_falls_back_to_decision_timestamp_when_opinion_has_no
     )
 
     summary = outcomes.compute_per_agent_accuracy([c], horizons=[15])
-    assert summary["analysis"][15]["correct"] == 1
+    assert summary["by_candidate"]["analysis"][15]["correct"] == 1
 
 
 def test_per_agent_accuracy_skips_opinion_with_no_timestamp_anywhere(fresh_env):
@@ -403,8 +420,9 @@ def test_per_agent_accuracy_skips_opinion_with_no_timestamp_anywhere(fresh_env):
     c["decision"]["timestamp"] = None
 
     summary = outcomes.compute_per_agent_accuracy([c], horizons=[15])
-    counts = summary["analysis"][15]
+    counts = summary["by_candidate"]["analysis"][15]
     assert counts["correct"] == 0 and counts["incorrect"] == 0 and counts["no_data"] == 0
+    assert summary["distinct_opinion_counts"]["analysis"] == 0
 
 
 def test_per_agent_accuracy_aggregates_across_multiple_candidates(fresh_env):
@@ -420,9 +438,13 @@ def test_per_agent_accuracy_aggregates_across_multiple_candidates(fresh_env):
     c2 = _candidate_with_opinions("c2", "TEST", "5m", t2, {"analysis": {"direction": "bullish", "timestamp": _iso(t2)}})
 
     summary = outcomes.compute_per_agent_accuracy([c1, c2], horizons=[15])
-    assert summary["analysis"][15]["correct"] == 1
-    assert summary["analysis"][15]["incorrect"] == 1
-    assert summary["analysis"][15]["accuracy"] == 0.5
+    by_candidate = summary["by_candidate"]["analysis"][15]
+    assert by_candidate["correct"] == 1
+    assert by_candidate["incorrect"] == 1
+    assert by_candidate["accuracy"] == 0.5
+    # Two genuinely distinct opinions (different timestamps) -- dedup changes nothing here.
+    assert summary["by_distinct_opinion"]["analysis"][15] == by_candidate
+    assert summary["distinct_opinion_counts"]["analysis"] == 2
 
 
 def test_per_agent_accuracy_never_touches_trades_or_mutates_candidates(fresh_env):
@@ -447,7 +469,87 @@ def test_per_agent_accuracy_never_touches_trades_or_mutates_candidates(fresh_env
 def test_per_agent_accuracy_empty_candidates_returns_zero_counts_for_all_agents(fresh_env):
     storage, pt, outcomes = fresh_env
     summary = outcomes.compute_per_agent_accuracy([], horizons=[15, 30])
-    assert set(summary.keys()) == {"analysis", "news", "macro"}
-    for agent in ("analysis", "news", "macro"):
-        for h in (15, 30):
-            assert summary[agent][h]["accuracy"] is None
+    for section in ("by_candidate", "by_distinct_opinion"):
+        assert set(summary[section].keys()) == {"analysis", "news", "macro"}
+        for agent in ("analysis", "news", "macro"):
+            for h in (15, 30):
+                assert summary[section][agent][h]["accuracy"] is None
+    assert summary["distinct_opinion_counts"] == {"analysis": 0, "news": 0, "macro": 0}
+
+
+# ---------------------------------------------------------------------------
+# Tier 3.6: by_distinct_opinion dedup
+# ---------------------------------------------------------------------------
+
+def test_per_agent_accuracy_dedup_reused_opinion_counted_once_in_distinct_view(fresh_env):
+    """The real-world case this tier was built for: News/Macro run on
+    their own schedule and the SAME opinion (identical timestamp/
+    direction) gets frozen into several consecutive candidates while
+    still fresh. by_candidate should tally it once per candidate (the
+    original Tier 3.5 behavior); by_distinct_opinion must tally it
+    exactly once regardless of how many candidates reused it."""
+    storage, pt, outcomes = fresh_env
+    opinion_time = datetime.now(timezone.utc) - timedelta(minutes=60)
+    horizon_time = opinion_time + timedelta(minutes=15)
+    _save_bar(storage, "TEST", "5m", opinion_time, 100.0)
+    _save_bar(storage, "TEST", "5m", horizon_time, 105.0)  # news bullish, price rose -> correct
+
+    # Three separate candidates (different decision timestamps, as three
+    # different webhook bars would produce), all sharing the exact same
+    # frozen news opinion -- exactly how a still-fresh News opinion gets
+    # reused across consecutive 5-minute bars in production.
+    same_news_opinion = {"direction": "bullish", "timestamp": _iso(opinion_time)}
+    candidates = [
+        _candidate_with_opinions("c1", "TEST", "5m", opinion_time + timedelta(minutes=5), {"news": same_news_opinion}),
+        _candidate_with_opinions("c2", "TEST", "5m", opinion_time + timedelta(minutes=10), {"news": same_news_opinion}),
+        _candidate_with_opinions("c3", "TEST", "5m", opinion_time + timedelta(minutes=15), {"news": same_news_opinion}),
+    ]
+
+    summary = outcomes.compute_per_agent_accuracy(candidates, horizons=[15])
+    assert summary["by_candidate"]["news"][15]["correct"] == 3
+    assert summary["by_distinct_opinion"]["news"][15]["correct"] == 1
+    assert summary["distinct_opinion_counts"]["news"] == 1
+
+
+def test_per_agent_accuracy_dedup_key_includes_direction_not_just_timestamp(fresh_env):
+    """Two opinions sharing a timestamp but disagreeing on direction
+    (shouldn't happen in practice, but the dedup key must not silently
+    collapse them into one) are still two distinct opinions."""
+    storage, pt, outcomes = fresh_env
+    opinion_time = datetime.now(timezone.utc) - timedelta(minutes=30)
+    horizon_time = opinion_time + timedelta(minutes=15)
+    _save_bar(storage, "TEST", "5m", opinion_time, 100.0)
+    _save_bar(storage, "TEST", "5m", horizon_time, 105.0)
+
+    candidates = [
+        _candidate_with_opinions("c1", "TEST", "5m", opinion_time, {"macro": {"direction": "bullish", "timestamp": _iso(opinion_time)}}),
+        _candidate_with_opinions("c2", "TEST", "5m", opinion_time, {"macro": {"direction": "bearish", "timestamp": _iso(opinion_time)}}),
+    ]
+
+    summary = outcomes.compute_per_agent_accuracy(candidates, horizons=[15])
+    assert summary["distinct_opinion_counts"]["macro"] == 2
+    assert summary["by_distinct_opinion"]["macro"][15]["correct"] == 1
+    assert summary["by_distinct_opinion"]["macro"][15]["incorrect"] == 1
+
+
+def test_per_agent_accuracy_dedup_does_not_cross_contaminate_agents(fresh_env):
+    """Analysis and News sharing an identical (timestamp, direction)
+    pair by coincidence must still be tracked as separate distinct-
+    opinion pools per agent."""
+    storage, pt, outcomes = fresh_env
+    opinion_time = datetime.now(timezone.utc) - timedelta(minutes=30)
+    horizon_time = opinion_time + timedelta(minutes=15)
+    _save_bar(storage, "TEST", "5m", opinion_time, 100.0)
+    _save_bar(storage, "TEST", "5m", horizon_time, 105.0)
+
+    c = _candidate_with_opinions(
+        "c1", "TEST", "5m", opinion_time,
+        {
+            "analysis": {"direction": "bullish", "timestamp": _iso(opinion_time)},
+            "news": {"direction": "bullish", "timestamp": _iso(opinion_time)},
+        },
+    )
+
+    summary = outcomes.compute_per_agent_accuracy([c], horizons=[15])
+    assert summary["distinct_opinion_counts"]["analysis"] == 1
+    assert summary["distinct_opinion_counts"]["news"] == 1
