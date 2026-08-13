@@ -305,6 +305,37 @@ only a fallback for candidates that never became a trade at all
   hypothetical-only regardless. Kept for anyone already depending on
   its shape; new analysis should use `/candidates/history/outcomes`.
 
+### `GET /candidates/history/outcomes/by-agent?symbol=MNQ1!&timeframe=5m&limit=100&horizons=15,30,60`
+Tier 3.5 (per-agent signal quality). A `COORDINATOR_THRESHOLD` sweep
+(`/candidates/history/replay/threshold-sweep` above) can only ever
+speak to the Coordinator's *blended* decision — it can't tell "one
+agent has real signal but is outweighed by noisier ones" apart from
+"no individual agent beats chance either." This endpoint answers that
+directly: for every recent candidate, scores each individual
+Analysis/News/Macro directional opinion (Timing excluded — always
+`"neutral"` by design, never a directional call to score) against the
+same hypothetical horizon price-direction estimate the rest of this
+section already uses, entirely independent of what the blended
+decision ended up being — a bullish Analysis opinion is scored here
+even if the Coordinator's overall decision was `no_trade`. Anchored to
+each agent's own opinion timestamp when present, falling back to the
+candidate's decision timestamp for older data recorded before
+per-opinion timestamps existed.
+```json
+{
+  "analysis": {"15": {"correct": 18, "incorrect": 22, "flat": 0, "pending": 0, "no_data": 0, "accuracy": 0.45}},
+  "news":     {"15": {"correct": 14, "incorrect": 26, "flat": 0, "pending": 0, "no_data": 0, "accuracy": 0.35}},
+  "macro":    {"15": {"correct": 20, "incorrect": 20, "flat": 0, "pending": 0, "no_data": 0, "accuracy": 0.5}}
+}
+```
+All three agent keys are always present, even if a given agent never
+issued a directional (non-neutral) opinion in the fetched window — its
+counts are all zero and `accuracy` is `null` rather than the key being
+absent. Entirely offline, no LLM calls, no trade side effects; same
+caveat as every hypothetical estimate in this project: this is a
+price-direction proxy at a fixed time horizon, not a real backtest.
+400 if `horizons` doesn't parse as comma-separated integers.
+
 ---
 
 ## Coordinator

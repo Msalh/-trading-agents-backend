@@ -26,6 +26,16 @@ a guess for a fact.
 Only enter_long / enter_short decisions have anything to evaluate —
 no_trade and insufficient_data made no directional call, so there's
 nothing to score them against, in either mode.
+
+Tier 3.5 (per-agent signal quality): compute_per_agent_accuracy()
+asks a different question than the rest of this module — not "was
+the Coordinator's blended decision right", but "was each individual
+agent's own directional call right, in isolation." Built after a
+COORDINATOR_THRESHOLD sweep (app/replay.sweep_thresholds) found no
+threshold value getting hypothetical accuracy anywhere near 50%
+(coin-flip) — this exists to help tell whether that's a WEIGHTING
+problem (one agent has real signal, drowned out by noisier ones) or
+whether no individual agent beats chance either.
 """
 
 from dataclasses import dataclass
@@ -271,3 +281,84 @@ def summarize_outcomes(outcomes: list[dict | None]) -> dict:
             "by_horizon_minutes": hypothetical_summary,
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Per-agent signal quality — Tier 3.5
+# ---------------------------------------------------------------------------
+
+# Analysis/News/Macro only — Timing is always "neutral" by design
+# (app/timing_agent.py) and structurally excluded from directional
+# scoring (coordinator.DIRECTIONAL_AGENTS, Tier 2.8); it has nothing
+# to evaluate here for the same reason.
+_DIRECTIONAL_AGENT_NAMES = ("analysis", "news", "macro")
+_OPINION_DIRECTION_TO_DECISION = {"bullish": "enter_long", "bearish": "enter_short"}
+
+
+def compute_per_agent_accuracy(candidates: list[dict], horizons: list[int] = None) -> dict:
+    """Tier 3.5: a different question than everything else in this
+    module asks. compute_outcome_for_candidate() and summarize_outcomes()
+    evaluate the COORDINATOR's blended decision — this evaluates each
+    individual agent's own directional call in isolation, independent
+    of what the Coordinator ultimately decided (a bullish Analysis
+    opinion is scored here even if News disagreed and the blended
+    decision came out no_trade). Useful for a question threshold
+    tuning can't answer: if the Coordinator's overall accuracy is
+    poor, is that a WEIGHTING problem (one agent has real signal but
+    is underweighted or drowned out by noisier ones) or is NO agent
+    individually beating chance (the weighting doesn't matter because
+    there's nothing to weight)?
+
+    Walks each candidate's frozen opinions_used (Tier 2.1 — the exact
+    snapshot the Coordinator scored from, not a fresh lookup) and, for
+    every DIRECTIONAL agent (analysis/news/macro — Timing is always
+    neutral, nothing to score) with a bullish/bearish call, computes
+    the same hypothetical horizon estimate the rest of this module
+    uses — anchored to that AGENT's own opinion timestamp when present
+    (falls back to the candidate's decision timestamp otherwise, e.g.
+    older data predating per-opinion timestamps). Neutral opinions and
+    missing agents are silently skipped — nothing to score, same "no
+    directional call, no evaluation" rule the rest of this file uses.
+
+    Entirely offline — reuses compute_outcome_at_horizon() against
+    already-stored bars, no LLM calls, no new data. Returns
+    {agent: {horizon_minutes: {correct, incorrect, flat, pending,
+    no_data, accuracy}}}."""
+    horizons = horizons or HORIZON_MINUTES_DEFAULT
+    per_agent_counts: dict[str, dict[int, dict[str, int]]] = {
+        agent: {h: {"correct": 0, "incorrect": 0, "flat": 0, "pending": 0, "no_data": 0} for h in horizons}
+        for agent in _DIRECTIONAL_AGENT_NAMES
+    }
+
+    for candidate in candidates:
+        symbol, timeframe = candidate["symbol"], candidate["timeframe"]
+        decision = candidate.get("decision") or {}
+        opinions_used = decision.get("opinions_used") or {}
+        for agent in _DIRECTIONAL_AGENT_NAMES:
+            opinion = opinions_used.get(agent)
+            if not opinion:
+                continue
+            pseudo_decision = _OPINION_DIRECTION_TO_DECISION.get(opinion.get("direction"))
+            if pseudo_decision is None:
+                continue  # neutral (or malformed) -- nothing to score
+            anchor_timestamp = opinion.get("timestamp") or decision.get("timestamp")
+            if not anchor_timestamp:
+                continue
+
+            for h in horizons:
+                result = compute_outcome_at_horizon(
+                    symbol=symbol, timeframe=timeframe,
+                    decision_timestamp=anchor_timestamp, decision_direction=pseudo_decision,
+                    horizon_minutes=h,
+                )
+                bucket = per_agent_counts[agent][h]
+                bucket[result.outcome] = bucket.get(result.outcome, 0) + 1
+
+    summary = {}
+    for agent, by_horizon in per_agent_counts.items():
+        summary[agent] = {}
+        for h, counts in by_horizon.items():
+            resolved = counts["correct"] + counts["incorrect"]
+            summary[agent][h] = {**counts, "accuracy": round(counts["correct"] / resolved, 3) if resolved else None}
+
+    return summary

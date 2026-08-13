@@ -69,6 +69,24 @@ def _candidate(candidate_id, symbol, timeframe, decision, timestamp_dt):
     }
 
 
+def _candidate_with_opinions(candidate_id, symbol, timeframe, decision_timestamp_dt, opinions_used):
+    """Tier 3.5 candidate shape — unlike _candidate() above, this
+    includes opinions_used, since compute_per_agent_accuracy() reads
+    each individual agent's frozen opinion rather than the blended
+    decision. `opinions_used` values are dicts like
+    {"direction": "bullish", "timestamp": <iso str or None>}."""
+    return {
+        "candidate_id": candidate_id,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "decision": {
+            "decision": "enter_long",
+            "timestamp": _iso(decision_timestamp_dt),
+            "opinions_used": opinions_used,
+        },
+    }
+
+
 def _trade(candidate_id, symbol, timeframe, direction, size, entry, stop, targets):
     return {
         "trade_id": f"trade-{candidate_id}",
@@ -281,3 +299,155 @@ def test_summarize_computes_hypothetical_accuracy_per_horizon(fresh_env):
     # horizon 30: one "pending" (h1) + one "correct" (h2) -> 1 resolved, 1 correct -> accuracy 1.0
     assert hyp["by_horizon_minutes"][30]["accuracy"] == 1.0
     assert hyp["by_horizon_minutes"][30]["pending"] == 1
+
+
+# ---------------------------------------------------------------------------
+# compute_per_agent_accuracy (Tier 3.5)
+# ---------------------------------------------------------------------------
+
+def test_per_agent_accuracy_scores_each_agent_against_its_own_call(fresh_env):
+    """Analysis bullish + price rose -> correct. News bearish + price
+    rose -> incorrect. Both are scored independently of any blended
+    Coordinator decision -- there isn't one being read here at all."""
+    storage, pt, outcomes = fresh_env
+    decision_time = datetime.now(timezone.utc) - timedelta(minutes=30)
+    horizon_time = decision_time + timedelta(minutes=15)
+    _save_bar(storage, "TEST", "5m", decision_time, 100.0)
+    _save_bar(storage, "TEST", "5m", horizon_time, 105.0)
+
+    c = _candidate_with_opinions(
+        "c1", "TEST", "5m", decision_time,
+        {
+            "analysis": {"direction": "bullish", "timestamp": _iso(decision_time)},
+            "news": {"direction": "bearish", "timestamp": _iso(decision_time)},
+        },
+    )
+
+    summary = outcomes.compute_per_agent_accuracy([c], horizons=[15])
+    assert summary["analysis"][15]["correct"] == 1
+    assert summary["analysis"][15]["accuracy"] == 1.0
+    assert summary["news"][15]["incorrect"] == 1
+    assert summary["news"][15]["accuracy"] == 0.0
+
+
+def test_per_agent_accuracy_skips_neutral_opinions(fresh_env):
+    storage, pt, outcomes = fresh_env
+    decision_time = datetime.now(timezone.utc) - timedelta(minutes=30)
+    horizon_time = decision_time + timedelta(minutes=15)
+    _save_bar(storage, "TEST", "5m", decision_time, 100.0)
+    _save_bar(storage, "TEST", "5m", horizon_time, 105.0)
+
+    c = _candidate_with_opinions(
+        "c1", "TEST", "5m", decision_time,
+        {"analysis": {"direction": "neutral", "timestamp": _iso(decision_time)}},
+    )
+
+    summary = outcomes.compute_per_agent_accuracy([c], horizons=[15])
+    counts = summary["analysis"][15]
+    assert counts["correct"] == 0 and counts["incorrect"] == 0
+    assert counts["accuracy"] is None
+
+
+def test_per_agent_accuracy_skips_missing_agents_but_still_reports_all_three_keys(fresh_env):
+    """A candidate with only an `analysis` opinion never touches
+    news/macro -- they must still appear in the returned summary (all
+    zero counts, accuracy None), not be silently absent, since a
+    caller comparing agents needs every agent's key present even when
+    a given dataset never exercised it."""
+    storage, pt, outcomes = fresh_env
+    decision_time = datetime.now(timezone.utc) - timedelta(minutes=30)
+    horizon_time = decision_time + timedelta(minutes=15)
+    _save_bar(storage, "TEST", "5m", decision_time, 100.0)
+    _save_bar(storage, "TEST", "5m", horizon_time, 105.0)
+
+    c = _candidate_with_opinions(
+        "c1", "TEST", "5m", decision_time,
+        {"analysis": {"direction": "bullish", "timestamp": _iso(decision_time)}},
+    )
+
+    summary = outcomes.compute_per_agent_accuracy([c], horizons=[15])
+    assert set(summary.keys()) == {"analysis", "news", "macro"}
+    assert summary["news"][15] == {"correct": 0, "incorrect": 0, "flat": 0, "pending": 0, "no_data": 0, "accuracy": None}
+    assert summary["macro"][15] == {"correct": 0, "incorrect": 0, "flat": 0, "pending": 0, "no_data": 0, "accuracy": None}
+
+
+def test_per_agent_accuracy_falls_back_to_decision_timestamp_when_opinion_has_none(fresh_env):
+    """Older candidates predate per-opinion timestamps -- the opinion
+    dict may have timestamp=None (or the key absent). Must fall back
+    to the candidate's own decision timestamp rather than being
+    skipped entirely."""
+    storage, pt, outcomes = fresh_env
+    decision_time = datetime.now(timezone.utc) - timedelta(minutes=30)
+    horizon_time = decision_time + timedelta(minutes=15)
+    _save_bar(storage, "TEST", "5m", decision_time, 100.0)
+    _save_bar(storage, "TEST", "5m", horizon_time, 105.0)
+
+    c = _candidate_with_opinions(
+        "c1", "TEST", "5m", decision_time,
+        {"analysis": {"direction": "bullish", "timestamp": None}},
+    )
+
+    summary = outcomes.compute_per_agent_accuracy([c], horizons=[15])
+    assert summary["analysis"][15]["correct"] == 1
+
+
+def test_per_agent_accuracy_skips_opinion_with_no_timestamp_anywhere(fresh_env):
+    """If neither the opinion nor the candidate's decision carries a
+    timestamp, there's no anchor to evaluate against -- must be
+    skipped, not raise."""
+    storage, pt, outcomes = fresh_env
+    c = _candidate_with_opinions(
+        "c1", "TEST", "5m", datetime.now(timezone.utc),
+        {"analysis": {"direction": "bullish", "timestamp": None}},
+    )
+    c["decision"]["timestamp"] = None
+
+    summary = outcomes.compute_per_agent_accuracy([c], horizons=[15])
+    counts = summary["analysis"][15]
+    assert counts["correct"] == 0 and counts["incorrect"] == 0 and counts["no_data"] == 0
+
+
+def test_per_agent_accuracy_aggregates_across_multiple_candidates(fresh_env):
+    storage, pt, outcomes = fresh_env
+    t1 = datetime.now(timezone.utc) - timedelta(minutes=60)
+    t2 = datetime.now(timezone.utc) - timedelta(minutes=30)
+    _save_bar(storage, "TEST", "5m", t1, 100.0)
+    _save_bar(storage, "TEST", "5m", t1 + timedelta(minutes=15), 105.0)  # analysis c1: correct
+    _save_bar(storage, "TEST", "5m", t2, 200.0)
+    _save_bar(storage, "TEST", "5m", t2 + timedelta(minutes=15), 195.0)  # analysis c2: incorrect (bullish, price fell)
+
+    c1 = _candidate_with_opinions("c1", "TEST", "5m", t1, {"analysis": {"direction": "bullish", "timestamp": _iso(t1)}})
+    c2 = _candidate_with_opinions("c2", "TEST", "5m", t2, {"analysis": {"direction": "bullish", "timestamp": _iso(t2)}})
+
+    summary = outcomes.compute_per_agent_accuracy([c1, c2], horizons=[15])
+    assert summary["analysis"][15]["correct"] == 1
+    assert summary["analysis"][15]["incorrect"] == 1
+    assert summary["analysis"][15]["accuracy"] == 0.5
+
+
+def test_per_agent_accuracy_never_touches_trades_or_mutates_candidates(fresh_env):
+    """Read-only guarantee, same pattern as replay_candidate() /
+    sweep_thresholds() -- no paper trade should ever be created as a
+    side effect of this purely analytical function."""
+    storage, pt, outcomes = fresh_env
+    decision_time = datetime.now(timezone.utc) - timedelta(minutes=30)
+    _save_bar(storage, "TEST", "5m", decision_time, 100.0)
+    c = _candidate_with_opinions(
+        "c1", "TEST", "5m", decision_time,
+        {"analysis": {"direction": "bullish", "timestamp": _iso(decision_time)}},
+    )
+    before = dict(c["decision"])
+
+    outcomes.compute_per_agent_accuracy([c], horizons=[15])
+
+    assert c["decision"] == before
+    assert storage.get_trade_by_candidate_id("c1") is None
+
+
+def test_per_agent_accuracy_empty_candidates_returns_zero_counts_for_all_agents(fresh_env):
+    storage, pt, outcomes = fresh_env
+    summary = outcomes.compute_per_agent_accuracy([], horizons=[15, 30])
+    assert set(summary.keys()) == {"analysis", "news", "macro"}
+    for agent in ("analysis", "news", "macro"):
+        for h in (15, 30):
+            assert summary[agent][h]["accuracy"] is None

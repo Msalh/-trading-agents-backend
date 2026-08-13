@@ -341,6 +341,29 @@ currently the ONLY data available to tune against — not a real
 backtest, an accuracy proxy, same caveat every hypothetical estimate
 in this project already carries.
 
+Tier 3.5 (per-agent signal quality): the threshold sweep above found
+no COORDINATOR_THRESHOLD value getting hypothetical accuracy anywhere
+near 50% (coin-flip) — but a threshold sweep can only ever say
+something about the Coordinator's BLENDED decision, since it re-scores
+_score_opinions() over all agents together. It can't distinguish "one
+agent has real signal but is outweighed/drowned out by noisier ones"
+from "no individual agent beats chance either" — two very different
+problems requiring very different fixes (reweighting vs. reworking or
+dropping an agent). New GET /candidates/history/outcomes/by-agent,
+built on app/outcomes.compute_per_agent_accuracy(), answers this
+directly: walks each historical candidate's frozen opinions_used
+(same Tier 2.1 snapshot the sweep already reads) and scores every
+individual Analysis/News/Macro directional call (Timing excluded —
+always neutral by design, structurally outside DIRECTIONAL_AGENTS)
+against the same hypothetical horizon estimate outcomes.py already
+uses elsewhere, independent of what the Coordinator ultimately
+decided. Anchored to each agent's own opinion timestamp when present,
+falling back to the candidate's decision timestamp for older data
+predating per-opinion timestamps. Entirely offline — no LLM calls, no
+new data, no trade side effects — computed from the same 79 (at last
+check) historical candidates already sitting in production, no new
+data collection required.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -376,6 +399,7 @@ from app.outcomes import (
     HORIZON_MINUTES_DEFAULT,
     compute_outcome_for_candidate,
     compute_outcomes_for_decision,
+    compute_per_agent_accuracy,
     summarize_outcomes,
 )
 from app.paper_trades import get_account_open_trade_count, open_trade_from_candidate, process_new_bar
@@ -954,6 +978,32 @@ def candidates_history_outcomes_summary(
     candidates = get_candidate_history(symbol=symbol, timeframe=timeframe, limit=limit)
     outcomes = [compute_outcome_for_candidate(c, horizons=horizon_list) for c in candidates]
     return summarize_outcomes(outcomes)
+
+
+@app.get("/candidates/history/outcomes/by-agent")
+def candidates_history_outcomes_by_agent(
+    symbol: str = Query(...),
+    timeframe: str = Query(...),
+    limit: int = Query(default=100, le=500),
+    horizons: str = Query(default="15,30,60"),
+) -> dict:
+    """Tier 3.5 (per-agent signal quality): a different cut of the same
+    candidate history — instead of the Coordinator's blended decision,
+    scores each individual agent's (analysis/news/macro) own
+    directional call in isolation, regardless of what the blended
+    decision ended up being. Built to answer a question a
+    COORDINATOR_THRESHOLD sweep can't: if overall accuracy is poor, is
+    any individual agent actually beating chance on its own, or is
+    there no signal anywhere to weight toward? Entirely offline, same
+    hypothetical horizon estimate the rest of this file already uses —
+    not a real backtest."""
+    try:
+        horizon_list = [int(h.strip()) for h in horizons.split(",") if h.strip()]
+    except ValueError:
+        raise HTTPException(status_code=400, detail="horizons must be comma-separated integers")
+
+    candidates = get_candidate_history(symbol=symbol, timeframe=timeframe, limit=limit)
+    return compute_per_agent_accuracy(candidates, horizons=horizon_list)
 
 
 def _parse_replay_horizons(horizons: str) -> list[int]:
