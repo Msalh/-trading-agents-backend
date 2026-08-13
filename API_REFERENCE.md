@@ -127,14 +127,26 @@ Analysis won't auto-run even during nominal kill-zone clock hours) and
        `pending_execution` (clear to let Execution run), `reject`
        (hard block: `max_positions_reached` / `daily_loss_limit_reached`
        / `drawdown_exhausted`), or `no_action` (Coordinator isn't
-       directional).
+       directional). As of Tier 3.3, the open-position count checked
+       here is ACCOUNT-WIDE (every symbol/timeframe), not scoped to
+       just this one — this pass stays an advisory pre-check, though;
+       the real enforcement is the atomic commit in the Size stage
+       below.
     2. **Size** (Execution has attached a validated `status="planned"`
        order to this same candidate): sizes the position from
        Execution's actual `entry_price`/`stop_loss` —
        `risk_per_contract = |entry - stop| × $2/pt` — never from ATR.
        Re-checks the daily loss limit and drawdown room too (Execution's
        LLM call happens in between the two stages, during which either
-       could change). Returns `approve` / `modify` / `reject`.
+       could change). The trade's budget (`key_data.budget_for_this_trade_usd`)
+       is, as of Tier 3.3, `min(RISK_FRACTION_PER_TRADE × remaining
+       drawdown room, remaining daily-loss room)` — whichever is
+       tighter right now, not drawdown room alone —
+       `key_data.budget_binding_constraint` reports which one
+       (`"drawdown_room"` | `"daily_loss_room"`), with flag
+       `daily_loss_room_binding` set when the daily-loss side is what
+       capped (or rejected) the trade. Returns `approve` / `modify` /
+       `reject`.
   - Response includes `stage: "gate" | "size"` alongside `decision` so
     callers can tell which pass produced the result.
   - Returns 404 if no trade candidate exists yet, or the latest one is
@@ -220,9 +232,14 @@ trade on a stop or nearest-target hit.
 - `GET /trades/{trade_id}` — a single trade by id, any status.
 
 `CURRENT_OPEN_POSITIONS` is now a fallback only — Risk's gate stage
-uses the LIVE count from this table (`get_open_trade_count`) by
-default, so `MAX_OPEN_POSITIONS` is enforced against reality instead
-of a hand-updated number.
+uses the LIVE count from this table by default, so `MAX_OPEN_POSITIONS`
+is enforced against reality instead of a hand-updated number. As of
+Tier 3.3, that count (and the limit) is ACCOUNT-WIDE — across every
+symbol/timeframe, not a separate budget per symbol — and the actual
+commit is atomic (`app/storage.open_trade_if_room()`, a single
+`BEGIN IMMEDIATE` transaction folding the idempotency check, the
+capacity check, and the insert together), closing the earlier
+count-then-insert race between two near-simultaneous candidates.
 
 ### Account Risk (Tier 2.10) — read-only, no secret needed
 
@@ -435,10 +452,10 @@ flipped?" before reading individual replayed candidates.
 | `ACCOUNT_BALANCE` | no | `50000` | static/manual, Sprint 7 |
 | `MAX_DRAWDOWN` | no | `2000` | |
 | `CURRENT_DRAWDOWN_USED` | no | `0` | Tier 2.10: fallback only — normally superseded by the live peak-to-trough figure computed from real closed paper trades |
-| `MAX_OPEN_POSITIONS` | no | `1` | enforced against the live open-paper-trade count as of Tier 2.3 |
-| `CURRENT_OPEN_POSITIONS` | no | `0` | Tier 2.3: fallback only — normally superseded by the live paper-trade count |
+| `MAX_OPEN_POSITIONS` | no | `1` | enforced against the live open-paper-trade count (Tier 2.3); ACCOUNT-WIDE across every symbol/timeframe, atomically, as of Tier 3.3 |
+| `CURRENT_OPEN_POSITIONS` | no | `0` | Tier 2.3: fallback only — normally superseded by the live, account-wide paper-trade count |
 | `BASE_POSITION_SIZE` | no | `1` | contracts |
-| `RISK_FRACTION_PER_TRADE` | no | `0.5` | fraction of remaining drawdown room risked per trade |
+| `RISK_FRACTION_PER_TRADE` | no | `0.5` | fraction of remaining drawdown room risked per trade — as of Tier 3.3, the trade's actual budget is `min(this, remaining daily-loss room)` |
 | `DAILY_LOSS_LIMIT` | no | `1000` | Tier 2.10: new time-boxed circuit breaker, live-computed from trades closed on the current NY/CME trading day — no manual updating needed |
 | `ORDER_EXPIRY_MINUTES` | no | `60` | Tier 3.2: cancels a `pending_fill` order after this many EVENT-time minutes unfilled |
 | `SLIPPAGE_POINTS` | no | `0.25` | Tier 3.2: applied against the trader on market entries and stop-loss exits only |

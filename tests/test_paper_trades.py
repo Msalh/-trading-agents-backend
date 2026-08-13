@@ -2,8 +2,11 @@
 Unit tests for app.paper_trades — the Tier 2.3 paper fill/P&L
 lifecycle, substantially reworked in Tier 3.2 (fill realism: event
 time, no more ready_now auto-fill, order expiry, slippage/commission,
-gap-through-stop). No LLM, no network. Uses a temporary SQLite file,
-same pattern as test_candidates.py.
+gap-through-stop) and Tier 3.3 (account-wide atomic position limits —
+MAX_OPEN_POSITIONS now spans every symbol/timeframe, and the
+idempotency/capacity check is one atomic transaction with the insert,
+not two racing operations). No LLM, no network. Uses a temporary
+SQLite file, same pattern as test_candidates.py.
 
 Run with: pytest tests/test_paper_trades.py -v
 """
@@ -126,14 +129,53 @@ def test_refuses_when_at_capacity(fresh_paper_trades):
     assert pt.get_open_trade_count("TEST", "5m") == 1
 
 
-def test_capacity_allows_a_second_trade_for_a_different_symbol(fresh_paper_trades):
+def test_capacity_is_account_wide_blocks_a_different_symbol_too(fresh_paper_trades):
+    """Tier 3.3: MAX_OPEN_POSITIONS is now an ACCOUNT-WIDE budget, not
+    a separate limit per symbol+timeframe -- a second symbol must NOT
+    be allowed to open its own position just because it hasn't
+    individually hit the cap yet. Regression test for the actual
+    second-review finding ("MAX_OPEN_POSITIONS not account-wide")."""
     storage, pt, _ = fresh_paper_trades(MAX_OPEN_POSITIONS="1")
+    c1 = _candidate("c1", "TEST", "5m", "bullish", 1, "market", 20020.0, 20000.0, [20100.0])
+    c2 = _candidate("c2", "OTHER", "5m", "bullish", 1, "market", 30.0, 28.0, [36.0])
+    pt.open_trade_from_candidate(c1)
+    result = pt.open_trade_from_candidate(c2)
+    assert result is None
+    assert pt.get_account_open_trade_count() == 1
+
+
+def test_capacity_allows_a_different_symbol_once_the_account_wide_limit_is_raised(fresh_paper_trades):
+    storage, pt, _ = fresh_paper_trades(MAX_OPEN_POSITIONS="2")
     c1 = _candidate("c1", "TEST", "5m", "bullish", 1, "market", 20020.0, 20000.0, [20100.0])
     c2 = _candidate("c2", "OTHER", "5m", "bullish", 1, "market", 30.0, 28.0, [36.0])
     pt.open_trade_from_candidate(c1)
     result = pt.open_trade_from_candidate(c2)
     assert result is not None
     assert result["status"] == "pending_fill"  # Tier 3.2: not "open" anymore, even for a market order
+    assert pt.get_account_open_trade_count() == 2
+
+
+def test_get_account_open_trade_count_spans_all_symbols(fresh_paper_trades):
+    storage, pt, _ = fresh_paper_trades(MAX_OPEN_POSITIONS="5")
+    pt.open_trade_from_candidate(_candidate("c1", "TEST", "5m", "bullish", 1, "market", 20020.0, 20000.0, [20100.0]))
+    pt.open_trade_from_candidate(_candidate("c2", "OTHER", "1h", "bearish", 1, "market", 30.0, 32.0, [24.0]))
+    assert pt.get_account_open_trade_count() == 2
+    # the per-symbol view stays scoped, unlike the account-wide one
+    assert pt.get_open_trade_count("TEST", "5m") == 1
+    assert pt.get_open_trade_count("OTHER", "1h") == 1
+
+
+def test_idempotent_returns_original_trade_even_when_account_is_at_capacity(fresh_paper_trades):
+    """Idempotency must win over a capacity rejection -- re-running
+    Risk's size stage on a candidate that already opened a trade
+    (e.g. a dashboard double-click) must always return that SAME
+    trade, never a None just because the account is now otherwise
+    full."""
+    storage, pt, _ = fresh_paper_trades(MAX_OPEN_POSITIONS="1")
+    c1 = _candidate("c1", "TEST", "5m", "bullish", 1, "market", 20020.0, 20000.0, [20100.0])
+    first = pt.open_trade_from_candidate(c1)
+    second = pt.open_trade_from_candidate(c1)  # same candidate, account now "at capacity" from its own trade
+    assert second["trade_id"] == first["trade_id"]
 
 
 # ---------------------------------------------------------------------------

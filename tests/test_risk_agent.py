@@ -257,6 +257,48 @@ def test_size_uses_absolute_distance_regardless_of_direction(risk_module):
     assert long_result.key_data["risk_per_contract_usd"] == short_result.key_data["risk_per_contract_usd"]
 
 
+def test_size_budget_bound_by_tighter_daily_loss_room_not_just_drawdown(risk_module):
+    """The core Tier 3.3 fix (external review's item 7): before this
+    tier, budget_for_trade was ONLY RISK_FRACTION_PER_TRADE of
+    remaining drawdown room -- a trade could be approved for more size
+    than what's actually left in TODAY's daily-loss allowance, as long
+    as overall drawdown room was still generous. Here, drawdown room
+    alone would allow $1000 (50% of $2000), but only $300 of
+    daily-loss room is left -- the real budget must be the tighter
+    $300, so 10 contracts at $50 risk/contract ($500 total) must be
+    reduced to 6, not approved at 10 like it would have been under the
+    old drawdown-only budget."""
+    ra = risk_module(DAILY_LOSS_LIMIT="300", BASE_POSITION_SIZE="10")
+    result = ra.size_position("TEST", "5m", entry_price=20000.0, stop_loss=19975.0, daily_loss_used=0.0)
+    assert result.decision == "modify"
+    assert result.suggested_size == 6  # floor(300 / 50)
+    assert result.key_data["budget_binding_constraint"] == "daily_loss_room"
+    assert result.key_data["budget_for_this_trade_usd"] == 300.0
+    assert "daily_loss_room_binding" in result.flags
+
+
+def test_size_budget_bound_by_drawdown_room_when_it_is_tighter(risk_module):
+    """The other side of the same fix: when drawdown room is the
+    tighter constraint (daily-loss room still has plenty left), the
+    binding constraint must correctly report "drawdown_room", and no
+    daily_loss_room_binding flag should be set."""
+    ra = risk_module(CURRENT_DRAWDOWN_USED="1500", BASE_POSITION_SIZE="10")  # remaining=500, budget=250
+    result = ra.size_position("TEST", "5m", entry_price=20000.0, stop_loss=19975.0)
+    assert result.decision == "modify"
+    assert result.suggested_size == 5  # floor(250 / 50)
+    assert result.key_data["budget_binding_constraint"] == "drawdown_room"
+    assert "daily_loss_room_binding" not in result.flags
+
+
+def test_size_daily_loss_room_can_reject_even_when_drawdown_room_is_wide_open(risk_module):
+    ra = risk_module(DAILY_LOSS_LIMIT="40", BASE_POSITION_SIZE="1")  # $40 room, 1 contract costs $50
+    result = ra.size_position("TEST", "5m", entry_price=20000.0, stop_loss=19975.0, daily_loss_used=0.0)
+    assert result.decision == "reject"
+    assert result.key_data["budget_binding_constraint"] == "daily_loss_room"
+    assert "daily_loss_room_binding" in result.flags
+    assert "budget_too_small_for_min_size" in result.flags
+
+
 def test_size_reflects_tighter_stop_than_atr_would_have_estimated(risk_module):
     """The core Tier 2.2 fix: a real stop tighter than ATR sizes UP
     (more contracts fit the same budget) instead of being stuck at

@@ -1,7 +1,8 @@
 """
 Paper Trade Lifecycle — Tier 2.3 (external review's prioritized
 sequence, next after Tier 2.2). Reworked substantially in Tier 3.2
-(second external review, fill realism) — see that section below.
+(second external review, fill realism) and Tier 3.3 (account-wide
+atomic position limits) — see those sections below.
 
 Everything up through Execution/Risk produces an opinion about what
 SHOULD happen — nothing until now has tracked what actually happened
@@ -41,10 +42,11 @@ simplification, not solved here).
 
 MAX_OPEN_POSITIONS is enforced here as the final gate before actually
 committing a paper position — Risk's gate stage (evaluate_risk_gate)
-already checks it earlier using the same get_open_trade_count(), but
-double-checking here means a race between two nearly-simultaneous
-candidates can't both slip through and open two positions. (Still
-scoped per symbol+timeframe, not account-wide — that's Tier 3.3.)
+already checks it earlier using the account-wide live count as an
+advisory pre-check, but the real enforcement is this module's atomic
+commit (see Tier 3.3 below), since Execution's LLM call happens in
+between the two Risk stages and another candidate could commit a
+trade during that window.
 
 Tier 3.2 (second external review, "paper fills were still materially
 unrealistic"): four changes, all aimed at the same goal — a closed
@@ -86,11 +88,36 @@ not just an exactly-computed but rigged number.
      COMMISSION_PER_CONTRACT (round-trip) is subtracted from pnl_usd
      on every close.
 
-Not solved in this tier (tracked for later, per the review's own
-ordering): fully transactional/account-wide position-limit reservation
-(Tier 3.3), and richer expiry policies (session-close / kill-zone-close
-/ setup-invalidation) — ORDER_EXPIRY_MINUTES is a plain fixed window,
-not any of those.
+Not solved in Tier 3.2 (tracked for Tier 3.3, next): fully
+transactional/account-wide position-limit reservation, and richer
+expiry policies (session-close / kill-zone-close / setup-invalidation)
+— ORDER_EXPIRY_MINUTES is a plain fixed window, not any of those (the
+expiry-policy item is still open after 3.3 too).
+
+Tier 3.3 (account-wide atomic position/risk limits — items 6-7 of the
+user's own recommended ordering, closing the second external review's
+"MAX_OPEN_POSITIONS not account-wide" and "position-limit enforcement
+race-prone" findings): two changes.
+
+  1. MAX_OPEN_POSITIONS is now account-wide. open_trade_from_candidate()
+     used to check get_open_trade_count(symbol, timeframe) — scoped to
+     ONE symbol+timeframe — so two different symbols could each
+     independently reach "the limit" and the account could end up with
+     a combined position count well past MAX_OPEN_POSITIONS. The real
+     enforcement now counts live (pending_fill/open) trades across
+     EVERY symbol/timeframe. get_open_trade_count() is kept as-is for
+     informational/dashboard use (open positions for THIS symbol) — it
+     is no longer what any risk decision is gated on.
+  2. The check-then-insert is now one atomic transaction, not two
+     separate operations. storage.open_trade_if_room() (BEGIN
+     IMMEDIATE) folds the idempotency check (does this candidate_id
+     already have a trade?) and the account-wide capacity check into
+     the SAME transaction as the insert, closing the exact race the
+     review flagged: two near-simultaneous candidates could previously
+     each read "under capacity" before either had committed, opening
+     one more position than the limit allows (or, for the same
+     candidate, opening two trades for one candidate). See that
+     function's docstring in app/storage.py for the full mechanism.
 """
 
 import os
@@ -100,9 +127,10 @@ from datetime import datetime, timezone
 from app.storage import (
     cancel_trade,
     close_trade,
+    get_open_or_pending_trade_count,
     get_open_or_pending_trades,
     get_trade_by_candidate_id,
-    save_paper_trade,
+    open_trade_if_room,
     update_trade_fill,
 )
 
@@ -137,10 +165,23 @@ def _event_minutes_elapsed(earlier_ts: str, later_ts: str) -> float | None:
 
 
 def get_open_trade_count(symbol: str, timeframe: str) -> int:
-    """Trades still live (pending_fill or open) — this is what Risk's
-    gate stage now checks against MAX_OPEN_POSITIONS, replacing the
-    old hand-updated CURRENT_OPEN_POSITIONS env var."""
+    """Trades still live (pending_fill or open) for ONE symbol+
+    timeframe. Informational/dashboard use only as of Tier 3.3 — no
+    risk decision is gated on this scoped count anymore, since
+    MAX_OPEN_POSITIONS is account-wide (see get_account_open_trade_count()
+    and open_trade_from_candidate() below)."""
     return len(get_open_or_pending_trades(symbol=symbol, timeframe=timeframe))
+
+
+def get_account_open_trade_count() -> int:
+    """Tier 3.3: ACCOUNT-WIDE count of trades still live (pending_fill
+    or open), across every symbol/timeframe — this is what
+    MAX_OPEN_POSITIONS actually gates against. Used by Risk's gate
+    stage (main.py) as a free, advisory pre-check before Execution
+    runs; the real, atomic enforcement happens in
+    open_trade_from_candidate() below when a trade is actually
+    committed."""
+    return get_open_or_pending_trade_count()
 
 
 def open_trade_from_candidate(candidate: dict) -> dict | None:
@@ -148,24 +189,25 @@ def open_trade_from_candidate(candidate: dict) -> dict | None:
     approve/modify and whose Execution result is a validated
     status="planned" order. Returns the existing trade (not a new
     one) if this candidate already has one — idempotent by
-    candidate_id. Returns None if the open-position limit is already
-    at capacity (should be rare — Risk's gate stage already checked
-    this before Execution even ran, but re-checked here as the last
-    line of defense against a race).
+    candidate_id. Returns None if the account-wide open-position limit
+    is already at capacity (should be rare — Risk's gate stage already
+    checked this before Execution even ran, but re-checked here as the
+    real enforcement point, since Execution's LLM call happens in
+    between and another candidate could have committed a trade during
+    that window).
 
     Tier 3.2: always creates status="pending_fill", regardless of
     order_type or Execution's ready_now flag — see the module
     docstring for why. process_new_bar() is what actually fills it,
-    against a real subsequent bar."""
+    against a real subsequent bar.
+
+    Tier 3.3: the idempotency check and the account-wide capacity
+    check are no longer two separate operations racing each other —
+    both, plus the insert, happen inside storage.open_trade_if_room()'s
+    single atomic transaction. This function just builds the candidate
+    trade dict and asks that function to commit it if there's room."""
     candidate_id = candidate["candidate_id"]
-    existing = get_trade_by_candidate_id(candidate_id)
-    if existing is not None:
-        return existing
-
     symbol, timeframe = candidate["symbol"], candidate["timeframe"]
-    if get_open_trade_count(symbol, timeframe) >= MAX_OPEN_POSITIONS:
-        return None
-
     execution = candidate["execution"]
     risk = candidate["risk"]
     direction = candidate["decision"].get("direction")
@@ -192,8 +234,10 @@ def open_trade_from_candidate(candidate: dict) -> dict | None:
         "opened_at": None,
         "fill_price": None,
     }
-    save_paper_trade(trade)
-    return trade
+    status, result = open_trade_if_room(trade, MAX_OPEN_POSITIONS)
+    if status == "at_capacity":
+        return None
+    return result  # "opened" -> this trade; "already_exists" -> the original one
 
 
 def _nearest_target(direction: str, targets: list[float]) -> float | None:

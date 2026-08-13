@@ -64,6 +64,31 @@ day can't quietly consume the whole drawdown budget. Both stages
 accept an optional daily_loss_used parameter the same way, defaulting
 to 0.0 when not supplied (there's no prior env var for this — it's a
 new control, not a migration of an existing manual one).
+
+Tier 3.3 (account-wide atomic position/risk limits, second external
+review's items 6-7): two more fixes.
+
+  1. current_open_positions, passed in by main.py, is now the
+     ACCOUNT-WIDE live open/pending trade count (app/paper_trades.py's
+     get_account_open_trade_count()) instead of one scoped to a single
+     symbol+timeframe — MAX_OPEN_POSITIONS is a single account-wide
+     budget, the same reasoning current_drawdown_used/daily_loss_used
+     already followed. This module itself didn't need to change for
+     that — it always just compared open_positions >= MAX_OPEN_POSITIONS,
+     whatever scope the caller's count represents; only the CALLER's
+     count changed. The real, atomic enforcement of this limit lives in
+     app/storage.py's open_trade_if_room(), not here — this gate stage
+     stays what it always was: a free, advisory pre-check before
+     Execution's paid LLM call, not the actual commit point.
+  2. size_position()'s budget_for_trade used to be ONLY
+     RISK_FRACTION_PER_TRADE of remaining drawdown room — a trade could
+     be approved for more than what's actually left in TODAY's loss
+     allowance as long as overall drawdown room was still generous.
+     budget_for_trade is now min(drawdown_budget, remaining_daily_loss_room)
+     — whichever constraint is tighter right now — with the binding one
+     recorded in key_data.budget_binding_constraint and flagged
+     "daily_loss_room_binding" when it's the daily-loss side that
+     capped (or rejected) the trade.
 """
 
 import os
@@ -339,7 +364,20 @@ def size_position(
 
     risk_per_contract = risk_per_unit * MNQ_POINT_VALUE
     proposed_risk = risk_per_contract * BASE_POSITION_SIZE
-    budget_for_trade = remaining_room * RISK_FRACTION_PER_TRADE
+
+    # Tier 3.3 (external review's item 7 — "size bounded by the
+    # smallest remaining budget, including daily-loss room"):
+    # RISK_FRACTION_PER_TRADE of remaining_room used to be the ONLY
+    # budget a trade was sized against — a trade could be approved for
+    # more than what's actually left in today's loss allowance, as
+    # long as overall drawdown room was still generous. The real
+    # spendable budget for this trade is now whichever constraint is
+    # tighter right now.
+    drawdown_budget = remaining_room * RISK_FRACTION_PER_TRADE
+    budget_for_trade = min(drawdown_budget, remaining_daily_loss_room)
+    binding_constraint = (
+        "daily_loss_room" if remaining_daily_loss_room < drawdown_budget else "drawdown_room"
+    )
 
     account_snapshot.update(
         {
@@ -347,7 +385,9 @@ def size_position(
             "stop_loss": stop_loss,
             "stop_distance_points": round(risk_per_unit, 2),
             "risk_per_contract_usd": round(risk_per_contract, 2),
+            "drawdown_budget_usd": round(drawdown_budget, 2),
             "budget_for_this_trade_usd": round(budget_for_trade, 2),
+            "budget_binding_constraint": binding_constraint,
         }
     )
 
@@ -364,10 +404,12 @@ def size_position(
             reasoning=(
                 f"Estimated risk ${proposed_risk:.2f} for {BASE_POSITION_SIZE} contract(s), sized from "
                 f"the actual stop distance ({risk_per_unit:.2f} pts), is within the ${budget_for_trade:.2f} "
-                f"budget for this trade ({RISK_FRACTION_PER_TRADE:.0%} of remaining drawdown room)."
+                f"budget for this trade (the tighter of {RISK_FRACTION_PER_TRADE:.0%} of remaining drawdown "
+                f"room=${drawdown_budget:.2f} and remaining daily-loss room=${remaining_daily_loss_room:.2f} "
+                f"— binding constraint: {binding_constraint})."
             ),
             key_data=account_snapshot,
-            flags=["sized_from_actual_stop"],
+            flags=["sized_from_actual_stop"] + (["daily_loss_room_binding"] if binding_constraint == "daily_loss_room" else []),
         )
 
     max_affordable_size = int(budget_for_trade // risk_per_contract)
@@ -383,12 +425,14 @@ def size_position(
             suggested_size=max_affordable_size,
             reasoning=(
                 f"{BASE_POSITION_SIZE} contract(s) at the actual stop distance ({risk_per_unit:.2f} pts) "
-                f"would risk ${proposed_risk:.2f}, over the ${budget_for_trade:.2f} budget. Reducing to "
-                f"{max_affordable_size} contract(s) (~${risk_per_contract * max_affordable_size:.2f}) "
-                "stays within budget."
+                f"would risk ${proposed_risk:.2f}, over the ${budget_for_trade:.2f} budget (the tighter of "
+                f"{RISK_FRACTION_PER_TRADE:.0%} of remaining drawdown room=${drawdown_budget:.2f} and "
+                f"remaining daily-loss room=${remaining_daily_loss_room:.2f} — binding constraint: "
+                f"{binding_constraint}). Reducing to {max_affordable_size} contract(s) "
+                f"(~${risk_per_contract * max_affordable_size:.2f}) stays within budget."
             ),
             key_data=account_snapshot,
-            flags=["size_reduced", "sized_from_actual_stop"],
+            flags=["size_reduced", "sized_from_actual_stop"] + (["daily_loss_room_binding"] if binding_constraint == "daily_loss_room" else []),
         )
 
     return RiskOpinion(
@@ -402,8 +446,9 @@ def size_position(
         suggested_size=None,
         reasoning=(
             f"Even 1 contract at the actual stop distance ({risk_per_unit:.2f} pts, ~${risk_per_contract:.2f}) "
-            f"exceeds the ${budget_for_trade:.2f} budget for this trade — no safe size available right now."
+            f"exceeds the ${budget_for_trade:.2f} budget for this trade (binding constraint: "
+            f"{binding_constraint}) — no safe size available right now."
         ),
         key_data=account_snapshot,
-        flags=["budget_too_small_for_min_size", "sized_from_actual_stop"],
+        flags=["budget_too_small_for_min_size", "sized_from_actual_stop"] + (["daily_loss_room_binding"] if binding_constraint == "daily_loss_room" else []),
     )

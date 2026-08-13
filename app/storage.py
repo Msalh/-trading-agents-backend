@@ -654,6 +654,37 @@ def _row_to_trade(row: sqlite3.Row) -> dict:
     }
 
 
+def _insert_paper_trade_row(conn: sqlite3.Connection, trade: dict) -> None:
+    """Shared INSERT body for save_paper_trade() and the atomic
+    open_trade_if_room() below — same statement, different connection/
+    transaction-management wrapped around it."""
+    conn.execute(
+        """
+        INSERT INTO paper_trades
+            (trade_id, candidate_id, symbol, timeframe, direction, size,
+             order_type, entry_price, stop_loss, targets_json, status,
+             order_submitted_at, opened_at, fill_price)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            trade["trade_id"],
+            trade["candidate_id"],
+            trade["symbol"],
+            trade["timeframe"],
+            trade["direction"],
+            trade["size"],
+            trade["order_type"],
+            trade["entry_price"],
+            trade["stop_loss"],
+            json.dumps(trade["targets"]),
+            trade["status"],
+            trade.get("order_submitted_at"),
+            trade.get("opened_at"),
+            trade.get("fill_price"),
+        ),
+    )
+
+
 def save_paper_trade(trade: dict) -> None:
     """Inserts a new paper trade — one row per opened candidate.
 
@@ -667,35 +698,101 @@ def save_paper_trade(trade: dict) -> None:
     stay NULL until process_new_bar() fills the order against a real
     subsequent bar. This function itself stays generic (inserts
     whatever status/fields it's given) so existing tests that build a
-    trade dict directly and pre-set status="open" keep working."""
+    trade dict directly and pre-set status="open" keep working.
+
+    Tier 3.3: this plain insert is no longer how
+    open_trade_from_candidate() actually commits a new trade — that
+    now goes through open_trade_if_room() below, which needs the
+    idempotency/capacity check and the insert to be one atomic
+    transaction. save_paper_trade() is kept for callers (tests, and
+    any future caller) that don't need that guarantee and just want to
+    insert a fully-formed trade row directly."""
     conn = get_connection()
     try:
-        conn.execute(
-            """
-            INSERT INTO paper_trades
-                (trade_id, candidate_id, symbol, timeframe, direction, size,
-                 order_type, entry_price, stop_loss, targets_json, status,
-                 order_submitted_at, opened_at, fill_price)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                trade["trade_id"],
-                trade["candidate_id"],
-                trade["symbol"],
-                trade["timeframe"],
-                trade["direction"],
-                trade["size"],
-                trade["order_type"],
-                trade["entry_price"],
-                trade["stop_loss"],
-                json.dumps(trade["targets"]),
-                trade["status"],
-                trade.get("order_submitted_at"),
-                trade.get("opened_at"),
-                trade.get("fill_price"),
-            ),
-        )
+        _insert_paper_trade_row(conn, trade)
         conn.commit()
+    finally:
+        conn.close()
+
+
+def get_open_or_pending_trade_count() -> int:
+    """Tier 3.3: ACCOUNT-WIDE count of trades still live (pending_fill
+    or open), across every symbol/timeframe — not scoped like
+    get_open_or_pending_trades() below. This is what MAX_OPEN_POSITIONS
+    actually gates against now: the second external review's finding
+    was that the old per-symbol+timeframe count let two different
+    symbols each independently reach "the limit" and open a combined
+    total well past it, when the account's position-limit budget is a
+    single account-wide number (the same reasoning Tier 2.10 already
+    applied to drawdown/daily-loss). This read is advisory only — used
+    for Risk's free "gate" pre-check before Execution runs, where no
+    trade is being committed yet. The actual enforcement happens
+    atomically in open_trade_if_room()."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) as c FROM paper_trades WHERE status IN ('pending_fill', 'open')"
+        ).fetchone()
+        return row["c"]
+    finally:
+        conn.close()
+
+
+def open_trade_if_room(trade: dict, max_open_positions: int) -> tuple[str, Optional[dict]]:
+    """Tier 3.3: the single atomic commit point for opening a paper
+    trade. Folds BOTH checks open_trade_from_candidate() used to make
+    as two separate, non-atomic operations into one BEGIN IMMEDIATE
+    transaction:
+
+      - idempotency: does this candidate_id already have a trade?
+      - account-wide capacity: are we already at max_open_positions
+        live (pending_fill/open) trades, across every symbol/timeframe?
+
+    Both were separately flagged by the second external review as
+    race-prone: two near-simultaneous calls for the SAME candidate
+    could each pass the idempotency check before either had inserted
+    (opening two trades for one candidate); two DIFFERENT candidates
+    could each pass the capacity check before either had inserted
+    (opening one more position than max_open_positions allows).
+    BEGIN IMMEDIATE grabs SQLite's write lock for the whole
+    check-then-insert sequence, not just the insert, so a second
+    concurrent caller is serialized behind this one rather than racing
+    it — it either sees the row this call just committed (idempotency
+    catches it) or the capacity this call just consumed (capacity
+    catches it), never a stale pre-commit view of either.
+
+    Returns (status, trade):
+      - ("opened", trade) — inserted; trade is the dict passed in.
+      - ("already_exists", existing_trade) — this candidate_id already
+        had a trade; the ORIGINAL trade is returned, never a new one.
+      - ("at_capacity", None) — max_open_positions already reached
+        account-wide; nothing was inserted."""
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 5000")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        existing_row = conn.execute(
+            "SELECT * FROM paper_trades WHERE candidate_id = ?", (trade["candidate_id"],)
+        ).fetchone()
+        if existing_row is not None:
+            conn.execute("ROLLBACK")
+            return "already_exists", _row_to_trade(existing_row)
+
+        count = conn.execute(
+            "SELECT COUNT(*) as c FROM paper_trades WHERE status IN ('pending_fill', 'open')"
+        ).fetchone()["c"]
+        if count >= max_open_positions:
+            conn.execute("ROLLBACK")
+            return "at_capacity", None
+
+        _insert_paper_trade_row(conn, trade)
+        conn.execute("COMMIT")
+        return "opened", trade
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
     finally:
         conn.close()
 

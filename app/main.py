@@ -291,9 +291,36 @@ outcome" convention this module already used for stop-vs-target
 ordering, extended to gaps). COMMISSION_PER_CONTRACT (round-trip) is
 subtracted from every closed trade's pnl_usd. app/outcomes.py updated
 to handle the new "cancelled" trade status distinctly from "pending".
-Still not in scope (Tier 3.3, per the review's ordering): account-wide
-atomic position/risk limits, and sizing bounded by the smaller of
-drawdown room and remaining daily-loss room.
+
+Tier 3.3 (account-wide atomic position/risk limits, same second
+review — items 6-7 of the user's own recommended ordering, the last
+items in that sequence): two fixes, closing the review's "MAX_OPEN_POSITIONS
+not account-wide" and "position-limit enforcement race-prone"
+findings, plus the daily-loss-bounded sizing gap.
+  1. MAX_OPEN_POSITIONS is now enforced account-wide, not per
+     symbol+timeframe — two different symbols could previously each
+     independently reach "the limit", letting the account's combined
+     open-position count run well past it. New
+     app/storage.open_trade_if_room() is the single atomic commit
+     point: one BEGIN IMMEDIATE transaction folds the idempotency
+     check (does this candidate already have a trade?), the
+     account-wide capacity check, and the insert into one operation,
+     closing the exact count-then-insert race the review flagged —
+     previously two separate, non-atomic steps in
+     app/paper_trades.open_trade_from_candidate().
+  2. size_position()'s trade-size budget used to be only
+     RISK_FRACTION_PER_TRADE of remaining drawdown room — a trade could
+     be sized past what's actually left in TODAY's daily-loss allowance
+     as long as overall drawdown room was still generous. It's now
+     min(that drawdown-room budget, remaining daily-loss room),
+     whichever is tighter, recorded in the risk opinion's
+     key_data.budget_binding_constraint and flagged
+     "daily_loss_room_binding" when the daily-loss side is what capped
+     (or rejected) the trade.
+Per the user's own explicit instruction, COORDINATOR_THRESHOLD itself
+was NOT touched in this tier or the two before it — tuning it is
+intentionally the last item in the full sequence, after paper trading
+is realistic enough to learn from.
 
 This backend is intentionally standalone — no dependency on any
 other existing project.
@@ -332,7 +359,7 @@ from app.outcomes import (
     compute_outcomes_for_decision,
     summarize_outcomes,
 )
-from app.paper_trades import get_open_trade_count, open_trade_from_candidate, process_new_bar
+from app.paper_trades import get_account_open_trade_count, open_trade_from_candidate, process_new_bar
 from app.replay import replay_candidate, replay_candidates_for_symbol, summarize_replay
 from app.risk_agent import (
     ACCOUNT_BALANCE,
@@ -1164,6 +1191,15 @@ def risk_evaluate(
     against a real subsequent bar (see app/paper_trades.py), never
     instantly at candidate-creation time.
 
+    Tier 3.3: that live count is now ACCOUNT-WIDE
+    (get_account_open_trade_count(), every symbol/timeframe) instead of
+    scoped to this one symbol+timeframe — MAX_OPEN_POSITIONS is a
+    single account-wide budget. This gate-stage check stays advisory
+    (Execution's LLM call happens after it, during which another
+    candidate could commit); the real, atomic enforcement is
+    open_trade_from_candidate()'s call into
+    storage.open_trade_if_room() below.
+
     Tier 3.1 (causal integrity): once a paper trade has been committed
     from this candidate, its risk_json is locked — calling this again
     (a dashboard double-click, a retry) no longer re-runs the gate/size
@@ -1208,7 +1244,7 @@ def risk_evaluate(
             daily_loss_used=daily_loss_used,
         )
     else:
-        open_positions = get_open_trade_count(symbol=symbol, timeframe=timeframe)
+        open_positions = get_account_open_trade_count()
         risk_opinion = evaluate_risk_gate(
             symbol=symbol,
             timeframe=timeframe,
