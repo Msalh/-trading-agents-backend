@@ -267,6 +267,34 @@ realism (ready_now/market fills, no order expiry, no
 commissions/slippage), and event-time vs. processing-time trade
 timestamps — see the second review's Priority 2/3 findings.
 
+Tier 3.2 (fill realism, same second review, Priority 2 — items 1-5 of
+the user's own recommended ordering): app/paper_trades.py reworked
+substantially. Every order — market or limit — now starts
+"pending_fill" and only fills against a REAL subsequent bar;
+ready_now is no longer a fill trigger (Execution's own belief a limit
+is "ready" doesn't prove the market traded there), and a market order
+fills at the NEXT bar's open rather than instantly at candidate-
+creation time (the anchor bar has already closed, so filling "into"
+it would be lookahead bias). Every lifecycle timestamp
+(order_submitted_at/opened_at/closed_at) is now the triggering bar's
+own EVENT time, not server-processing time — new *_processed columns
+keep the server timestamp too, but purely as operational data, never
+read by trading logic (this also fixes daily-loss trading-day
+attribution, which reads these same fields). New ORDER_EXPIRY_MINUTES
+cancels a pending order that never filled instead of leaving it
+resting forever. Fill/exit pricing is more realistic: market entries
+and stop exits apply SLIPPAGE_POINTS against the trader (a stop is
+effectively a market order once triggered); a stop is also gap-
+adjusted (if the bar's open already breached it, the realistic exit
+is the open, not the stop price — same "never assume the better
+outcome" convention this module already used for stop-vs-target
+ordering, extended to gaps). COMMISSION_PER_CONTRACT (round-trip) is
+subtracted from every closed trade's pnl_usd. app/outcomes.py updated
+to handle the new "cancelled" trade status distinctly from "pending".
+Still not in scope (Tier 3.3, per the review's ordering): account-wide
+atomic position/risk limits, and sizing bounded by the smaller of
+drawdown room and remaining daily-loss room.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -1127,11 +1155,14 @@ def risk_evaluate(
     Tier 2.3: the gate stage's position-limit check now uses the LIVE
     count of open/pending paper trades (app/paper_trades.py) instead
     of only the static CURRENT_OPEN_POSITIONS env var. And when the
-    size stage approves or modifies, a paper trade is opened right
+    size stage approves or modifies, a paper ORDER is submitted right
     here as a side effect — that's the natural commit point: Risk
     deciding a real size IS the decision to actually take the trade
     (paper-only, so there's no reason to gate that behind a further
-    manual step).
+    manual step). As of Tier 3.2, this only ever creates a
+    status="pending_fill" order, even for a market order — it fills
+    against a real subsequent bar (see app/paper_trades.py), never
+    instantly at candidate-creation time.
 
     Tier 3.1 (causal integrity): once a paper trade has been committed
     from this candidate, its risk_json is locked — calling this again

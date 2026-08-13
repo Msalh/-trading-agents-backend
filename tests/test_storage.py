@@ -131,3 +131,71 @@ def test_init_db_migration_is_idempotent_on_an_existing_db(fresh_storage):
         decision={"decision": "no_trade"},
     )
     assert storage.get_candidate_by_id("c1")["risk_history"] == []
+
+
+# ---------------------------------------------------------------------------
+# Tier 3.2: paper_trades migration (order_submitted_at/opened_at_processed/
+# closed_at_processed) and cancel_trade()
+# ---------------------------------------------------------------------------
+
+def test_paper_trades_migration_is_idempotent_on_an_existing_db(fresh_storage):
+    """Same idempotent-ALTER-TABLE guarantee as the trade_candidates
+    migration above, but for the three Tier 3.2 paper_trades columns
+    -- a second init_db() call (e.g. app restart) must not raise even
+    though the columns already exist from the first call."""
+    storage = fresh_storage
+    storage.init_db()  # fixture already called it once; a second call must not raise
+    storage.save_paper_trade({
+        "trade_id": "t1", "candidate_id": "c1", "symbol": "TEST", "timeframe": "5m",
+        "direction": "bullish", "size": 1, "order_type": "market",
+        "entry_price": 100.0, "stop_loss": 95.0, "targets": [110.0],
+        "status": "pending_fill", "order_submitted_at": "2026-08-13T10:00:00Z",
+    })
+    trade = storage.get_trade_by_id("t1")
+    assert trade["order_submitted_at"] == "2026-08-13T10:00:00Z"
+    assert trade["opened_at_processed"] is None
+    assert trade["closed_at_processed"] is None
+
+
+def test_cancel_trade_marks_pending_order_cancelled(fresh_storage):
+    storage = fresh_storage
+    storage.save_paper_trade({
+        "trade_id": "t1", "candidate_id": "c1", "symbol": "TEST", "timeframe": "5m",
+        "direction": "bullish", "size": 1, "order_type": "limit",
+        "entry_price": 100.0, "stop_loss": 95.0, "targets": [110.0],
+        "status": "pending_fill", "order_submitted_at": "2026-08-13T10:00:00Z",
+    })
+
+    result = storage.cancel_trade("t1", cancelled_at="2026-08-13T11:00:00Z", reason="expired_unfilled")
+    assert result is True
+
+    trade = storage.get_trade_by_id("t1")
+    assert trade["status"] == "cancelled"
+    assert trade["exit_reason"] == "expired_unfilled"
+    assert trade["closed_at"] == "2026-08-13T11:00:00Z"
+    # A cancelled order was never filled -- nothing to realize a price/P&L against.
+    assert trade["exit_price"] is None
+    assert trade["pnl_usd"] is None
+
+
+def test_cancel_trade_is_a_noop_on_a_trade_that_already_filled(fresh_storage):
+    """Idempotency/race guard, same pattern as close_trade only
+    affecting 'open' rows: an order that filled in the meantime (e.g.
+    a duplicate/retried bar delivery) must not be retroactively
+    cancelled out from under an already-open position."""
+    storage = fresh_storage
+    storage.save_paper_trade({
+        "trade_id": "t1", "candidate_id": "c1", "symbol": "TEST", "timeframe": "5m",
+        "direction": "bullish", "size": 1, "order_type": "market",
+        "entry_price": 100.0, "stop_loss": 95.0, "targets": [110.0],
+        "status": "open", "opened_at": "2026-08-13T10:05:00Z", "fill_price": 100.25,
+    })
+
+    result = storage.cancel_trade("t1", cancelled_at="2026-08-13T11:00:00Z", reason="expired_unfilled")
+    assert result is False
+    assert storage.get_trade_by_id("t1")["status"] == "open"
+
+
+def test_cancel_trade_returns_false_for_unknown_trade_id(fresh_storage):
+    storage = fresh_storage
+    assert storage.cancel_trade("no-such-trade", cancelled_at="2026-08-13T11:00:00Z", reason="expired_unfilled") is False

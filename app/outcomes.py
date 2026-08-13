@@ -174,6 +174,20 @@ def compute_outcome_for_candidate(candidate: dict, horizons: list[int] = None) -
             "outcome": outcome,
         }
 
+    if trade is not None and trade["status"] == "cancelled":
+        # Tier 3.2: an order that expired before it ever filled
+        # (ORDER_EXPIRY_MINUTES, app/paper_trades.py) — a real trade
+        # record exists, but no position was ever taken. Distinct from
+        # both "pending" (might still resolve) and a real win/loss/
+        # breakeven (nothing was ever filled to realize a P&L against).
+        return {
+            "source": "actual_trade",
+            "trade_id": trade["trade_id"],
+            "status": "cancelled",
+            "exit_reason": trade["exit_reason"],
+            "outcome": "cancelled",
+        }
+
     if trade is not None:
         # pending_fill or open — a real trade exists, it just hasn't
         # resolved yet. Distinct from "hypothetical": this candidate
@@ -208,7 +222,15 @@ def summarize_outcomes(outcomes: list[dict | None]) -> dict:
     into one number — a hypothetical guess and a real result answer
     different questions."""
     closed = [o for o in outcomes if o and o.get("source") == "actual_trade" and o.get("status") == "closed"]
-    pending_trades = [o for o in outcomes if o and o.get("source") == "actual_trade" and o.get("status") != "closed"]
+    # Tier 3.2: an expired/cancelled order never took a position — it
+    # belongs in neither "closed" (no P&L was ever realized) nor
+    # "still_open_or_pending" (it's resolved, just resolved as
+    # "never happened"), so it gets its own bucket.
+    cancelled = [o for o in outcomes if o and o.get("source") == "actual_trade" and o.get("status") == "cancelled"]
+    pending_trades = [
+        o for o in outcomes
+        if o and o.get("source") == "actual_trade" and o.get("status") not in ("closed", "cancelled")
+    ]
     hypothetical = [o for o in outcomes if o and o.get("source") == "hypothetical"]
 
     wins = [o for o in closed if o["outcome"] == "win"]
@@ -224,6 +246,7 @@ def summarize_outcomes(outcomes: list[dict | None]) -> dict:
         "total_pnl_usd": total_pnl,
         "avg_pnl_usd": round(total_pnl / len(closed), 2) if closed else None,
         "still_open_or_pending": len(pending_trades),
+        "cancelled_unfilled": len(cancelled),
     }
 
     horizon_accuracy: dict[int, dict] = {}

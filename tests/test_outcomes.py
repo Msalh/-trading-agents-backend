@@ -180,6 +180,27 @@ def test_candidate_outcome_real_loss_from_closed_trade(fresh_env):
     assert result["pnl_usd"] == -40.0
 
 
+def test_candidate_outcome_cancelled_for_expired_unfilled_trade(fresh_env):
+    """Tier 3.2: an order that expired before it ever filled
+    (paper_trades.ORDER_EXPIRY_MINUTES) has a real trade row, but no
+    position was ever taken -- must be reported distinctly from both
+    a real win/loss/breakeven (nothing was filled to realize a P&L
+    against) and "pending" (this IS resolved, just resolved as
+    "never happened")."""
+    storage, pt, outcomes = fresh_env
+    c = _candidate("c1", "TEST", "5m", "enter_long", datetime.now(timezone.utc))
+    trade = _trade("c1", "TEST", "5m", "bullish", 1, 20020.0, 20000.0, [20100.0])
+    trade["status"] = "pending_fill"
+    storage.save_paper_trade(trade)
+    storage.cancel_trade(trade["trade_id"], cancelled_at=_iso(datetime.now(timezone.utc)), reason="expired_unfilled")
+
+    result = outcomes.compute_outcome_for_candidate(c)
+    assert result["source"] == "actual_trade"
+    assert result["status"] == "cancelled"
+    assert result["exit_reason"] == "expired_unfilled"
+    assert result["outcome"] == "cancelled"
+
+
 def test_candidate_outcome_pending_for_still_open_trade(fresh_env):
     storage, pt, outcomes = fresh_env
     c = _candidate("c1", "TEST", "5m", "enter_long", datetime.now(timezone.utc))
@@ -227,6 +248,23 @@ def test_summarize_computes_real_win_rate_and_total_pnl(fresh_env):
     assert real["total_pnl_usd"] == 60.0
     assert real["win_rate"] == 0.5
     assert real["still_open_or_pending"] == 1
+
+
+def test_summarize_buckets_cancelled_separately_from_pending_and_closed(fresh_env):
+    """Tier 3.2: a cancelled/expired order must land in its own
+    cancelled_unfilled bucket -- neither closed_trades (no P&L was
+    ever realized) nor still_open_or_pending (it's fully resolved,
+    just resolved as "never happened")."""
+    storage, pt, outcomes = fresh_env
+    win = {"source": "actual_trade", "status": "closed", "outcome": "win", "pnl_usd": 100.0}
+    cancelled = {"source": "actual_trade", "status": "cancelled", "outcome": "cancelled", "exit_reason": "expired_unfilled"}
+    pending = {"source": "actual_trade", "status": "open", "outcome": "pending"}
+
+    summary = outcomes.summarize_outcomes([win, cancelled, pending])
+    real = summary["real_trades"]
+    assert real["closed_trades"] == 1
+    assert real["still_open_or_pending"] == 1
+    assert real["cancelled_unfilled"] == 1
 
 
 def test_summarize_computes_hypothetical_accuracy_per_horizon(fresh_env):

@@ -159,3 +159,58 @@ def test_live_drawdown_spans_all_symbols_not_just_one(fresh_storage):
 
     # cumulative: +100 (peak 100) -> -200 (peak still 100) -> drawdown 300
     assert account_risk.compute_current_drawdown_used() == 300.0
+
+
+# ---------------------------------------------------------------------------
+# Tier 3.2 integration: a paper trade closed via process_new_bar() (event
+# time) must feed the daily-loss trading-day bucketing by its EVENT time,
+# not by whenever the server actually happened to process the bar -- this
+# is the concrete payoff of sequencing event-time timestamps before
+# account-wide risk (Tier 3.3): the two features compose correctly with no
+# code changes needed in account_risk.py itself.
+# ---------------------------------------------------------------------------
+
+def test_paper_trade_close_feeds_daily_loss_by_event_time_not_server_time(fresh_storage):
+    storage, account_risk = fresh_storage
+    import importlib as _importlib
+    import app.paper_trades as paper_trades
+    _importlib.reload(paper_trades)
+
+    candidate = {
+        "candidate_id": "c1", "symbol": "MNQ1!", "timeframe": "5m",
+        # A fixed bar timestamp years in the past relative to whenever
+        # this test actually runs -- if anything in the chain used
+        # datetime.now() instead of the bar's own timestamp, this
+        # trade would show up bucketed under today's real date instead.
+        "bar": {"timestamp": "2020-01-01T14:00:00Z"},
+        "decision": {"direction": "bullish"},
+        "risk": {"suggested_size": 1},
+        "execution": {
+            "order_type": "market", "entry_price": 20000.0,
+            "stop_loss": 19990.0, "targets": [20050.0],
+        },
+    }
+    trade = paper_trades.open_trade_from_candidate(candidate)
+    assert trade["status"] == "pending_fill"
+
+    # Next bar fills the market order; a later bar hits the stop -- both
+    # still in EVENT-time January 2020.
+    paper_trades.process_new_bar("MNQ1!", "5m", {
+        "timestamp": "2020-01-01T14:05:00Z", "open": 20000.0, "high": 20010.0, "low": 19995.0,
+    })
+    changed = paper_trades.process_new_bar("MNQ1!", "5m", {
+        "timestamp": "2020-01-01T14:10:00Z", "open": 19985.0, "high": 19990.0, "low": 19980.0,
+    })
+    assert changed[0]["status"] == "closed"
+    assert changed[0]["exit_reason"] == "stop_hit"
+    assert changed[0]["closed_at"] == "2020-01-01T14:10:00Z"  # event time, not real "now"
+
+    # Bucketed under the EVENT day it actually closed on...
+    event_day_pnl = account_risk.compute_realized_pnl_today("2020-01-01T18:00:00Z")
+    assert event_day_pnl != 0.0
+
+    # ...and NOT under today's real trading day, which is what would
+    # happen if closed_at had been stamped with server-processing time
+    # instead of the bar's own event time.
+    real_today_pnl = account_risk.compute_realized_pnl_today("2026-08-13T18:00:00Z")
+    assert real_today_pnl == 0.0

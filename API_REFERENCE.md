@@ -176,25 +176,48 @@ Analysis won't auto-run even during nominal kill-zone clock hours) and
     LLM at all (checked before `plan_execution()` runs, so a re-call
     never spends a paid Execution call it can't use).
 
-### Trades (paper fill/P&L lifecycle, Tier 2.3) — read-only, no secret needed
-A paper trade opens automatically the moment `/agents/risk/evaluate`'s
-size stage returns `approve`/`modify` — there's no separate "open
-trade" endpoint to call. Every new webhook bar (regardless of Timing/
-kill-zone gating — price doesn't pause outside a kill zone) advances
-every live trade: fills a `pending_fill` limit order once price
-reaches it, and closes an `open` trade on a stop or nearest-target
-hit, computing `pnl_usd = |exit − fill| × $2/pt × size` (sign per
-direction). A bar that spans both stop and target in one move is
-treated as the stop having been hit first (conservative — OHLC bars
-don't carry true intrabar order). Only the nearest target is checked;
-a multi-target plan fully closes at the first one reached, no partial
-scale-out modeling yet.
+### Trades (paper fill/P&L lifecycle, Tier 2.3; fill realism, Tier 3.2) — read-only, no secret needed
+A paper ORDER is submitted automatically the moment
+`/agents/risk/evaluate`'s size stage returns `approve`/`modify` —
+there's no separate "open trade" endpoint to call. As of Tier 3.2,
+every order (market or limit) starts `pending_fill` — even a market
+order no longer fills instantly; it fills at the NEXT bar's open
+(filling into the already-closed anchor bar would be lookahead bias).
+Every new webhook bar (regardless of Timing/kill-zone gating — price
+doesn't pause outside a kill zone) advances every live trade: fills a
+`pending_fill` order (market fills unconditionally at the bar's open;
+a limit fills once price actually reaches it), and closes an `open`
+trade on a stop or nearest-target hit.
+- Market entries and stop-loss exits apply `SLIPPAGE_POINTS` against
+  the trader (a stop is effectively a market order once triggered);
+  limit and target fills stay exact, no slippage.
+- A stop is gap-adjusted: if the bar's `open` already breached it, the
+  realistic exit is the `open` (worse for the trader), not the stop
+  price itself.
+- `pnl_usd = (|exit_price − fill_price| × $2/pt × size) −
+  (COMMISSION_PER_CONTRACT × size)` (sign per direction) — a flat
+  round-trip commission is subtracted on every close.
+- A `pending_fill` order that hasn't filled within
+  `ORDER_EXPIRY_MINUTES` of EVENT time (not wall-clock) is
+  auto-cancelled (`status="cancelled"`, `exit_reason="expired_unfilled"`)
+  instead of resting forever, freeing its position-limit slot.
+- A bar that spans both stop and target in one move is treated as the
+  stop having been hit first (conservative — OHLC bars don't carry
+  true intrabar order). Only the nearest target is checked; a
+  multi-target plan fully closes at the first one reached, no partial
+  scale-out modeling yet.
+- All lifecycle timestamps (`order_submitted_at`/`opened_at`/`closed_at`)
+  are the triggering bar's own EVENT time — `created_at` and the two
+  new `*_processed` fields are server-processing time, operational
+  data only, never used in fill/expiry/P&L logic.
 - `GET /trades/open?symbol=MNQ1!&timeframe=5m` — trades still live
   (`pending_fill` or `open`).
 - `GET /trades/history?symbol=MNQ1!&timeframe=5m&limit=20` — closed
   trades, newest first, with `exit_price` / `exit_reason`
-  (`stop_hit` | `target_hit`) / `pnl_usd`.
-- `GET /trades/{trade_id}` — a single trade by id.
+  (`stop_hit` | `target_hit`) / `pnl_usd`. Cancelled/expired orders are
+  not included here (nothing was ever filled) — fetch a specific one
+  via `GET /trades/{trade_id}` if needed.
+- `GET /trades/{trade_id}` — a single trade by id, any status.
 
 `CURRENT_OPEN_POSITIONS` is now a fallback only — Risk's gate stage
 uses the LIVE count from this table (`get_open_trade_count`) by
@@ -243,17 +266,22 @@ only a fallback for candidates that never became a trade at all
   "win"|"loss"|"breakeven", "pnl_usd": ..., "exit_reason": ...}` for a
   candidate that became a real, resolved trade; `{"source":
   "actual_trade", "status": "open"|"pending_fill", "outcome":
-  "pending"}` for one still live; or `{"source": "hypothetical",
-  "horizons": {...}}` (the old per-horizon `correct`/`incorrect`/
-  `flat`/`pending`/`no_data` estimate) for a candidate that never
-  became a trade. `horizons` only affects the hypothetical fallback.
+  "pending"}` for one still live; `{"source": "actual_trade", "status":
+  "cancelled", "outcome": "cancelled", "exit_reason":
+  "expired_unfilled"}` (Tier 3.2) for an order that expired before it
+  ever filled — a real order existed, but no position was ever taken,
+  so it's neither a resolved trade nor a hypothetical guess; or
+  `{"source": "hypothetical", "horizons": {...}}` (the old per-horizon
+  `correct`/`incorrect`/`flat`/`pending`/`no_data` estimate) for a
+  candidate that never became a trade at all. `horizons` only affects
+  the hypothetical fallback.
 - `GET /candidates/history/outcomes/summary?symbol=MNQ1!&timeframe=5m&limit=100`
   — aggregated: real win rate / total & average `pnl_usd` / count
-  still open from closed trades, and hypothetical direction-accuracy
-  per horizon for never-traded candidates — kept as two separate
-  sections, never blended into one number. Replaces manually pulling
-  and tallying `/coordinator/history` rows by hand for
-  `COORDINATOR_THRESHOLD` tuning.
+  still open / count cancelled-unfilled (Tier 3.2) from closed trades,
+  and hypothetical direction-accuracy per horizon for never-traded
+  candidates — kept as two separate sections, never blended into one
+  number. Replaces manually pulling and tallying `/coordinator/history`
+  rows by hand for `COORDINATOR_THRESHOLD` tuning.
 - `GET /coordinator/history/outcomes` (Sprint 14, unchanged) still
   works exactly as before — it reads the older `coordinator_decisions`
   table, which has no `candidate_id` to link a real trade to, so it's
@@ -412,6 +440,9 @@ flipped?" before reading individual replayed candidates.
 | `BASE_POSITION_SIZE` | no | `1` | contracts |
 | `RISK_FRACTION_PER_TRADE` | no | `0.5` | fraction of remaining drawdown room risked per trade |
 | `DAILY_LOSS_LIMIT` | no | `1000` | Tier 2.10: new time-boxed circuit breaker, live-computed from trades closed on the current NY/CME trading day — no manual updating needed |
+| `ORDER_EXPIRY_MINUTES` | no | `60` | Tier 3.2: cancels a `pending_fill` order after this many EVENT-time minutes unfilled |
+| `SLIPPAGE_POINTS` | no | `0.25` | Tier 3.2: applied against the trader on market entries and stop-loss exits only |
+| `COMMISSION_PER_CONTRACT` | no | `2.0` | Tier 3.2: flat round-trip commission, subtracted from `pnl_usd` on every closed trade |
 
 ---
 
@@ -426,10 +457,12 @@ flipped?" before reading individual replayed candidates.
 6. GET  /agents/risk/evaluate?...     -> gate stage: pending_execution / reject / no_action
 7. GET  /agents/execution/plan?...    -> order_type / entry_price / stop_loss / targets
 8. GET  /agents/risk/evaluate?...     -> size stage: approve / modify / reject
-                                          -- a paper trade opens automatically here on approve/modify
-9. GET  /trades/open?...              -> confirm the position opened
+                                          -- a paper ORDER is submitted automatically here on approve/modify
+                                          (Tier 3.2: starts pending_fill even for a market order)
+9. GET  /trades/open?...              -> confirm the order exists (pending_fill)
    (later, on subsequent bars)
-10. GET /trades/history?...           -> once a stop/target is hit, the trade shows up here closed with pnl_usd
+10. GET /trades/open?...              -> once a real bar fills it, status flips to open
+11. GET /trades/history?...           -> once a stop/target is hit, the trade shows up here closed with pnl_usd
 ```
 
 In production with `ENABLE_SCHEDULER=true`, steps 1–4 happen on

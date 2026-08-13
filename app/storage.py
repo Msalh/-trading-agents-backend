@@ -86,9 +86,12 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     targets_json TEXT NOT NULL,
     status TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    order_submitted_at TEXT,
     opened_at TEXT,
+    opened_at_processed TEXT,
     fill_price REAL,
     closed_at TEXT,
+    closed_at_processed TEXT,
     exit_price REAL,
     exit_reason TEXT,
     pnl_usd REAL
@@ -120,6 +123,15 @@ def init_db() -> None:
         for column in ("risk_history_json", "execution_history_json"):
             try:
                 conn.execute(f"ALTER TABLE trade_candidates ADD COLUMN {column} TEXT")
+            except sqlite3.OperationalError as e:
+                if "duplicate column name" not in str(e):
+                    raise
+        # Tier 3.2: event-time trade lifecycle timestamps, distinct
+        # from the server-processing ones (created_at already existed
+        # and stays the server-insert time; these three are new).
+        for column in ("order_submitted_at", "opened_at_processed", "closed_at_processed"):
+            try:
+                conn.execute(f"ALTER TABLE paper_trades ADD COLUMN {column} TEXT")
             except sqlite3.OperationalError as e:
                 if "duplicate column name" not in str(e):
                     raise
@@ -608,6 +620,7 @@ def attach_execution_result(candidate_id: str, execution_opinion: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def _row_to_trade(row: sqlite3.Row) -> dict:
+    row_keys = row.keys()
     return {
         "trade_id": row["trade_id"],
         "candidate_id": row["candidate_id"],
@@ -621,9 +634,20 @@ def _row_to_trade(row: sqlite3.Row) -> dict:
         "targets": json.loads(row["targets_json"]),
         "status": row["status"],
         "created_at": row["created_at"],
+        # Tier 3.2: order_submitted_at/opened_at/closed_at are EVENT
+        # time (the triggering bar's own timestamp) — what the trade
+        # lifecycle logic (fills, expiry, P&L, daily-loss bucketing)
+        # actually reasons about. created_at above and the two
+        # *_processed columns below are server-processing time —
+        # operational/debugging data only, never used for trading
+        # logic. row_keys guards let this keep working against a row
+        # from a DB that hasn't run the Tier 3.2 migration yet.
+        "order_submitted_at": row["order_submitted_at"] if "order_submitted_at" in row_keys else None,
         "opened_at": row["opened_at"],
+        "opened_at_processed": row["opened_at_processed"] if "opened_at_processed" in row_keys else None,
         "fill_price": row["fill_price"],
         "closed_at": row["closed_at"],
+        "closed_at_processed": row["closed_at_processed"] if "closed_at_processed" in row_keys else None,
         "exit_price": row["exit_price"],
         "exit_reason": row["exit_reason"],
         "pnl_usd": row["pnl_usd"],
@@ -632,10 +656,18 @@ def _row_to_trade(row: sqlite3.Row) -> dict:
 
 def save_paper_trade(trade: dict) -> None:
     """Inserts a new paper trade — one row per opened candidate.
-    status is "open" (market/ready-now orders, filled immediately) or
-    "pending_fill" (a limit order still waiting for price to reach
-    it). opened_at/fill_price are set now for an immediate fill, NULL
-    for pending_fill — process_new_bar() fills those in later."""
+
+    As of Tier 3.2, app/paper_trades.py always passes status=
+    "pending_fill" here — even market orders no longer fill
+    instantly at candidate-creation time (see that module's
+    docstring for why: the anchor bar has already closed by the time
+    this runs, so filling "into" it would be lookahead bias).
+    order_submitted_at is the EVENT time (the candidate's anchor bar
+    timestamp) the order was actually placed at; opened_at/fill_price
+    stay NULL until process_new_bar() fills the order against a real
+    subsequent bar. This function itself stays generic (inserts
+    whatever status/fields it's given) so existing tests that build a
+    trade dict directly and pre-set status="open" keep working."""
     conn = get_connection()
     try:
         conn.execute(
@@ -643,8 +675,8 @@ def save_paper_trade(trade: dict) -> None:
             INSERT INTO paper_trades
                 (trade_id, candidate_id, symbol, timeframe, direction, size,
                  order_type, entry_price, stop_loss, targets_json, status,
-                 opened_at, fill_price)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 order_submitted_at, opened_at, fill_price)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 trade["trade_id"],
@@ -658,6 +690,7 @@ def save_paper_trade(trade: dict) -> None:
                 trade["stop_loss"],
                 json.dumps(trade["targets"]),
                 trade["status"],
+                trade.get("order_submitted_at"),
                 trade.get("opened_at"),
                 trade.get("fill_price"),
             ),
@@ -749,19 +782,23 @@ def get_all_closed_trades_chronological() -> list[dict]:
         conn.close()
 
 
-def update_trade_fill(trade_id: str, fill_price: float, opened_at: str) -> bool:
-    """A pending_fill limit order's price has been reached — marks it
-    open at the limit price (standard paper-trading assumption: filled
-    exactly at the limit, no slippage modeled)."""
+def update_trade_fill(
+    trade_id: str, fill_price: float, opened_at: str, opened_at_processed: str | None = None
+) -> bool:
+    """A pending order's price has been reached (limit) or it's a
+    market order being filled at the next available bar (Tier 3.2) —
+    marks it open. opened_at is EVENT time (the filling bar's own
+    timestamp); opened_at_processed is when this server actually ran
+    the check, kept only as operational data."""
     conn = get_connection()
     try:
         cur = conn.execute(
             """
             UPDATE paper_trades
-            SET status = 'open', fill_price = ?, opened_at = ?
+            SET status = 'open', fill_price = ?, opened_at = ?, opened_at_processed = ?
             WHERE trade_id = ? AND status = 'pending_fill'
             """,
-            (fill_price, opened_at, trade_id),
+            (fill_price, opened_at, opened_at_processed, trade_id),
         )
         conn.commit()
         return cur.rowcount > 0
@@ -769,19 +806,57 @@ def update_trade_fill(trade_id: str, fill_price: float, opened_at: str) -> bool:
         conn.close()
 
 
-def close_trade(trade_id: str, exit_price: float, exit_reason: str, pnl_usd: float, closed_at: str) -> bool:
+def close_trade(
+    trade_id: str,
+    exit_price: float,
+    exit_reason: str,
+    pnl_usd: float,
+    closed_at: str,
+    closed_at_processed: str | None = None,
+) -> bool:
     """Realizes P&L and closes an open trade. Only affects rows still
     'open' — a trade already closed (e.g. a duplicate bar delivery
-    processed twice) is left untouched rather than double-closed."""
+    processed twice) is left untouched rather than double-closed.
+    closed_at is EVENT time as of Tier 3.2; closed_at_processed is the
+    server-processing timestamp, operational data only."""
     conn = get_connection()
     try:
         cur = conn.execute(
             """
             UPDATE paper_trades
-            SET status = 'closed', exit_price = ?, exit_reason = ?, pnl_usd = ?, closed_at = ?
+            SET status = 'closed', exit_price = ?, exit_reason = ?, pnl_usd = ?,
+                closed_at = ?, closed_at_processed = ?
             WHERE trade_id = ? AND status = 'open'
             """,
-            (exit_price, exit_reason, pnl_usd, closed_at, trade_id),
+            (exit_price, exit_reason, pnl_usd, closed_at, closed_at_processed, trade_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def cancel_trade(
+    trade_id: str, cancelled_at: str, reason: str, cancelled_at_processed: str | None = None
+) -> bool:
+    """Tier 3.2: an order still pending_fill after ORDER_EXPIRY_MINUTES
+    (event time) is cancelled rather than left resting forever — see
+    app/paper_trades.py. Only affects rows still 'pending_fill' — an
+    order that filled in the meantime is left alone, same idempotency
+    guarantee close_trade already has for 'open'. Reuses the
+    closed_at/closed_at_processed/exit_reason columns rather than
+    adding yet more — exit_price/pnl_usd stay NULL/unset, since a
+    cancelled order was never filled and has nothing to realize a
+    price or P&L against."""
+    conn = get_connection()
+    try:
+        cur = conn.execute(
+            """
+            UPDATE paper_trades
+            SET status = 'cancelled', exit_reason = ?, closed_at = ?, closed_at_processed = ?
+            WHERE trade_id = ? AND status = 'pending_fill'
+            """,
+            (reason, cancelled_at, cancelled_at_processed, trade_id),
         )
         conn.commit()
         return cur.rowcount > 0

@@ -1,6 +1,7 @@
 """
 Paper Trade Lifecycle — Tier 2.3 (external review's prioritized
-sequence, next after Tier 2.2).
+sequence, next after Tier 2.2). Reworked substantially in Tier 3.2
+(second external review, fill realism) — see that section below.
 
 Everything up through Execution/Risk produces an opinion about what
 SHOULD happen — nothing until now has tracked what actually happened
@@ -16,12 +17,13 @@ Two entry points:
     size stage returns approve/modify (see main.py). Idempotent per
     candidate_id: re-running Risk's size stage on the same candidate
     (e.g. a dashboard double-click) must never open a second position
-    for it.
+    for it. As of Tier 3.2, this only ever creates the ORDER
+    (status="pending_fill") — it no longer decides a fill happened.
   - process_new_bar() — called on EVERY new bar for a symbol/
     timeframe, unconditionally (not gated by the Timing/kill-zone
     check that gates Analysis). Price doesn't pause outside kill
-    zones, so neither should stop/target monitoring for a trade
-    that's already open.
+    zones, so neither should fill/stop/target monitoring for an order
+    that's already resting or a trade that's already open.
 
 Order-of-events assumption: when a single bar's high/low range
 contains BOTH the stop and the nearest target, the stop is assumed to
@@ -41,7 +43,54 @@ MAX_OPEN_POSITIONS is enforced here as the final gate before actually
 committing a paper position — Risk's gate stage (evaluate_risk_gate)
 already checks it earlier using the same get_open_trade_count(), but
 double-checking here means a race between two nearly-simultaneous
-candidates can't both slip through and open two positions.
+candidates can't both slip through and open two positions. (Still
+scoped per symbol+timeframe, not account-wide — that's Tier 3.3.)
+
+Tier 3.2 (second external review, "paper fills were still materially
+unrealistic"): four changes, all aimed at the same goal — a closed
+paper trade's pnl_usd should be defensible as a realistic estimate,
+not just an exactly-computed but rigged number.
+
+  1. Event time, not server time. Every lifecycle timestamp
+     (order_submitted_at/opened_at/closed_at) is now the triggering
+     BAR's own timestamp, not datetime.now() at the moment this code
+     happened to run. Fill/expiry/close decisions, and the daily-loss
+     trading-day bucketing that reads them (app/account_risk.py), all
+     reason in event time now — a delayed or replayed bar is
+     attributed to when it actually happened, not to whenever the
+     server got around to processing it. Server-processing timestamps
+     are still recorded, but in separate *_processed columns, purely
+     as operational data — nothing in this module's trading logic
+     reads them.
+  2. ready_now is no longer a fill trigger. Execution's belief that a
+     limit is "ready" doesn't prove the market actually traded there.
+     Every order — market or limit — now starts "pending_fill" and
+     only fills against a REAL subsequent bar. For a market order that
+     means the very next bar's open (never the anchor bar itself,
+     which has already closed by the time this code runs — filling
+     "into" a bar that's already in the past would be lookahead bias).
+     For a limit order it means the same price-cross check as before,
+     just without the ready_now shortcut.
+  3. Pending orders expire. Before this tier a limit could rest
+     forever, filling hours or days after the setup that justified it
+     had long since stopped being true. ORDER_EXPIRY_MINUTES (event
+     time, measured from order_submitted_at) cancels it instead.
+  4. Realistic fill/exit pricing. Market entries and stop exits both
+     apply SLIPPAGE_POINTS against the trader (stops are effectively
+     market orders once triggered) — limit and target fills stay
+     exact, no slippage, since a resting order is filled at its stated
+     price by definition. A stop is also gap-adjusted: if a bar's OPEN
+     already breached the stop level, the realistic exit is the open
+     (worse for the trader), not the stop price itself — the existing
+     "never assume the better outcome" convention extended to gaps.
+     COMMISSION_PER_CONTRACT (round-trip) is subtracted from pnl_usd
+     on every close.
+
+Not solved in this tier (tracked for later, per the review's own
+ordering): fully transactional/account-wide position-limit reservation
+(Tier 3.3), and richer expiry policies (session-close / kill-zone-close
+/ setup-invalidation) — ORDER_EXPIRY_MINUTES is a plain fixed window,
+not any of those.
 """
 
 import os
@@ -49,6 +98,7 @@ import uuid
 from datetime import datetime, timezone
 
 from app.storage import (
+    cancel_trade,
     close_trade,
     get_open_or_pending_trades,
     get_trade_by_candidate_id,
@@ -60,9 +110,30 @@ MNQ_POINT_VALUE = 2.0  # USD per index point per contract (Micro E-mini Nasdaq-1
 
 MAX_OPEN_POSITIONS = int(os.environ.get("MAX_OPEN_POSITIONS", "1"))
 
+# Tier 3.2 additions. Defaults are deliberately conservative
+# approximations, not calibrated to a real broker's actual schedule —
+# tunable via env var like everything else in this project.
+ORDER_EXPIRY_MINUTES = int(os.environ.get("ORDER_EXPIRY_MINUTES", "60"))
+SLIPPAGE_POINTS = float(os.environ.get("SLIPPAGE_POINTS", "0.25"))  # ~1 tick on MNQ
+COMMISSION_PER_CONTRACT = float(os.environ.get("COMMISSION_PER_CONTRACT", "2.0"))  # round-trip, per contract
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_event_ts(ts: str) -> datetime:
+    return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+
+
+def _event_minutes_elapsed(earlier_ts: str, later_ts: str) -> float | None:
+    """None (never expire) on anything unparseable — expiry is a
+    destructive action (cancels a live order), so ambiguous/malformed
+    timestamps fail safe rather than triggering a cancel."""
+    try:
+        return (_parse_event_ts(later_ts) - _parse_event_ts(earlier_ts)).total_seconds() / 60
+    except (ValueError, AttributeError, TypeError):
+        return None
 
 
 def get_open_trade_count(symbol: str, timeframe: str) -> int:
@@ -73,14 +144,19 @@ def get_open_trade_count(symbol: str, timeframe: str) -> int:
 
 
 def open_trade_from_candidate(candidate: dict) -> dict | None:
-    """Opens a new paper trade from a candidate whose Risk result is
+    """Opens a new PENDING order from a candidate whose Risk result is
     approve/modify and whose Execution result is a validated
     status="planned" order. Returns the existing trade (not a new
     one) if this candidate already has one — idempotent by
     candidate_id. Returns None if the open-position limit is already
     at capacity (should be rare — Risk's gate stage already checked
     this before Execution even ran, but re-checked here as the last
-    line of defense against a race)."""
+    line of defense against a race).
+
+    Tier 3.2: always creates status="pending_fill", regardless of
+    order_type or Execution's ready_now flag — see the module
+    docstring for why. process_new_bar() is what actually fills it,
+    against a real subsequent bar."""
     candidate_id = candidate["candidate_id"]
     existing = get_trade_by_candidate_id(candidate_id)
     if existing is not None:
@@ -95,12 +171,11 @@ def open_trade_from_candidate(candidate: dict) -> dict | None:
     direction = candidate["decision"].get("direction")
     size = risk.get("suggested_size")
 
-    order_type = execution["order_type"]
-    entry_price = execution["entry_price"]
-    ready_now = execution.get("ready_now", order_type == "market")
-    is_immediate = order_type == "market" or bool(ready_now)
+    # The candidate's own anchor bar (Tier 3.1) — event time for when
+    # this order was actually submitted, not whenever this code
+    # happens to run.
+    anchor_bar = candidate.get("bar") or {}
 
-    now_iso = _now_iso()
     trade = {
         "trade_id": str(uuid.uuid4()),
         "candidate_id": candidate_id,
@@ -108,13 +183,14 @@ def open_trade_from_candidate(candidate: dict) -> dict | None:
         "timeframe": timeframe,
         "direction": direction,
         "size": size,
-        "order_type": order_type,
-        "entry_price": entry_price,
+        "order_type": execution["order_type"],
+        "entry_price": execution["entry_price"],  # Execution's PROPOSED price — reference only; fill_price is the realized one.
         "stop_loss": execution["stop_loss"],
         "targets": execution["targets"],
-        "status": "open" if is_immediate else "pending_fill",
-        "opened_at": now_iso if is_immediate else None,
-        "fill_price": entry_price if is_immediate else None,
+        "status": "pending_fill",
+        "order_submitted_at": anchor_bar.get("timestamp"),
+        "opened_at": None,
+        "fill_price": None,
     }
     save_paper_trade(trade)
     return trade
@@ -131,27 +207,72 @@ def _pnl_usd(direction: str, entry_price: float, exit_price: float, size: int) -
     return round(diff * MNQ_POINT_VALUE * size, 2)
 
 
+def _round_trip_commission(size: int) -> float:
+    return round(COMMISSION_PER_CONTRACT * size, 2)
+
+
+def _apply_entry_slippage(raw_price: float, order_type: str, direction: str) -> float:
+    """Only market fills get slippage — a limit order is filled at its
+    stated price by definition (that's what "limit" means), so there's
+    nothing to model there."""
+    if order_type != "market":
+        return raw_price
+    return round(raw_price + SLIPPAGE_POINTS, 4) if direction == "bullish" else round(raw_price - SLIPPAGE_POINTS, 4)
+
+
+def _apply_stop_slippage(raw_price: float, direction: str) -> float:
+    """A stop is effectively a market order once triggered — real
+    stops don't get a guaranteed price. Always moves the fill AGAINST
+    the trader, never in their favor."""
+    return round(raw_price - SLIPPAGE_POINTS, 4) if direction == "bullish" else round(raw_price + SLIPPAGE_POINTS, 4)
+
+
 def process_new_bar(symbol: str, timeframe: str, bar: dict) -> list[dict]:
     """Advances every live (pending_fill/open) trade for this
-    symbol/timeframe against one new bar's high/low range. Returns
-    the trades that changed state this call (filled and/or closed),
-    for logging — callers don't need to do anything with the return
-    value, storage is already updated."""
-    high, low = bar.get("high"), bar.get("low")
-    if high is None or low is None:
+    symbol/timeframe against one new bar's OHLC. Returns the trades
+    that changed state this call (filled/closed/cancelled), for
+    logging — callers don't need to do anything with the return
+    value, storage is already updated.
+
+    Tier 3.2: bar["timestamp"] is now the EVENT time recorded on every
+    state transition this function makes (fill, close, cancel) — see
+    the module docstring."""
+    high, low, open_ = bar.get("high"), bar.get("low"), bar.get("open")
+    bar_ts = bar.get("timestamp")
+    if high is None or low is None or open_ is None:
         return []
 
     changed: list[dict] = []
     for trade in get_open_or_pending_trades(symbol=symbol, timeframe=timeframe):
         if trade["status"] == "pending_fill":
-            entry = trade["entry_price"]
-            crossed = (low <= entry) if trade["direction"] == "bullish" else (high >= entry)
+            submitted_at = trade.get("order_submitted_at")
+            if submitted_at and bar_ts:
+                elapsed = _event_minutes_elapsed(submitted_at, bar_ts)
+                if elapsed is not None and elapsed >= ORDER_EXPIRY_MINUTES:
+                    cancel_trade(
+                        trade["trade_id"], cancelled_at=bar_ts, reason="expired_unfilled",
+                        cancelled_at_processed=_now_iso(),
+                    )
+                    changed.append({**trade, "status": "cancelled", "exit_reason": "expired_unfilled", "closed_at": bar_ts})
+                    continue
+
+            direction = trade["direction"]
+            if trade["order_type"] == "market":
+                crossed, raw_fill = True, open_  # unconditional — a market order fills wherever price is now
+            else:
+                entry = trade["entry_price"]
+                crossed = (low <= entry) if direction == "bullish" else (high >= entry)
+                raw_fill = entry
             if not crossed:
                 continue  # still waiting — no stop/target check until it's actually open
-            now_iso = _now_iso()
-            update_trade_fill(trade["trade_id"], fill_price=entry, opened_at=now_iso)
-            trade = {**trade, "status": "open", "fill_price": entry, "opened_at": now_iso}
+
+            fill_price = _apply_entry_slippage(raw_fill, trade["order_type"], direction)
+            update_trade_fill(trade["trade_id"], fill_price=fill_price, opened_at=bar_ts, opened_at_processed=_now_iso())
+            trade = {**trade, "status": "open", "fill_price": fill_price, "opened_at": bar_ts}
             changed.append(trade)
+
+        if trade["status"] != "open":
+            continue  # a limit that didn't cross this bar — still pending
 
         direction = trade["direction"]
         stop = trade["stop_loss"]
@@ -163,14 +284,27 @@ def process_new_bar(symbol: str, timeframe: str, bar: dict) -> list[dict]:
         target_hit = target is not None and ((high >= target) if direction == "bullish" else (low <= target))
 
         if stop_hit:
-            pnl = _pnl_usd(direction, fill_price, stop, size)
-            now_iso = _now_iso()
-            close_trade(trade["trade_id"], exit_price=stop, exit_reason="stop_hit", pnl_usd=pnl, closed_at=now_iso)
-            changed.append({**trade, "status": "closed", "exit_price": stop, "exit_reason": "stop_hit", "pnl_usd": pnl, "closed_at": now_iso})
+            # Gap-through-stop: if the bar's OPEN already breached the
+            # stop, that's the realistic (worse) fill — a real stop
+            # order doesn't get its exact requested price in a gap.
+            raw_exit = min(open_, stop) if direction == "bullish" else max(open_, stop)
+            exit_price = _apply_stop_slippage(raw_exit, direction)
+            pnl = _pnl_usd(direction, fill_price, exit_price, size) - _round_trip_commission(size)
+            close_trade(
+                trade["trade_id"], exit_price=exit_price, exit_reason="stop_hit", pnl_usd=pnl,
+                closed_at=bar_ts, closed_at_processed=_now_iso(),
+            )
+            changed.append({**trade, "status": "closed", "exit_price": exit_price, "exit_reason": "stop_hit", "pnl_usd": pnl, "closed_at": bar_ts})
         elif target_hit:
-            pnl = _pnl_usd(direction, fill_price, target, size)
-            now_iso = _now_iso()
-            close_trade(trade["trade_id"], exit_price=target, exit_reason="target_hit", pnl_usd=pnl, closed_at=now_iso)
-            changed.append({**trade, "status": "closed", "exit_price": target, "exit_reason": "target_hit", "pnl_usd": pnl, "closed_at": now_iso})
+            # No favorable-gap credit at the target either — same
+            # "never assume the better outcome" convention this
+            # function already used before Tier 3.2.
+            exit_price = target
+            pnl = _pnl_usd(direction, fill_price, exit_price, size) - _round_trip_commission(size)
+            close_trade(
+                trade["trade_id"], exit_price=exit_price, exit_reason="target_hit", pnl_usd=pnl,
+                closed_at=bar_ts, closed_at_processed=_now_iso(),
+            )
+            changed.append({**trade, "status": "closed", "exit_price": exit_price, "exit_reason": "target_hit", "pnl_usd": pnl, "closed_at": bar_ts})
 
     return changed
