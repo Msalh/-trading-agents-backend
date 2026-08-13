@@ -122,3 +122,10 @@ class WebhookAck(BaseModel):
     event_id: str
     timing: dict
     analysis_would_run: bool
+    # Tier 2.9 (calendar integrity): non-None when the payload's
+    # trading_date doesn't match what its own timestamp implies under
+    # the CME/Globex session-rollover convention (see
+    # app/trading_calendar.py) — surfaced, not rejected, since failing
+    # ingestion outright over a data source we don't control is worse
+    # than a flagged anomaly a human can go check.
+    calendar_warning: Optional[str] = None

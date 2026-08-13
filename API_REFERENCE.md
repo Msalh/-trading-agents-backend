@@ -53,9 +53,18 @@ timestamp:
   "status": "stored",            // or "duplicate" if event_id seen before
   "event_id": "MNQ1!:5m:2026-08-11T10:30:00Z",
   "timing": { "...": "TimingOpinion fields" },
-  "analysis_would_run": true
+  "analysis_would_run": true,
+  "calendar_warning": null       // Tier 2.9 — see below
 }
 ```
+
+`calendar_warning` (Tier 2.9, calendar integrity) is `null` when the
+payload's `trading_date` field agrees with what its own `timestamp`
+implies under the CME/Globex session-rollover convention (NY local
+time at/after 18:00 belongs to the next day's session), or a short
+string describing the mismatch otherwise. A mismatch is logged and
+surfaced here but never rejected — the bar is still stored either way
+(`status` is unaffected).
 
 ---
 
@@ -97,6 +106,14 @@ needed (inside the webhook response, and inside the Coordinator).
 Standalone test endpoints:
 - `GET /timing/now` — evaluates the current server time
 - `GET /timing/at?timestamp=2026-08-10T09:00:00Z` — evaluates any timestamp you give it
+
+As of Tier 2.9, `key_data.is_holiday` is `true` and `session_label` is
+`"holiday"` on a US market holiday (New Year's, MLK Day, Presidents
+Day, Good Friday, Memorial Day, Juneteenth, July 4th, Labor Day,
+Thanksgiving, Christmas — see `app/trading_calendar.py`), same
+treatment as a weekend: every `in_*_session` flag is `false` (so
+Analysis won't auto-run even during nominal kill-zone clock hours) and
+`flags` includes `"market_closed"`.
 
 ### Risk (deterministic logic, no LLM) — two-stage as of Tier 2.2
 - `GET /agents/risk/evaluate?symbol=MNQ1!&timeframe=5m`
@@ -212,11 +229,23 @@ pool only. Timing is still gathered and still appears in
 visible in the response's `timing_context` field
 (`{"confidence", "session_label", "flags"}`, or `null` if no market
 bar was available to evaluate it against): a `"market_closed"` flag
-(weekend timestamp) forces `score` to `0` outright; a `"low_liquidity"`
-flag (a weekday bar outside every ICT kill zone) halves the score.
-Either shows up in `conflict_flags` too
-(`"timing_market_closed"` / `"timing_low_liquidity_dampened"`) next to
-the existing `analysis_news_conflict*` flags.
+(weekend timestamp, or — as of Tier 2.9 — a US market holiday) forces
+`score` to `0` outright; a `"low_liquidity"` flag (a weekday bar
+outside every ICT kill zone) halves the score. Either shows up in
+`conflict_flags` too (`"timing_market_closed"` /
+`"timing_low_liquidity_dampened"`) next to the
+`analysis_news_conflict*` flags.
+
+As of Tier 2.9, News's `"urgent"` flag (set when a major scheduled
+economic event — FOMC, CPI, NFP — is imminent or already breaking)
+halves `score` whenever it's present, independent of whether Analysis
+and News actually agree — previously this only applied inside an
+Analysis/News direction conflict, so two agents that agreed right
+before a flagged event got no dampening at all. `conflict_flags`
+reports `"analysis_news_conflict_urgent_dampened"` when both a
+conflict AND `"urgent"` apply (same single flag/single dampen as
+before), or the new `"news_urgent_dampened"` when `"urgent"` applies
+on its own.
 
 ### `GET /coordinator/history?symbol=MNQ1!&timeframe=5m&limit=20`
 Most recent N persisted decisions, newest first.

@@ -179,6 +179,39 @@ bar outside every kill zone). No new endpoints — same
 and, when triggered, in conflict_flags ("timing_market_closed" /
 "timing_low_liquidity_dampened").
 
+Tier 2.9 (calendar integrity): three related gaps, all fixed via a new
+app/trading_calendar.py (deterministic US holiday calendar + a
+CME/Globex trading-day/timestamp consistency check):
+  1. Holiday awareness: timing_agent.py only checked weekday-vs-weekend
+     — a US market holiday (Thanksgiving, July 4th, Christmas, etc.) is
+     a WEEKDAY the cash equity market these kill zones model is closed
+     on. A bar timestamped during nominal kill-zone hours on a holiday
+     used to score as a normal, full-confidence session — wasting a
+     paid Analysis LLM call and letting the Coordinator treat a shut
+     market as ordinary. is_holiday now folds into every in_*_session
+     flag the same way is_weekday already did, and TimingOpinion gains
+     an is_holiday key_data field plus the same "market_closed" flag
+     weekends already use (so Tier 2.8's Coordinator veto applies here
+     for free, no coordinator.py changes needed).
+  2. Bar data-integrity: the webhook payload's own trading_date field
+     was never checked against what its timestamp implies. New
+     calendar_warning field on WebhookAck (None when consistent) flags
+     a mismatch under the CME/Globex session-rollover convention (NY
+     local time >= 18:00 belongs to the next day's session) — surfaced
+     and logged, never rejected, since failing ingestion outright over
+     a data source we don't control is worse than a flagged anomaly.
+  3. Economic event awareness: News's "urgent" flag (FOMC/CPI/NFP
+     imminent or breaking) only ever dampened the score INSIDE the
+     Analysis/News opposing-conflict branch in coordinator.py — two
+     agents that AGREED (e.g. both bullish right before an FOMC
+     decision) got zero dampening despite the same flagged risk,
+     silently ignoring the flag exactly the way the conflict-dampening
+     design was meant to prevent. "urgent" now dampens the score
+     whenever News carries it, independent of conflict status; the
+     combined conflict+urgent case still reports the original single
+     "analysis_news_conflict_urgent_dampened" flag, agreement+urgent
+     reports the new "news_urgent_dampened".
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -245,6 +278,7 @@ from app.storage import (
     wipe_all_data,
 )
 from app.timing_agent import evaluate_timing, should_run_analysis
+from app.trading_calendar import check_trading_date
 
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 
@@ -459,6 +493,15 @@ def receive_market_state(
     timing = evaluate_timing(payload.timestamp)
     analysis_would_run = should_run_analysis(timing)
 
+    # Tier 2.9 (calendar integrity): does the payload's own
+    # trading_date agree with what its timestamp implies? A mismatch
+    # is surfaced, not rejected — see app/trading_calendar.py.
+    calendar_warning = check_trading_date(payload.timestamp, payload.trading_date)
+    if calendar_warning:
+        logging.getLogger("webhook").warning(
+            "calendar integrity: event_id=%s %s", payload.event_id, calendar_warning
+        )
+
     # Only for genuinely new bars — a retried/duplicate delivery
     # shouldn't trigger a second paid LLM call for the same bar.
     # Scheduled as a background task: the HTTP response below returns
@@ -485,6 +528,7 @@ def receive_market_state(
         event_id=payload.event_id,
         timing=timing.to_dict(),
         analysis_would_run=analysis_would_run,
+        calendar_warning=calendar_warning,
     )
 
 

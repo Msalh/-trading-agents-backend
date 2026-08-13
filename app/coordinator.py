@@ -365,17 +365,36 @@ def _score_opinions(
     if "analysis" in opinions and "news" in opinions:
         a_dir = opinions["analysis"].get("direction")
         n_dir = opinions["news"].get("direction")
-        n_flags = opinions["news"].get("flags", [])
         opposing = (
             a_dir in ("bullish", "bearish")
             and n_dir in ("bullish", "bearish")
             and a_dir != n_dir
         )
-        if opposing and "urgent" in n_flags:
-            score *= 0.5
-            conflict_flags.append("analysis_news_conflict_urgent_dampened")
-        elif opposing:
+        if opposing:
             conflict_flags.append("analysis_news_conflict")
+
+    # Tier 2.9 (calendar integrity — economic event awareness): News's
+    # "urgent" flag (set by news_agent.py when a major scheduled event
+    # like FOMC/CPI/NFP is imminent or already breaking) dampens the
+    # score whenever it's set, regardless of whether Analysis and News
+    # happen to agree or conflict — imminent-event volatility risk
+    # applies either way. Before this tier, "urgent" only had any
+    # effect INSIDE the opposing-conflict branch above, so two agents
+    # that agreed (e.g. both bullish right before an FOMC decision)
+    # got zero dampening despite the exact same flagged risk — silently
+    # ignoring the flag in the agreeing case, the same failure mode the
+    # conflict-dampening design was originally meant to prevent.
+    if "news" in opinions and "urgent" in opinions["news"].get("flags", []):
+        score *= 0.5
+        if "analysis_news_conflict" in conflict_flags:
+            # combine into the single existing flag name tests/callers
+            # already expect for the conflict+urgent case, rather than
+            # reporting two separate flags for one 0.5 dampen.
+            conflict_flags[conflict_flags.index("analysis_news_conflict")] = (
+                "analysis_news_conflict_urgent_dampened"
+            )
+        else:
+            conflict_flags.append("news_urgent_dampened")
 
     # Tier 2.8: Timing's actual gating role — a full veto when the
     # market is flagged closed (weekend timestamp), a half-dampen when

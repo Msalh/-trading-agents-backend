@@ -24,11 +24,26 @@ time, not patched with additional zones. Because the windows don't
 touch, an "overlap" essentially never occurs with this narrower
 definition; the field is kept for shape-compatibility with the rest
 of the system but will rarely if ever be true.
+
+Tier 2.9 (calendar integrity): the weekday check above is necessary
+but not sufficient — a US market holiday (Thanksgiving, July 4th,
+Christmas, etc.) is a WEEKDAY on which the cash equity market these
+kill zones are built around is closed. Before this tier, a bar
+timestamped during nominal kill-zone hours on a holiday was scored as
+a normal, full-confidence session — wasting a paid Analysis LLM call
+(should_run_analysis() would say yes) and letting the Coordinator
+treat a shut market as an ordinary trading day. app/trading_calendar.py
+now supplies a deterministic US holiday calendar; is_holiday folds
+into is_london/is_ny/is_ny_pm exactly the same way is_weekday already
+did, so a holiday correctly zeroes out every kill zone rather than
+only affecting the display label.
 """
 
 from dataclasses import dataclass
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
+
+from app.trading_calendar import is_us_market_holiday
 
 NY_TZ = ZoneInfo("America/New_York")
 
@@ -90,9 +105,17 @@ def evaluate_timing(timestamp: str) -> TimingOpinion:
     # actually evaluated against NY time now, not London local time.
     london_local = dt_utc.astimezone(ZoneInfo("Europe/London"))
 
-    in_london = is_weekday and _in_window(ny_local, LONDON_SESSION_START, LONDON_SESSION_END)
-    in_ny = is_weekday and _in_window(ny_local, NY_SESSION_START, NY_SESSION_END)
-    in_ny_pm = is_weekday and _in_window(ny_local, NY_PM_SESSION_START, NY_PM_SESSION_END)
+    # Tier 2.9: a US market holiday is a weekday the underlying cash
+    # market is still closed on — folded into is_trading_day exactly
+    # like is_weekday, so every in_* kill-zone flag (and therefore
+    # should_run_analysis() below) is correctly False on a holiday,
+    # not just the display label.
+    is_holiday = is_weekday and is_us_market_holiday(ny_local.date())
+    is_trading_day = is_weekday and not is_holiday
+
+    in_london = is_trading_day and _in_window(ny_local, LONDON_SESSION_START, LONDON_SESSION_END)
+    in_ny = is_trading_day and _in_window(ny_local, NY_SESSION_START, NY_SESSION_END)
+    in_ny_pm = is_trading_day and _in_window(ny_local, NY_PM_SESSION_START, NY_PM_SESSION_END)
     in_overlap = in_london and in_ny  # structurally near-impossible with these windows
 
     flags: list[str] = []
@@ -101,6 +124,11 @@ def evaluate_timing(timestamp: str) -> TimingOpinion:
         confidence = 0
         session_label = "weekend"
         reasoning = "Weekend — no kill zone active."
+        flags.append("market_closed")
+    elif is_holiday:
+        confidence = 0
+        session_label = "holiday"
+        reasoning = "US market holiday — no kill zone active."
         flags.append("market_closed")
     elif in_overlap:
         confidence = 100
@@ -133,6 +161,7 @@ def evaluate_timing(timestamp: str) -> TimingOpinion:
         key_data={
             "session_label": session_label,
             "is_weekday": is_weekday,
+            "is_holiday": is_holiday,
             "in_london_session": in_london,
             "in_ny_session": in_ny,
             "in_ny_pm_session": in_ny_pm,
@@ -147,7 +176,9 @@ def evaluate_timing(timestamp: str) -> TimingOpinion:
 def should_run_analysis(timing: TimingOpinion) -> bool:
     """The gate Sprint 2 exists to build: should the (future) Analysis
     Agent even run for this bar? Currently: yes if we're inside any
-    kill zone on a weekday."""
+    kill zone on a weekday that isn't a US market holiday (Tier 2.9 —
+    in_*_session are already False on a holiday, so no separate
+    is_holiday check is needed here)."""
     return (
         timing.key_data["in_london_session"]
         or timing.key_data["in_ny_session"]

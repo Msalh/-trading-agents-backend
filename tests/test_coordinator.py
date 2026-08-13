@@ -504,3 +504,52 @@ def test_replay_style_hypothetical_config_reveals_the_old_bug(fresh_storage):
         min_available_weight=coordinator.MIN_AVAILABLE_WEIGHT,
     )
     assert live_decision.decision == "insufficient_data"  # the Tier 2.8 fix, confirmed again directly
+
+
+# --- Tier 2.9 (calendar integrity: News "urgent" dampens regardless of
+# analysis/news agreement, not just during a conflict) -------------------
+
+
+def test_news_urgent_dampens_score_even_when_agreeing_with_analysis(fresh_storage):
+    """The bug this fixes: before Tier 2.9, "urgent" only dampened the
+    score INSIDE the opposing-conflict branch, so two agents that
+    AGREED (e.g. both bullish right before an FOMC decision) got zero
+    dampening despite the same flagged imminent-event risk."""
+    storage, coordinator = fresh_storage
+    storage.save_opinion("analysis", "TEST", "5m", "t1", _opinion("bullish", 80))
+    storage.save_opinion("news", "TEST", "global", "t1", _opinion("bullish", 60, flags=["urgent"]))
+
+    decision = coordinator.compute_decision(symbol="TEST", timeframe="5m")
+
+    assert "news_urgent_dampened" in decision.conflict_flags
+    assert "analysis_news_conflict" not in decision.conflict_flags  # they agree, no conflict
+    # undampened score would be 47/0.65 = 72.31; halved by the urgent dampener
+    assert decision.score == pytest.approx(36.15, abs=0.1)
+
+
+def test_news_urgent_and_opposing_still_uses_single_combined_flag(fresh_storage):
+    """When BOTH conditions apply (opposing direction AND urgent), the
+    result stays a single 0.5 dampen under the original combined flag
+    name — not two separate dampens (0.25x) or two separate flags for
+    one event. Same scenario/numbers as
+    test_urgent_conflict_dampens_score above, re-asserted here as the
+    Tier 2.9 regression check that the refactor didn't change it."""
+    storage, coordinator = fresh_storage
+    storage.save_opinion("analysis", "TEST", "5m", "t1", _opinion("bullish", 80))
+    storage.save_opinion("news", "TEST", "global", "t1", _opinion("bearish", 70, flags=["urgent"]))
+
+    decision = coordinator.compute_decision(symbol="TEST", timeframe="5m")
+
+    assert decision.conflict_flags == ["analysis_news_conflict_urgent_dampened"]
+    assert decision.score == pytest.approx(11.15, abs=0.5)
+
+
+def test_no_news_opinion_no_urgent_dampening(fresh_storage):
+    """No News opinion at all -> nothing to read a flag from; the new
+    urgent check must not error or fire on a missing agent."""
+    storage, coordinator = fresh_storage
+    storage.save_opinion("analysis", "TEST", "5m", "t1", _opinion("bullish", 90))
+    storage.save_opinion("macro", "TEST", "global", "t1", _opinion("bullish", 60))
+
+    decision = coordinator.compute_decision(symbol="TEST", timeframe="5m")
+    assert "news_urgent_dampened" not in decision.conflict_flags
