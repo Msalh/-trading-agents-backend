@@ -536,6 +536,39 @@ tier before it, any real trading-logic change needs the user's
 explicit direction. Entirely offline, no LLM calls, no new data
 collection. COORDINATOR_THRESHOLD and Coordinator scoring untouched.
 
+Tier 3.12 (backtest-lite methodology corrections): a second external
+review of the Tier 3.10/3.11 results flagged three issues, addressed
+here. First, Tier 3.10's backtest-lite endpoint compares sources as
+independent POLICIES — each source applies the non-overlap schedule
+against its own resolved directions, so different sources can end up
+trading different candidate subsets; the endpoint's docstring
+previously (inaccurately) described this as a "same candidate
+population" comparison. New app/backtest.run_paired_barrier_backtest(),
+exposed at GET /candidates/history/backtest-lite/paired, fixes this
+properly: it keeps only candidates every requested source can resolve
+a direction for, and uses ONE shared entry price plus ONE shared,
+direction-independent non-overlap schedule, so any difference between
+sources is attributable to the direction call alone. Second, a
+calibration-window candidate near the validation boundary could have
+its forward barrier walk read price bars that fall inside the
+validation window, which is a boundary-leakage risk for calibration's
+own numbers (it does not affect validation's numbers, since a
+validation trade only ever looks forward from its own anchor).
+split_candidates_chronologically() gained an optional `expiry_bars`
+parameter that embargoes/purges any calibration candidate whose
+forward window would cross into validation;
+compute_champion_challenger_report() now uses this embargo and reports
+the purged count via config.purged_at_boundary. Third,
+simulate_barrier_trade()'s "expired" exit (mark-to-last-seen-close)
+previously applied no slippage, inconsistent with every other exit
+type in the same function — now fixed to apply the same
+against-the-trader slippage as a stop-out. compute_champion_challenger_
+report() also gained a base_rate section (calibration vs. validation)
+reusing Tier 3.8's compute_baseline_comparison(), as a cheap regime
+sanity-check alongside the existing per-source results. All three
+fixes are purely methodological — no trading-logic change, no
+COORDINATOR_THRESHOLD change, entirely offline.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -560,6 +593,7 @@ from app.backtest import (
     EXPIRY_BARS,
     compute_backtest_comparison,
     compute_champion_challenger_report,
+    run_paired_barrier_backtest,
 )
 from app.candidates import (
     CandidateError,
@@ -1630,11 +1664,18 @@ def candidates_history_backtest_lite(
     LLM-independent baselines), and "inverse_analysis" (Analysis's
     calls flipped — diagnostic only, never acted on, matches Tier
     3.8's framing for the same baseline in the horizon-proxy endpoint).
-    Same candidate population and ATR geometry held fixed across every
-    source in one call, so a difference in results is attributable to
-    the direction signal alone — this is the actual "does Analysis
-    beat simple baselines" comparison the external review asked for,
-    which the horizon-price proxy alone couldn't answer honestly.
+
+    IMPORTANT (Tier 3.12 correction): this is a POLICY comparison, not
+    a paired one — each source independently applies the
+    `non_overlapping` schedule against ITS OWN resolved directions, so
+    different sources can end up trading different candidate subsets
+    (a candidate analysis stays flat on may still open a trade under
+    coordinator's direction). An earlier version of this docstring
+    claimed a "same candidate population" comparison; that was
+    inaccurate and has been corrected. For a true apples-to-apples
+    comparison — one shared entry, one shared non-overlap schedule,
+    only candidates every requested source can resolve — use
+    GET /candidates/history/backtest-lite/paired instead.
 
     `non_overlapping` (default true) skips a candidate whose anchor
     falls before the previous simulated trade (for that source)
@@ -1734,6 +1775,70 @@ def candidates_history_backtest_lite_champion_challenger(
         raise HTTPException(status_code=400, detail=str(e))
 
     return {"symbol": symbol, "timeframe": timeframe, **report}
+
+
+@app.get("/candidates/history/backtest-lite/paired")
+def candidates_history_backtest_lite_paired(
+    symbol: str = Query(...),
+    timeframe: str = Query(...),
+    limit: int = Query(default=300, le=1000),
+    sources: str = Query(
+        ...,
+        description="comma-separated direction sources to compare on a shared candidate population, e.g. analysis,coordinator,inverse_analysis — at least one required",
+    ),
+    atr_stop_mult: float = Query(default=ATR_STOP_MULT),
+    atr_target_mult: float = Query(default=ATR_TARGET_MULT),
+    expiry_bars: int = Query(default=EXPIRY_BARS, le=200),
+) -> dict:
+    """Tier 3.12 (paired signal comparison): the plain backtest-lite
+    endpoint above compares sources as independent POLICIES — each one
+    applies its own non-overlap schedule against its own resolved
+    directions, so two sources can end up trading different candidate
+    subsets entirely. That is a fair comparison of "what would running
+    on this signal alone have looked like," but it is NOT a clean
+    "does signal A beat signal B" comparison, since a difference in
+    results can come from which candidates were traded rather than
+    what direction was called on the same candidate. This endpoint,
+    built on app/backtest.run_paired_barrier_backtest(), fixes that:
+    it keeps only candidates where EVERY requested source can resolve
+    a direction (the full intersection), then runs every source
+    through the identical entry price, ATR-derived stop/target
+    geometry, and forward bar walk for each accepted candidate — one
+    shared, direction-independent non-overlap schedule decides which
+    candidates are accepted at all, so no source's own resolved
+    direction can influence which candidates make the comparison.
+    Any remaining difference in a source's results is attributable to
+    the direction call itself, not to a different candidate mix.
+
+    Raised by the external review after Tier 3.11: fix the fairness of
+    the comparison before drawing further conclusions from
+    backtest-lite. `sources` requires at least one recognized source
+    (400 if empty or if any entry is unrecognized). `config` in the
+    response reports `candidates_considered` (pulled from history),
+    `eligible_candidates` (resolved a direction under every requested
+    source), and `accepted_candidates` (also passed the shared
+    non-overlap schedule) so the funnel from raw history down to
+    actual paired trades is visible.
+
+    Entirely offline: no LLM calls, no new data collection, nothing
+    written to any trade table. COORDINATOR_THRESHOLD and the
+    Coordinator's own scoring are untouched — this is read-only
+    analysis, same as every diagnostic tier before it."""
+    source_list = [s.strip() for s in sources.split(",") if s.strip()]
+
+    candidates = get_candidate_history(symbol=symbol, timeframe=timeframe, limit=limit)
+    try:
+        result = run_paired_barrier_backtest(
+            candidates,
+            sources=source_list,
+            stop_mult=atr_stop_mult,
+            target_mult=atr_target_mult,
+            expiry_bars=expiry_bars,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {"symbol": symbol, "timeframe": timeframe, **result}
 
 
 @app.get("/candidates/{candidate_id}")

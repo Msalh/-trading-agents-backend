@@ -160,7 +160,10 @@ def test_simulate_expires_and_marks_to_last_seen_close(fresh_env):
         forward_bars=forward, expiry_bars=2,
     )
     assert result["exit_reason"] == "expired"
-    assert result["exit_price"] == 101.0
+    # Tier 3.12: an expiry close-out is a market order too, so it now
+    # carries the same against-the-trader slippage every other exit
+    # type in this function already did (101.0 - SLIPPAGE_POINTS).
+    assert result["exit_price"] == 100.75
     assert result["bars_held"] == 2
 
 
@@ -387,12 +390,23 @@ def test_champion_challenger_report_shape_has_calibration_and_validation_per_sou
             open_=100.0, high=106.0, low=99.5, close=105.5,
         )
 
+    # expiry_bars=1 keeps each candidate's forward window to its own
+    # single saved bar -- with the default expiry_bars=24 and only one
+    # sparse bar per 20-minute-spaced candidate, get_bars_after's
+    # bar-COUNT limit (not a time cap) would sweep in LATER candidates'
+    # bars too and trip the Tier 3.12 boundary embargo in a way that's
+    # an artifact of this sparse synthetic data, not something this
+    # shape-only test is meant to exercise (see the dedicated embargo
+    # tests below for that).
     report = backtest.compute_champion_challenger_report(
-        candidates, champion="coordinator", challengers=["always_bullish", "inverse_analysis"], holdout_fraction=0.5,
+        candidates, champion="coordinator", challengers=["always_bullish", "inverse_analysis"],
+        holdout_fraction=0.5, expiry_bars=1,
     )
     assert report["champion"] == "coordinator"
     assert set(report["challengers"]) == {"always_bullish", "inverse_analysis"}
     assert set(report["by_source"].keys()) == {"coordinator", "always_bullish", "inverse_analysis"}
+    assert set(report.keys()) >= {"base_rate", "config", "champion", "challengers", "by_source"}
+    assert set(report["base_rate"].keys()) == {"calibration", "validation"}
     for source_result in report["by_source"].values():
         assert set(source_result.keys()) == {"calibration", "validation"}
         assert "trades_taken" in source_result["calibration"]
@@ -419,3 +433,123 @@ def test_champion_challenger_report_rejects_unknown_champion_or_challenger(fresh
         backtest.compute_champion_challenger_report([], champion="not_a_real_source")
     with pytest.raises(ValueError):
         backtest.compute_champion_challenger_report([], champion="coordinator", challengers=["not_a_real_source"])
+
+
+# ---------------------------------------------------------------------------
+# Tier 3.12: holdout-boundary embargo
+# ---------------------------------------------------------------------------
+
+def test_split_embargoes_calibration_candidate_whose_forward_window_crosses_boundary(fresh_env):
+    storage, backtest = fresh_env
+    t0 = datetime(2026, 8, 11, 14, 0, 0, tzinfo=timezone.utc)
+    c1 = _candidate("c1", "TEST", "5m", t0, atr=2.0)
+    c2 = _candidate("c2", "TEST", "5m", t0 + timedelta(minutes=10), atr=2.0)  # becomes validation's first candidate
+
+    # c1's own 2-bar forward window (expiry_bars=2) reaches PAST c2's
+    # anchor (the validation cutoff) -- t0+15min > t0+10min.
+    _save_bar(storage, "TEST", "5m", t0 + timedelta(minutes=5), open_=100.0, high=101.0, low=99.0, close=100.5)
+    _save_bar(storage, "TEST", "5m", t0 + timedelta(minutes=15), open_=100.5, high=101.5, low=99.5, close=101.0)
+
+    calibration, validation = backtest.split_candidates_chronologically(
+        [c1, c2], holdout_fraction=0.5, expiry_bars=2,
+    )
+    assert calibration == []  # c1 was embargoed -- its forward window bled into validation's period
+    assert [c["candidate_id"] for c in validation] == ["c2"]
+
+
+def test_split_does_not_embargo_calibration_candidate_that_resolves_before_boundary(fresh_env):
+    storage, backtest = fresh_env
+    t0 = datetime(2026, 8, 11, 14, 0, 0, tzinfo=timezone.utc)
+    c1 = _candidate("c1", "TEST", "5m", t0, atr=2.0)
+    c2 = _candidate("c2", "TEST", "5m", t0 + timedelta(minutes=30), atr=2.0)
+
+    # c1's forward window resolves well before c2's anchor this time.
+    _save_bar(storage, "TEST", "5m", t0 + timedelta(minutes=5), open_=100.0, high=101.0, low=99.0, close=100.5)
+
+    calibration, validation = backtest.split_candidates_chronologically(
+        [c1, c2], holdout_fraction=0.5, expiry_bars=1,
+    )
+    assert [c["candidate_id"] for c in calibration] == ["c1"]
+    assert [c["candidate_id"] for c in validation] == ["c2"]
+
+
+def test_split_without_expiry_bars_skips_the_embargo_check(fresh_env):
+    storage, backtest = fresh_env
+    t0 = datetime(2026, 8, 11, 14, 0, 0, tzinfo=timezone.utc)
+    c1 = _candidate("c1", "TEST", "5m", t0, atr=2.0)
+    c2 = _candidate("c2", "TEST", "5m", t0 + timedelta(minutes=10), atr=2.0)
+    _save_bar(storage, "TEST", "5m", t0 + timedelta(minutes=5), open_=100.0, high=101.0, low=99.0, close=100.5)
+    _save_bar(storage, "TEST", "5m", t0 + timedelta(minutes=15), open_=100.5, high=101.5, low=99.5, close=101.0)
+
+    # Same data as the embargo test above, but expiry_bars omitted --
+    # backward-compatible default: no embargo check runs at all.
+    calibration, validation = backtest.split_candidates_chronologically([c1, c2], holdout_fraction=0.5)
+    assert [c["candidate_id"] for c in calibration] == ["c1"]
+
+
+def test_champion_challenger_report_reports_purged_at_boundary_count(fresh_env):
+    storage, backtest = fresh_env
+    t0 = datetime(2026, 8, 11, 14, 0, 0, tzinfo=timezone.utc)
+    c1 = _candidate("c1", "TEST", "5m", t0, atr=2.0, decision="enter_long")
+    c2 = _candidate("c2", "TEST", "5m", t0 + timedelta(minutes=10), atr=2.0, decision="enter_long")
+    _save_bar(storage, "TEST", "5m", t0 + timedelta(minutes=5), open_=100.0, high=101.0, low=99.0, close=100.5)
+    _save_bar(storage, "TEST", "5m", t0 + timedelta(minutes=15), open_=100.5, high=101.5, low=99.5, close=101.0)
+
+    report = backtest.compute_champion_challenger_report(
+        [c1, c2], champion="coordinator", challengers=[], holdout_fraction=0.5, expiry_bars=2,
+    )
+    assert report["config"]["purged_at_boundary"] == 1
+    assert report["config"]["calibration_candidates"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Tier 3.12: paired signal comparison
+# ---------------------------------------------------------------------------
+
+def test_paired_backtest_uses_a_shared_entry_for_every_source(fresh_env):
+    """Same anchor, same ATR, same entry price for every source --
+    only the direction (and therefore stop/target sign) differs. This
+    bar is deliberately built so a bullish read wins cleanly (target
+    hit, stop never touched) and a bearish read on the SAME bar loses
+    cleanly (stop hit, target never touched)."""
+    storage, backtest = fresh_env
+    anchor = datetime(2026, 8, 11, 14, 0, 0, tzinfo=timezone.utc)
+    candidate = _candidate("c1", "TEST", "5m", anchor, atr=2.0)
+    _save_bar(storage, "TEST", "5m", anchor + timedelta(minutes=5), open_=100.0, high=106.0, low=98.0, close=105.5)
+
+    report = backtest.run_paired_barrier_backtest([candidate], sources=["always_bullish", "always_bearish"])
+    assert report["config"]["eligible_candidates"] == 1
+    assert report["config"]["accepted_candidates"] == 1
+    assert report["by_source"]["always_bullish"]["wins"] == 1
+    assert report["by_source"]["always_bearish"]["losses"] == 1
+    assert report["by_source"]["always_bullish"]["trades_taken"] == report["by_source"]["always_bearish"]["trades_taken"] == 1
+
+
+def test_paired_backtest_excludes_candidates_ineligible_for_any_requested_source(fresh_env):
+    storage, backtest = fresh_env
+    anchor = datetime(2026, 8, 11, 14, 0, 0, tzinfo=timezone.utc)
+    # No analysis opinion at all -- eligible for always_bullish, but
+    # NOT for "analysis", so paired mode must drop it entirely rather
+    # than let always_bullish trade it alone.
+    candidate = {
+        "candidate_id": "c1", "symbol": "TEST", "timeframe": "5m",
+        "bar": {"timestamp": "2026-08-11T14:00:00Z", "atr": 2.0},
+        "decision": {"decision": "no_trade", "timestamp": "2026-08-11T14:00:00Z", "opinions_used": {}},
+    }
+    _save_bar(storage, "TEST", "5m", anchor + timedelta(minutes=5), open_=100.0, high=106.0, low=98.0, close=105.5)
+
+    report = backtest.run_paired_barrier_backtest([candidate], sources=["always_bullish", "analysis"])
+    assert report["config"]["eligible_candidates"] == 0
+    assert report["by_source"]["always_bullish"]["trades_taken"] == 0
+
+
+def test_paired_backtest_requires_at_least_one_source(fresh_env):
+    _, backtest = fresh_env
+    with pytest.raises(ValueError):
+        backtest.run_paired_barrier_backtest([], sources=[])
+
+
+def test_paired_backtest_rejects_unknown_source(fresh_env):
+    _, backtest = fresh_env
+    with pytest.raises(ValueError):
+        backtest.run_paired_barrier_backtest([], sources=["not_a_real_source"])

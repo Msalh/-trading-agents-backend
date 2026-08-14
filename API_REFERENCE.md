@@ -656,14 +656,24 @@ levels, since this benchmarks the directional SIGNAL, not what
 Execution would have picked.
 
 `sources` runs several direction signals through the identical barrier
-mechanics side by side, so a difference in results is attributable to
-the signal alone: `analysis` (Analysis's own opinion), `coordinator`
+mechanics side by side: `analysis` (Analysis's own opinion), `coordinator`
 (the blended decision), `always_bullish` / `always_bearish` / `vwap`
 (trivial baselines — `vwap` is bullish when the anchor bar's own
 `distance_from_vwap_points` is positive), and `inverse_analysis`
 (Analysis's calls flipped — diagnostic only, never acted on, same
 framing as the `inverse_of_analysis` baseline in
 `baseline-comparison` above). Omit `sources` for all six.
+
+**Tier 3.12 correction:** this is a POLICY comparison, not a paired
+one — each source independently applies `non_overlapping` against its
+OWN resolved directions, so different sources can end up trading
+different candidate subsets (a candidate `analysis` stays flat on may
+still open a trade under `coordinator`'s direction). An earlier
+version of this document described this as a "same candidate
+population" comparison; that was inaccurate. For a true paired
+comparison — one shared entry, one shared non-overlap schedule, only
+candidates every requested source can resolve — see
+`GET /candidates/history/backtest-lite/paired` below.
 
 `non_overlapping=true` (default) skips a candidate whose anchor falls
 before the previous simulated trade (for that source) resolved —
@@ -726,7 +736,8 @@ calibration window and the held-out validation window, separately.
   "symbol": "MNQ1!", "timeframe": "5m",
   "config": {
     "atr_stop_mult": 1.5, "atr_target_mult": 2.5, "expiry_bars": 24, "non_overlapping": true,
-    "holdout_fraction": 0.3, "candidates_considered": 156, "calibration_candidates": 109, "validation_candidates": 47
+    "holdout_fraction": 0.3, "candidates_considered": 156, "calibration_candidates": 104, "validation_candidates": 47,
+    "purged_at_boundary": 5
   },
   "champion": "coordinator",
   "challengers": ["analysis", "inverse_analysis", "always_bullish", "always_bearish", "vwap"],
@@ -734,6 +745,10 @@ calibration window and the held-out validation window, separately.
     "coordinator": {"calibration": { "...": "same shape as backtest-lite's per-source summary" }, "validation": { "...": "same shape" }},
     "inverse_analysis": {"calibration": { "...": "..." }, "validation": { "...": "..." }},
     "...": "one calibration/validation pair per source"
+  },
+  "base_rate": {
+    "calibration": { "...": "same shape as GET /candidates/history/baseline-comparison" },
+    "validation": { "...": "same shape" }
   }
 }
 ```
@@ -749,6 +764,63 @@ trading-logic change needs the user's explicit direction.
 `COORDINATOR_THRESHOLD` and Coordinator scoring untouched. 400 if
 `champion`/`challengers` contains an unrecognized source; 422 (FastAPI's
 own query validation) if `holdout_fraction` is outside `(0, 1)`.
+
+**Tier 3.12 additions:** `config.calibration_candidates` now reflects
+an EMBARGOED calibration set — any calibration candidate whose forward
+barrier walk (`expiry_bars` bars ahead) would read price bars from
+inside the validation window is purged, so calibration and validation
+no longer share any price data; `config.purged_at_boundary` reports
+how many candidates that removed (this doesn't affect
+`validation_candidates` or validation's own numbers — a validation
+trade only ever looks forward from its own, later anchor). The new
+`base_rate` section runs Tier 3.8's plain "price higher/lower N
+minutes later" baseline comparison on both windows, as a cheap sanity
+check for whether the two windows look like meaningfully different
+market regimes.
+
+### `GET /candidates/history/backtest-lite/paired?symbol=MNQ1!&timeframe=5m&limit=300&sources=analysis,coordinator,inverse_analysis&atr_stop_mult=1.5&atr_target_mult=2.5&expiry_bars=24`
+Tier 3.12 (paired signal comparison). The plain `backtest-lite`
+endpoint above compares sources as independent POLICIES — each one
+applies its own non-overlap schedule against its own resolved
+directions, so two sources can end up trading different candidate
+subsets. That's a fair "what would running on this signal alone have
+looked like" comparison, but not a clean "does signal A beat signal B"
+one, since a difference in results can come from which candidates were
+traded rather than what direction was called on the same candidate.
+This endpoint, built on `app/backtest.run_paired_barrier_backtest()`,
+fixes that: it keeps only candidates where EVERY requested source can
+resolve a direction (the full intersection), then runs every source
+through the identical entry price, ATR-derived stop/target geometry,
+and forward bar walk for each accepted candidate — one shared,
+direction-independent non-overlap schedule decides which candidates
+are accepted at all, so no source's own resolved direction can
+influence which candidates make the comparison. `sources` is required
+(comma-separated, at least one recognized source).
+
+```json
+{
+  "symbol": "MNQ1!", "timeframe": "5m",
+  "config": {
+    "atr_stop_mult": 1.5, "atr_target_mult": 2.5, "expiry_bars": 24,
+    "candidates_considered": 156, "eligible_candidates": 61, "accepted_candidates": 38
+  },
+  "sources": ["analysis", "coordinator", "inverse_analysis"],
+  "by_source": {
+    "analysis": { "...": "same shape as backtest-lite's per-source summary" },
+    "coordinator": { "...": "same shape" },
+    "inverse_analysis": { "...": "same shape" }
+  }
+}
+```
+`eligible_candidates` is the intersection — only candidates every
+requested source could resolve a direction for; `accepted_candidates`
+is what's left after the shared non-overlap schedule, i.e. the actual
+number of paired trades each source ran. Entirely offline: no LLM
+calls, no new data collection, nothing written to any trade table. 400
+if `sources` is empty or contains an unrecognized value.
+`COORDINATOR_THRESHOLD` and the Coordinator's own scoring are
+untouched — read-only analysis, same as every diagnostic tier before
+it.
 
 ---
 
@@ -817,7 +889,7 @@ were NOT touched by this tier.
 | `COMMISSION_PER_CONTRACT` | no | `2.0` | Tier 3.2: flat round-trip commission, subtracted from `pnl_usd` on every closed trade |
 | `BACKTEST_ATR_STOP_MULT` | no | `1.5` | Tier 3.10: ATR-barrier backtest-lite's default stop distance (multiple of the anchor bar's own ATR) — only affects the offline benchmark, never real trades or Execution's actual proposed geometry |
 | `BACKTEST_ATR_TARGET_MULT` | no | `2.5` | Tier 3.10: same, target distance |
-| `BACKTEST_EXPIRY_BARS` | no | `24` | Tier 3.10: how many forward bars a hypothetical barrier trade is walked before being marked "expired" (mark-to-last-seen-close) |
+| `BACKTEST_EXPIRY_BARS` | no | `24` | Tier 3.10: how many forward bars a hypothetical barrier trade is walked before being marked "expired" (mark-to-last-seen-close, `SLIPPAGE_POINTS` applied against the trader as of Tier 3.12 — this exit is itself a market order, previously priced with no slippage, inconsistent with every other exit type) |
 | `BACKTEST_HOLDOUT_FRACTION` | no | `0.3` | Tier 3.11: fraction of candidate history (chronologically most recent) held out as the champion/challenger validation window |
 
 ---

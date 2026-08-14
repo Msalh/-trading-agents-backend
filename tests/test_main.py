@@ -637,3 +637,77 @@ def test_champion_challenger_endpoint_rejects_out_of_range_holdout_fraction(clie
         params={"symbol": "MNQ1!", "timeframe": "5m", "holdout_fraction": 1.5},
     )
     assert r.status_code == 422  # FastAPI's own gt/lt Query validation, before our function ever runs
+
+
+# ---------------------------------------------------------------------------
+# Tier 3.12: paired signal comparison (backtest-lite methodology fix)
+# ---------------------------------------------------------------------------
+
+def test_paired_backtest_endpoint_returns_shared_trade_counts_per_source(client):
+    import app.storage as storage
+
+    anchor = "2026-08-11T14:00:00Z"
+    bar = {"event_id": "evt-paired-1", "symbol": "MNQ1!", "timeframe": "5m", "timestamp": anchor, "atr": 2.0}
+    decision = {
+        "decision": "enter_long", "timestamp": anchor,
+        "opinions_used": {"analysis": {"direction": "bullish", "timestamp": anchor}},
+    }
+    storage.save_candidate(candidate_id="cand-paired-1", symbol="MNQ1!", timeframe="5m", bar=bar, decision=decision)
+    _save_market_bar(
+        storage, "MNQ1!", "5m", "2026-08-11T14:05:00Z",
+        open_=20000.0, high=20060.0, low=19995.0, close=20055.0,
+    )
+
+    r = client.get(
+        "/candidates/history/backtest-lite/paired",
+        params={"symbol": "MNQ1!", "timeframe": "5m", "sources": "analysis,coordinator"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body["by_source"].keys()) == {"analysis", "coordinator"}
+    # Same candidate, same shared entry/schedule, both sources bullish here
+    # -- both must report the identical accepted trade count.
+    assert body["config"]["accepted_candidates"] == 1
+    assert body["by_source"]["analysis"]["trades_taken"] == body["by_source"]["coordinator"]["trades_taken"] == 1
+
+
+def test_paired_backtest_endpoint_rejects_unknown_source(client):
+    r = client.get(
+        "/candidates/history/backtest-lite/paired",
+        params={"symbol": "MNQ1!", "timeframe": "5m", "sources": "not_a_real_source"},
+    )
+    assert r.status_code == 400
+
+
+def test_paired_backtest_endpoint_requires_at_least_one_source(client):
+    r = client.get(
+        "/candidates/history/backtest-lite/paired",
+        params={"symbol": "MNQ1!", "timeframe": "5m", "sources": ""},
+    )
+    assert r.status_code == 400
+
+
+def test_paired_backtest_endpoint_excludes_candidates_ineligible_for_any_source(client):
+    import app.storage as storage
+
+    anchor = "2026-08-11T14:00:00Z"
+    bar = {"event_id": "evt-paired-2", "symbol": "MNQ1!", "timeframe": "5m", "timestamp": anchor, "atr": 2.0}
+    # No "analysis" opinion recorded, so the "analysis" source can't
+    # resolve a direction for this candidate -- it must be excluded
+    # from the shared (intersected) eligible set entirely.
+    decision = {"decision": "enter_long", "timestamp": anchor, "opinions_used": {}}
+    storage.save_candidate(candidate_id="cand-paired-2", symbol="MNQ1!", timeframe="5m", bar=bar, decision=decision)
+    _save_market_bar(
+        storage, "MNQ1!", "5m", "2026-08-11T14:05:00Z",
+        open_=20000.0, high=20060.0, low=19995.0, close=20055.0,
+    )
+
+    r = client.get(
+        "/candidates/history/backtest-lite/paired",
+        params={"symbol": "MNQ1!", "timeframe": "5m", "sources": "analysis,coordinator"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["config"]["eligible_candidates"] == 0
+    assert body["by_source"]["analysis"]["trades_taken"] == 0
+    assert body["by_source"]["coordinator"]["trades_taken"] == 0
