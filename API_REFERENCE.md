@@ -640,6 +640,72 @@ was never actually filled/sized/executed, so there's no real P&L to
 attribute to it. 400 if `thresholds` doesn't parse as comma-separated
 numbers.
 
+### `GET /candidates/history/backtest-lite?symbol=MNQ1!&timeframe=5m&limit=200&sources=analysis,coordinator,always_bullish,always_bearish,vwap,inverse_analysis&atr_stop_mult=1.5&atr_target_mult=2.5&expiry_bars=24&non_overlapping=true`
+Tier 3.10 (ATR-barrier benchmark) — every accuracy number through Tier
+3.9 uses the "price higher/lower N minutes later" proxy, never an
+actual entry/stop/target trade simulation. This endpoint runs the
+SAME fill/stop/target/slippage/commission mechanics the live
+paper-trade engine uses for real trades
+(`app/paper_trades.process_new_bar`), offline, against bars already in
+storage, for a hypothetical trade that was never taken — nothing
+written to any trade table. Entry is a market fill at the next bar's
+open after the candidate's own anchor bar; stop/target are the anchor
+bar's own already-stored ATR times `atr_stop_mult`/`atr_target_mult`
+(deterministic, no LLM, no lookahead) — NOT Execution's proposed
+levels, since this benchmarks the directional SIGNAL, not what
+Execution would have picked.
+
+`sources` runs several direction signals through the identical barrier
+mechanics side by side, so a difference in results is attributable to
+the signal alone: `analysis` (Analysis's own opinion), `coordinator`
+(the blended decision), `always_bullish` / `always_bearish` / `vwap`
+(trivial baselines — `vwap` is bullish when the anchor bar's own
+`distance_from_vwap_points` is positive), and `inverse_analysis`
+(Analysis's calls flipped — diagnostic only, never acted on, same
+framing as the `inverse_of_analysis` baseline in
+`baseline-comparison` above). Omit `sources` for all six.
+
+`non_overlapping=true` (default) skips a candidate whose anchor falls
+before the previous simulated trade (for that source) resolved —
+avoids double-counting overlapping candidates on a fast timeframe as
+independent evidence, mirroring the real `MAX_OPEN_POSITIONS=1`
+constraint.
+
+```json
+{
+  "symbol": "MNQ1!", "timeframe": "5m",
+  "config": {"atr_stop_mult": 1.5, "atr_target_mult": 2.5, "expiry_bars": 24, "non_overlapping": true, "candidates_considered": 100},
+  "by_source": {
+    "analysis": {
+      "trades_taken": 61, "skipped_no_direction": 22, "skipped_no_atr": 0,
+      "skipped_overlapping": 17, "skipped_no_forward_data": 0,
+      "wins": 27, "losses": 33, "breakeven": 1, "expired": 9,
+      "total_pnl_usd": -412.0, "gross_profit_usd": 890.0, "gross_loss_usd": 1302.0,
+      "win_rate": 0.45, "profit_factor": 0.6834, "avg_pnl_usd": -6.75,
+      "trades": []
+    },
+    "always_bullish": { "...": "same shape" },
+    "always_bearish": { "...": "same shape" },
+    "vwap": { "...": "same shape" },
+    "inverse_analysis": { "...": "same shape" },
+    "coordinator": { "...": "same shape" }
+  }
+}
+```
+`trades` is always `[]` at this endpoint's compact default — per-trade
+detail exists in `app/backtest.run_barrier_backtest(..., include_trades=True)`
+for direct/programmatic use, but is deliberately excluded from the
+HTTP response to stay compact and WebFetch-reliable at scale, same
+constraint that's shaped every other endpoint in this project queried
+against production through this session. `profit_factor` is `null`
+when there are no losses to divide by (undefined, not a misleading
+infinity), and `win_rate`/`avg_pnl_usd` are `null` when nothing
+resolved to a decided win/loss yet. Entirely offline: no LLM calls,
+no new data collection. 400 if `sources` contains an unrecognized
+value. `COORDINATOR_THRESHOLD` and the Coordinator's own scoring are
+untouched — this is read-only analysis, same as every diagnostic tier
+before it.
+
 ---
 
 ## Auto-execution (Tier 3.9)
@@ -705,6 +771,9 @@ were NOT touched by this tier.
 | `ORDER_EXPIRY_MINUTES` | no | `60` | Tier 3.2: cancels a `pending_fill` order after this many EVENT-time minutes unfilled |
 | `SLIPPAGE_POINTS` | no | `0.25` | Tier 3.2: applied against the trader on market entries and stop-loss exits only |
 | `COMMISSION_PER_CONTRACT` | no | `2.0` | Tier 3.2: flat round-trip commission, subtracted from `pnl_usd` on every closed trade |
+| `BACKTEST_ATR_STOP_MULT` | no | `1.5` | Tier 3.10: ATR-barrier backtest-lite's default stop distance (multiple of the anchor bar's own ATR) — only affects the offline benchmark, never real trades or Execution's actual proposed geometry |
+| `BACKTEST_ATR_TARGET_MULT` | no | `2.5` | Tier 3.10: same, target distance |
+| `BACKTEST_EXPIRY_BARS` | no | `24` | Tier 3.10: how many forward bars a hypothetical barrier trade is walked before being marked "expired" (mark-to-last-seen-close) |
 
 ---
 

@@ -507,3 +507,81 @@ def test_webhook_background_task_calls_auto_execute_when_enabled(monkeypatch):
     assert called["candidate"]["symbol"] == "MNQ1!"
 
     os.unlink(tmp.name)
+
+
+# ---------------------------------------------------------------------------
+# Tier 3.10: ATR-barrier backtest-lite
+# ---------------------------------------------------------------------------
+
+def _save_market_bar(storage, symbol, timeframe, timestamp, open_, high, low, close, atr=None):
+    import json as _json
+    conn = storage.get_connection()
+    payload = {
+        "event_id": f"{symbol}:{timeframe}:{timestamp}",
+        "symbol": symbol, "timeframe": timeframe, "timestamp": timestamp,
+        "open": open_, "high": high, "low": low, "close": close, "atr": atr,
+    }
+    conn.execute(
+        "INSERT INTO market_state (event_id, symbol, timeframe, timestamp, payload_json) VALUES (?, ?, ?, ?, ?)",
+        (payload["event_id"], symbol, timeframe, timestamp, _json.dumps(payload)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_backtest_lite_endpoint_returns_all_sources_by_default(client):
+    import app.storage as storage
+
+    anchor = "2026-08-11T14:00:00Z"
+    bar = {"event_id": "evt-bt-1", "symbol": "MNQ1!", "timeframe": "5m", "timestamp": anchor, "atr": 2.0}
+    decision = {
+        "decision": "enter_long", "timestamp": anchor,
+        "opinions_used": {"analysis": {"direction": "bullish", "timestamp": anchor}},
+    }
+    storage.save_candidate(candidate_id="cand-bt-1", symbol="MNQ1!", timeframe="5m", bar=bar, decision=decision)
+    _save_market_bar(
+        storage, "MNQ1!", "5m", "2026-08-11T14:05:00Z",
+        open_=20000.0, high=20060.0, low=19995.0, close=20055.0,
+    )
+
+    r = client.get("/candidates/history/backtest-lite", params={"symbol": "MNQ1!", "timeframe": "5m"})
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body["by_source"].keys()) == {
+        "analysis", "coordinator", "inverse_analysis", "always_bullish", "always_bearish", "vwap",
+    }
+    assert body["by_source"]["coordinator"]["trades_taken"] == 1
+
+
+def test_backtest_lite_endpoint_rejects_unknown_source(client):
+    r = client.get(
+        "/candidates/history/backtest-lite",
+        params={"symbol": "MNQ1!", "timeframe": "5m", "sources": "not_a_real_source"},
+    )
+    assert r.status_code == 400
+
+
+def test_backtest_lite_endpoint_accepts_a_source_subset(client):
+    import app.storage as storage
+
+    anchor = "2026-08-11T14:00:00Z"
+    bar = {"event_id": "evt-bt-2", "symbol": "MNQ1!", "timeframe": "5m", "timestamp": anchor, "atr": 2.0}
+    decision = {"decision": "enter_short", "timestamp": anchor, "opinions_used": {}}
+    storage.save_candidate(candidate_id="cand-bt-2", symbol="MNQ1!", timeframe="5m", bar=bar, decision=decision)
+    # Bearish stop sits at entry+1.5*ATR=20003, target at
+    # entry-2.5*ATR=19995 — keep high below the stop so only the
+    # target is touched this bar (a clean win, not an ambiguous
+    # same-bar stop/target tie).
+    _save_market_bar(
+        storage, "MNQ1!", "5m", "2026-08-11T14:05:00Z",
+        open_=20000.0, high=20001.0, low=19940.0, close=19945.0,
+    )
+
+    r = client.get(
+        "/candidates/history/backtest-lite",
+        params={"symbol": "MNQ1!", "timeframe": "5m", "sources": "coordinator,always_bullish"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body["by_source"].keys()) == {"coordinator", "always_bullish"}
+    assert body["by_source"]["coordinator"]["wins"] == 1

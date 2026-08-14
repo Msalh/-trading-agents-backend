@@ -484,6 +484,39 @@ not affect the candidate/decision work already saved by the same
 background task. As with every tier before it, COORDINATOR_THRESHOLD
 and the Coordinator's own scoring were not touched.
 
+Tier 3.10 (ATR-barrier benchmark): the same external review's other
+unaddressed item — every accuracy figure through Tier 3.9 (this
+module's outcomes.py-backed endpoints, replay.py's threshold sweep)
+uses the "price higher/lower than the decision price N minutes later"
+proxy. That's cheap and has driven every real finding so far, but it
+was never a trade simulation — no entry/stop/target geometry, no
+slippage, no commission, no notion of "the stop got hit before the
+target did," which the review flagged as necessary before any
+"Analysis beats/doesn't beat a simple baseline" comparison can be
+trusted. New app/backtest.py runs the exact same fill/stop/target/
+slippage/commission conventions app/paper_trades.process_new_bar()
+uses for real trades, offline, against bars already in storage, for a
+hypothetical trade that's never actually taken — nothing written to
+any trade table. Entry is a market fill at the next bar's open after
+a candidate's anchor bar; stop/target are the anchor bar's own
+already-stored ATR (no lookahead) times a stop/target multiple — NOT
+Execution's proposed geometry, since this benchmarks the directional
+SIGNAL rather than re-litigating what Execution would have picked.
+New GET /candidates/history/backtest-lite, built on
+compute_backtest_comparison(), runs several direction sources
+(Analysis's own opinion, the blended Coordinator decision, trivial
+always-bullish/always-bearish/VWAP-side baselines, and Analysis's
+calls inverted as a pure diagnostic) through the identical barrier
+mechanics side by side, with non-overlapping-by-default sampling
+(mirroring the real MAX_OPEN_POSITIONS=1 constraint instead of
+counting correlated back-to-back candidates as independent evidence)
+— the actual apples-to-apples "does Analysis have a testable edge
+over cheap deterministic baselines" comparison the horizon-price proxy
+alone couldn't answer honestly. Entirely offline, no LLM calls, no new
+data collection, no trading-logic change — COORDINATOR_THRESHOLD and
+the Coordinator's own scoring remain untouched, same as every
+diagnostic tier before it.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -500,6 +533,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.account_risk import compute_current_drawdown_used, compute_daily_loss_used
 from app.analysis_agent import AnalysisAgentError, run_analysis
+from app.backtest import ATR_STOP_MULT, ATR_TARGET_MULT, DIRECTION_SOURCES, EXPIRY_BARS, compute_backtest_comparison
 from app.candidates import (
     CandidateError,
     CandidateLockedError,
@@ -1532,6 +1566,82 @@ def candidates_history_replay_threshold_sweep(
         min_available_weight=min_available_weight,
         horizons=_parse_replay_horizons(horizons),
     )
+
+
+@app.get("/candidates/history/backtest-lite")
+def candidates_history_backtest_lite(
+    symbol: str = Query(...),
+    timeframe: str = Query(...),
+    limit: int = Query(default=200, le=1000),
+    sources: str = Query(
+        default=None,
+        description="comma-separated direction sources to compare, e.g. analysis,coordinator,always_bullish,always_bearish,vwap,inverse_analysis — omit for all",
+    ),
+    atr_stop_mult: float = Query(default=ATR_STOP_MULT),
+    atr_target_mult: float = Query(default=ATR_TARGET_MULT),
+    expiry_bars: int = Query(default=EXPIRY_BARS, le=200),
+    non_overlapping: bool = Query(default=True),
+) -> dict:
+    """Tier 3.10 (ATR-barrier benchmark): every accuracy figure this
+    project has produced through Tier 3.9 uses the "price higher/lower
+    N minutes later" proxy — never an entry/stop/target simulation, no
+    slippage, no commission, no notion of "the stop got hit before the
+    target." Built on app/backtest.compute_backtest_comparison(),
+    which runs app/paper_trades.process_new_bar()'s exact fill/stop/
+    target/slippage/commission conventions OFFLINE against bars
+    already in storage, for a hypothetical trade that was never
+    actually taken — same mechanics as a real paper trade, just not
+    persisted anywhere. Entry/stop/target geometry is ATR-based
+    (the anchor bar's own already-stored ATR, no lookahead), NOT
+    Execution's LLM-proposed levels — this benchmarks the directional
+    SIGNAL, not what Execution would have picked.
+
+    `sources` lets several direction signals run through the identical
+    barrier mechanics side by side for direct comparison: "analysis"
+    (Analysis's own opinion), "coordinator" (the actual blended
+    decision), "always_bullish"/"always_bearish"/"vwap" (trivial,
+    LLM-independent baselines), and "inverse_analysis" (Analysis's
+    calls flipped — diagnostic only, never acted on, matches Tier
+    3.8's framing for the same baseline in the horizon-proxy endpoint).
+    Same candidate population and ATR geometry held fixed across every
+    source in one call, so a difference in results is attributable to
+    the direction signal alone — this is the actual "does Analysis
+    beat simple baselines" comparison the external review asked for,
+    which the horizon-price proxy alone couldn't answer honestly.
+
+    `non_overlapping` (default true) skips a candidate whose anchor
+    falls before the previous simulated trade (for that source)
+    resolved — avoids counting overlapping candidates from a fast
+    timeframe as independent evidence, mirroring the real
+    MAX_OPEN_POSITIONS=1 constraint instead of pretending unlimited
+    concurrent hypothetical positions.
+
+    Entirely offline: no LLM calls, no new data collection, nothing
+    written to any trade table. COORDINATOR_THRESHOLD and the
+    Coordinator's own scoring are untouched — this is read-only
+    analysis, same as every diagnostic tier before it."""
+    source_list = [s.strip() for s in sources.split(",") if s.strip()] if sources else None
+    if source_list:
+        unknown = [s for s in source_list if s not in DIRECTION_SOURCES]
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=f"unknown source(s) {unknown} — must be one of {list(DIRECTION_SOURCES)}",
+            )
+
+    candidates = get_candidate_history(symbol=symbol, timeframe=timeframe, limit=limit)
+    return {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        **compute_backtest_comparison(
+            candidates,
+            sources=source_list,
+            stop_mult=atr_stop_mult,
+            target_mult=atr_target_mult,
+            expiry_bars=expiry_bars,
+            non_overlapping=non_overlapping,
+        ),
+    }
 
 
 @app.get("/candidates/{candidate_id}")

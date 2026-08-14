@@ -242,6 +242,33 @@ def get_recent_as_of(symbol: str, timeframe: str, as_of_timestamp: str, limit: i
         conn.close()
 
 
+def get_bars_after(symbol: str, timeframe: str, after_timestamp: str, limit: int = 50) -> list[dict]:
+    """Tier 3.10 (ATR-barrier backtest-lite): the walk-FORWARD
+    counterpart to get_recent_as_of() — bars strictly AFTER
+    after_timestamp, ascending (oldest first), for simulating a
+    hypothetical trade bar-by-bar from its entry point forward. Never
+    includes the bar at after_timestamp itself, matching the live
+    paper-trade engine's convention that a trade can only fill against
+    a bar that arrives after the one that triggered it, never the
+    triggering bar itself (that bar has already closed by the time
+    any decision is made from it — filling "into" it would be
+    lookahead bias)."""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT payload_json FROM market_state
+            WHERE symbol = ? AND timeframe = ? AND timestamp > ?
+            ORDER BY timestamp ASC
+            LIMIT ?
+            """,
+            (symbol, timeframe, after_timestamp, limit),
+        ).fetchall()
+        return [json.loads(r["payload_json"]) for r in rows]
+    finally:
+        conn.close()
+
+
 def save_opinion(agent: str, symbol: str, timeframe: str, timestamp: str, opinion: dict) -> None:
     conn = get_connection()
     try:
