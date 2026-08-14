@@ -553,3 +553,89 @@ def test_per_agent_accuracy_dedup_does_not_cross_contaminate_agents(fresh_env):
     summary = outcomes.compute_per_agent_accuracy([c], horizons=[15])
     assert summary["distinct_opinion_counts"]["analysis"] == 1
     assert summary["distinct_opinion_counts"]["news"] == 1
+
+
+# ---------------------------------------------------------------------------
+# compute_agent_opinion_detail (Tier 3.7)
+# ---------------------------------------------------------------------------
+
+def test_opinion_detail_returns_one_record_per_distinct_opinion(fresh_env):
+    storage, pt, outcomes = fresh_env
+    t1 = datetime.now(timezone.utc) - timedelta(minutes=60)
+    t2 = datetime.now(timezone.utc) - timedelta(minutes=30)
+    _save_bar(storage, "TEST", "5m", t1, 100.0)
+    _save_bar(storage, "TEST", "5m", t1 + timedelta(minutes=15), 105.0)
+    _save_bar(storage, "TEST", "5m", t2, 200.0)
+    _save_bar(storage, "TEST", "5m", t2 + timedelta(minutes=15), 195.0)
+
+    c1 = _candidate_with_opinions("c1", "TEST", "5m", t1, {"analysis": {"direction": "bullish", "timestamp": _iso(t1), "confidence": 70, "flags": []}})
+    c2 = _candidate_with_opinions("c2", "TEST", "5m", t2, {"analysis": {"direction": "bullish", "timestamp": _iso(t2), "confidence": 40, "flags": ["choppy"]}})
+
+    opinions = outcomes.compute_agent_opinion_detail([c1, c2], agent="analysis", horizons=[15])
+    assert len(opinions) == 2
+    # sorted oldest first
+    assert opinions[0]["opinion_timestamp"] == _iso(t1)
+    assert opinions[0]["confidence"] == 70
+    assert opinions[0]["flags"] == []
+    assert opinions[0]["outcome_by_horizon"][15] == "correct"
+    assert opinions[1]["opinion_timestamp"] == _iso(t2)
+    assert opinions[1]["confidence"] == 40
+    assert opinions[1]["flags"] == ["choppy"]
+    assert opinions[1]["outcome_by_horizon"][15] == "incorrect"
+
+
+def test_opinion_detail_tracks_reuse_count_across_candidates(fresh_env):
+    """The per-opinion version of Tier 3.6's distinct_opinion_counts --
+    a single reused News/Macro opinion should show how many candidates
+    in the window actually reused it."""
+    storage, pt, outcomes = fresh_env
+    opinion_time = datetime.now(timezone.utc) - timedelta(minutes=60)
+    horizon_time = opinion_time + timedelta(minutes=15)
+    _save_bar(storage, "TEST", "5m", opinion_time, 100.0)
+    _save_bar(storage, "TEST", "5m", horizon_time, 105.0)
+
+    same_opinion = {"direction": "bullish", "timestamp": _iso(opinion_time), "confidence": 55, "flags": []}
+    candidates = [
+        _candidate_with_opinions("c1", "TEST", "5m", opinion_time + timedelta(minutes=5), {"news": same_opinion}),
+        _candidate_with_opinions("c2", "TEST", "5m", opinion_time + timedelta(minutes=10), {"news": same_opinion}),
+        _candidate_with_opinions("c3", "TEST", "5m", opinion_time + timedelta(minutes=15), {"news": same_opinion}),
+    ]
+
+    opinions = outcomes.compute_agent_opinion_detail(candidates, agent="news", horizons=[15])
+    assert len(opinions) == 1
+    assert opinions[0]["reused_by_candidate_count"] == 3
+
+
+def test_opinion_detail_skips_neutral_and_missing_opinions(fresh_env):
+    storage, pt, outcomes = fresh_env
+    decision_time = datetime.now(timezone.utc) - timedelta(minutes=30)
+    c1 = _candidate_with_opinions("c1", "TEST", "5m", decision_time, {"analysis": {"direction": "neutral", "timestamp": _iso(decision_time)}})
+    c2 = _candidate_with_opinions("c2", "TEST", "5m", decision_time, {})
+
+    opinions = outcomes.compute_agent_opinion_detail([c1, c2], agent="analysis", horizons=[15])
+    assert opinions == []
+
+
+def test_opinion_detail_rejects_unknown_agent(fresh_env):
+    storage, pt, outcomes = fresh_env
+    with pytest.raises(ValueError):
+        outcomes.compute_agent_opinion_detail([], agent="timing", horizons=[15])
+
+
+def test_opinion_detail_excludes_reasoning_and_key_data(fresh_env):
+    """Deliberately compact -- reasoning/key_data must never leak into
+    the record even if present on the source opinion."""
+    storage, pt, outcomes = fresh_env
+    decision_time = datetime.now(timezone.utc) - timedelta(minutes=30)
+    _save_bar(storage, "TEST", "5m", decision_time, 100.0)
+    c = _candidate_with_opinions(
+        "c1", "TEST", "5m", decision_time,
+        {"analysis": {
+            "direction": "bullish", "timestamp": _iso(decision_time), "confidence": 60,
+            "flags": [], "reasoning": "a long explanation", "key_data": {"vwap": 100.5},
+        }},
+    )
+
+    opinions = outcomes.compute_agent_opinion_detail([c], agent="analysis", horizons=[15])
+    assert "reasoning" not in opinions[0]
+    assert "key_data" not in opinions[0]

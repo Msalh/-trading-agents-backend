@@ -426,3 +426,87 @@ def compute_per_agent_accuracy(candidates: list[dict], horizons: list[int] = Non
         "by_distinct_opinion": _finalize_agent_counts(distinct_counts),
         "distinct_opinion_counts": {agent: len(keys) for agent, keys in seen_opinion_keys.items()},
     }
+
+
+def compute_agent_opinion_detail(candidates: list[dict], agent: str, horizons: list[int] = None) -> list[dict]:
+    """Tier 3.7: compute_per_agent_accuracy() (Tier 3.5/3.6) answers
+    WHETHER an agent shows signal; this answers the natural follow-up
+    once an answer is in hand -- WHY. Analysis (78 distinct opinions in
+    production as of this tier) turned out to be the one agent with
+    enough real, deduplicated evidence to say something concrete: a
+    consistent ~30% accuracy across all three default horizons, well
+    below the 50% coin-flip line. That number alone doesn't explain
+    anything -- explaining it needs to see whether the wrong calls
+    cluster around something (low self-reported confidence, a flag the
+    agent already raises about its own read like "choppy" or
+    "conflicting_signals", a particular time of day), which the
+    aggregate counts in compute_per_agent_accuracy() can't show.
+
+    Returns one record per DISTINCT opinion for the given agent (same
+    (symbol, timeframe, opinion_timestamp, direction) dedup key as
+    Tier 3.6's by_distinct_opinion, so a reused News/Macro opinion
+    still only appears once here) -- each with the opinion's own
+    self-reported confidence/flags (already frozen in opinions_used,
+    no new lookup) plus the outcome at every requested horizon and how
+    many candidates in the input reused this exact opinion (low-N
+    agents' apparent accuracy rests on very few of these -- surfacing
+    the reuse count here makes that visible per-opinion, not just as
+    the one aggregate distinct_opinion_counts number). Sorted oldest
+    first. Entirely offline, no LLM calls, no new data — same
+    hypothetical horizon estimate the rest of this module uses.
+
+    Deliberately excludes each opinion's free-text "reasoning" and
+    full "key_data" — this is meant for pattern-finding across many
+    opinions at once (confidence/flag correlation with outcome), and a
+    large detailed payload here would hit the same WebFetch large-JSON
+    summarization unreliability that shaped every other compact
+    endpoint in this project. A caller that wants one opinion's full
+    reasoning already has it via /agents/{agent}/history or the
+    candidate's own opinions_used."""
+    if agent not in _DIRECTIONAL_AGENT_NAMES:
+        raise ValueError(f"agent must be one of {_DIRECTIONAL_AGENT_NAMES}, got {agent!r}")
+    horizons = horizons or HORIZON_MINUTES_DEFAULT
+
+    records_by_key: dict[tuple, dict] = {}
+    outcome_cache: dict[tuple, str] = {}
+
+    for candidate in candidates:
+        symbol, timeframe = candidate["symbol"], candidate["timeframe"]
+        decision = candidate.get("decision") or {}
+        opinions_used = decision.get("opinions_used") or {}
+        opinion = opinions_used.get(agent)
+        if not opinion:
+            continue
+        pseudo_decision = _OPINION_DIRECTION_TO_DECISION.get(opinion.get("direction"))
+        if pseudo_decision is None:
+            continue  # neutral (or malformed) -- nothing to score
+        anchor_timestamp = opinion.get("timestamp") or decision.get("timestamp")
+        if not anchor_timestamp:
+            continue
+
+        opinion_key = (symbol, timeframe, anchor_timestamp, pseudo_decision)
+        if opinion_key not in records_by_key:
+            outcome_by_horizon = {}
+            for h in horizons:
+                cache_key = opinion_key + (h,)
+                if cache_key not in outcome_cache:
+                    outcome_cache[cache_key] = compute_outcome_at_horizon(
+                        symbol=symbol, timeframe=timeframe,
+                        decision_timestamp=anchor_timestamp, decision_direction=pseudo_decision,
+                        horizon_minutes=h,
+                    ).outcome
+                outcome_by_horizon[h] = outcome_cache[cache_key]
+
+            records_by_key[opinion_key] = {
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "opinion_timestamp": anchor_timestamp,
+                "direction": opinion.get("direction"),
+                "confidence": opinion.get("confidence"),
+                "flags": opinion.get("flags") or [],
+                "outcome_by_horizon": outcome_by_horizon,
+                "reused_by_candidate_count": 0,
+            }
+        records_by_key[opinion_key]["reused_by_candidate_count"] += 1
+
+    return sorted(records_by_key.values(), key=lambda r: r["opinion_timestamp"])

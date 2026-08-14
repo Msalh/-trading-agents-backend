@@ -391,6 +391,30 @@ production in this same investigation, nothing else consumes it yet),
 so the response shape changed in place rather than versioning a new
 endpoint.
 
+Running Tier 3.6's by_distinct_opinion view against production
+answered the "does this agent show signal" question concretely for
+the first time: News/Macro only had 6 and 4 genuinely distinct
+opinions respectively — nowhere near enough to say anything either
+way — but Analysis had 78, and its accuracy across all three default
+horizons (34.7% / 31.9% / 29.9%) is consistently and substantially
+below the 50% coin-flip line on a real sample, not a duplication
+artifact.
+
+Tier 3.7 (per-opinion diagnostic detail): with a real finding on
+Analysis in hand, the next question is WHY. New GET
+/candidates/history/outcomes/by-agent/detail, built on
+app/outcomes.compute_agent_opinion_detail(), returns one record per
+distinct opinion for a given agent — opinion_timestamp, direction,
+confidence, flags, reused_by_candidate_count, and outcome_by_horizon —
+so a caller can check whether Analysis's wrong calls cluster around
+low self-reported confidence, a flag it already raises about its own
+read (choppy/conflicting_signals/low_data), or something else visible
+per-opinion that the aggregate counts in the endpoint above can't
+show. Deliberately excludes each opinion's free-text reasoning/
+key_data to stay compact and WebFetch-reliable at scale — same design
+constraint that shaped every other endpoint in this project meant to
+be queried against production through this session.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -424,6 +448,7 @@ from app.models import MarketStateOut, MarketStatePayload, WebhookAck
 from app.news_agent import NewsAgentError, run_news
 from app.outcomes import (
     HORIZON_MINUTES_DEFAULT,
+    compute_agent_opinion_detail,
     compute_outcome_for_candidate,
     compute_outcomes_for_decision,
     compute_per_agent_accuracy,
@@ -1042,6 +1067,59 @@ def candidates_history_outcomes_by_agent(
 
     candidates = get_candidate_history(symbol=symbol, timeframe=timeframe, limit=limit)
     return compute_per_agent_accuracy(candidates, horizons=horizon_list)
+
+
+@app.get("/candidates/history/outcomes/by-agent/detail")
+def candidates_history_outcomes_by_agent_detail(
+    symbol: str = Query(...),
+    timeframe: str = Query(...),
+    agent: str = Query(...),
+    limit: int = Query(default=100, le=500),
+    horizons: str = Query(default="15,30,60"),
+) -> dict:
+    """Tier 3.7 (per-opinion diagnostic detail): the by-agent endpoint
+    above answers WHETHER an agent shows signal; this answers WHY, once
+    there's an answer worth explaining. Built after production data
+    showed Analysis (78 distinct opinions, easily the best-populated
+    of the three agents) sitting at ~30% accuracy across every default
+    horizon — a real, sample-backed underperformance, not a
+    duplication artifact. Explaining that needs to see whether the
+    wrong calls cluster around something the aggregate can't show:
+    low self-reported confidence, a flag the agent already raises
+    about its own read ("choppy", "conflicting_signals", "low_data"),
+    or a particular time window.
+
+    Returns one record per DISTINCT opinion for `agent` (same dedup
+    key as the by_distinct_opinion section above, sorted oldest
+    first): opinion_timestamp, direction, confidence, flags,
+    reused_by_candidate_count (how many candidates in this window
+    reused this exact opinion — the per-opinion version of
+    distinct_opinion_counts, useful for spotting whether a low-N
+    agent's headline number rests on one dominant call), and
+    outcome_by_horizon ({15: "correct", ...}). Deliberately excludes
+    each opinion's free-text reasoning/key_data to keep the payload
+    compact and reliable for large windows — see
+    app/outcomes.compute_agent_opinion_detail()'s docstring for why.
+    400 if `agent` isn't analysis/news/macro or `horizons` doesn't
+    parse as comma-separated integers."""
+    try:
+        horizon_list = [int(h.strip()) for h in horizons.split(",") if h.strip()]
+    except ValueError:
+        raise HTTPException(status_code=400, detail="horizons must be comma-separated integers")
+
+    candidates = get_candidate_history(symbol=symbol, timeframe=timeframe, limit=limit)
+    try:
+        opinions = compute_agent_opinion_detail(candidates, agent=agent, horizons=horizon_list)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "agent": agent,
+        "distinct_opinion_count": len(opinions),
+        "opinions": opinions,
+    }
 
 
 def _parse_replay_horizons(horizons: str) -> list[int]:

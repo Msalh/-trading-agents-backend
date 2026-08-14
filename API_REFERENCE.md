@@ -363,6 +363,50 @@ directly how much duplication a `by_candidate` figure was resting on
 (Analysis, which only stays fresh for `ANALYSIS_MAX_AGE_MINUTES`,
 default 15, is reused far less than News/Macro in practice).
 
+Running `by_distinct_opinion` against production answered the
+"does this agent show signal" question concretely for the first
+time: News/Macro had only 6 and 4 genuinely distinct opinions
+respectively — too few to conclude anything either way — but Analysis
+had 78, and its accuracy across all three default horizons (34.7% /
+31.9% / 29.9%) is consistently and substantially below the 50%
+coin-flip line on a real sample, not a duplication artifact.
+
+### `GET /candidates/history/outcomes/by-agent/detail?symbol=MNQ1!&timeframe=5m&agent=analysis&limit=100&horizons=15,30,60`
+Tier 3.7 (per-opinion diagnostic detail). The endpoint above answers
+WHETHER an agent shows signal; this answers WHY, once there's a real
+finding worth explaining (built after Analysis's ~30%-across-the-board
+production result above). Returns one record per DISTINCT opinion for
+the given `agent` (required — one of `analysis`/`news`/`macro`, 400
+otherwise), same dedup key as `by_distinct_opinion`, sorted oldest
+first:
+```json
+{
+  "symbol": "MNQ1!", "timeframe": "5m", "agent": "analysis",
+  "distinct_opinion_count": 78,
+  "opinions": [
+    {
+      "symbol": "MNQ1!", "timeframe": "5m",
+      "opinion_timestamp": "2026-08-12T14:05:11Z",
+      "direction": "bullish", "confidence": 55, "flags": ["choppy"],
+      "outcome_by_horizon": {"15": "incorrect", "30": "incorrect", "60": "correct"},
+      "reused_by_candidate_count": 1
+    }
+  ]
+}
+```
+`confidence`/`flags` are each opinion's own self-reported read, read
+straight from the already-frozen `opinions_used` entry — no new
+lookup. `reused_by_candidate_count` is the per-opinion version of
+`distinct_opinion_counts` above — useful for spotting whether a
+low-N agent's headline number rests on one dominant call.
+Deliberately excludes each opinion's free-text `reasoning` and
+`key_data` to stay compact and reliable for large windows (same
+WebFetch-large-JSON constraint that shaped every other endpoint in
+this project meant to be queried against production through an
+LLM-mediated fetch) — pull `/agents/{agent}/history` for full
+reasoning on a specific opinion. Entirely offline, no LLM calls, no
+trade side effects.
+
 ---
 
 ## Coordinator
