@@ -65,6 +65,20 @@ be made honestly on the horizon-price proxy alone.
 COORDINATOR_THRESHOLD and the Coordinator's own scoring are untouched
 by this module, same as every diagnostic tier before it — this is
 read-only analysis, not a trading-logic change.
+
+Tier 3.11 (champion/challenger, out-of-sample): the first real
+backtest-lite run against production found inverse_analysis (Analysis's
+calls flipped) as the only source with profit_factor > 1 — exactly the
+kind of finding the external review warned about, since it was found
+on the same historical sample it would be used to justify a change
+against. split_candidates_chronologically() and
+compute_champion_challenger_report() below hold out the most RECENT
+slice of candidate history (never a random split — regimes are
+time-correlated) and run every source on the calibration window AND
+the held-out validation window separately, so a reader can see whether
+a challenger's apparent edge survives on data it was never fitted to.
+Reports both windows side by side; never picks a winner or flips
+anything on its own.
 """
 
 import os
@@ -417,5 +431,125 @@ def compute_backtest_comparison(
                 expiry_bars=expiry_bars, non_overlapping=non_overlapping,
             )
             for source in sources
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tier 3.11: champion/challenger out-of-sample evaluation
+# ---------------------------------------------------------------------------
+#
+# Tier 3.10's own first real result (inverse_analysis showing the only
+# profit_factor > 1 among six sources tested) is exactly the kind of
+# finding the external review warned about: it was found by looking at
+# the same historical sample it would be used to justify a change
+# against. A pattern "discovered" and "validated" on identical data is
+# not validated at all — it's fitting to history. The review's
+# explicit recommendation was a champion/challenger design evaluated
+# strictly on data NOT used to find the pattern.
+#
+# split_candidates_chronologically() and compute_champion_challenger_report()
+# below are the harness for that: hold out the most RECENT slice of
+# candidate history (never a random split — a random split lets a
+# challenger "see" the future relative to a calibration-window
+# decision, and lets time-correlated regimes leak across the split),
+# run the exact same run_barrier_backtest() machinery Tier 3.10 built
+# on BOTH the calibration (older) and validation (held-out, newer)
+# windows independently for the champion and every requested
+# challenger, and report both side by side rather than collapsing them
+# into a single pass/fail verdict — a rigid threshold would be its own
+# kind of overfitting at this sample size. A challenger whose edge
+# holds up on the validation window is meaningfully different evidence
+# than one that only looked good on the window used to notice it.
+
+DEFAULT_HOLDOUT_FRACTION = float(os.environ.get("BACKTEST_HOLDOUT_FRACTION", "0.3"))
+
+
+def split_candidates_chronologically(
+    candidates: list[dict], holdout_fraction: float = DEFAULT_HOLDOUT_FRACTION
+) -> tuple[list[dict], list[dict]]:
+    """Sorts candidates by their own anchor timestamp (oldest first,
+    same anchor logic every other function in this module uses —
+    candidates with no resolvable anchor are dropped, same as
+    run_barrier_backtest already does implicitly per-source) and
+    splits them into (calibration, validation): the earliest
+    (1 - holdout_fraction) as calibration, the most recent
+    holdout_fraction as validation. Never a random split — see the
+    module note above for why."""
+    if not (0.0 < holdout_fraction < 1.0):
+        raise ValueError(f"holdout_fraction must be between 0 and 1 (exclusive), got {holdout_fraction!r}")
+
+    dated = [
+        (anchor, candidate)
+        for candidate in candidates
+        for anchor in [_candidate_anchor_timestamp(candidate)]
+        if anchor
+    ]
+    dated.sort(key=lambda pair: pair[0])
+
+    split_index = round(len(dated) * (1 - holdout_fraction))
+    calibration = [candidate for _, candidate in dated[:split_index]]
+    validation = [candidate for _, candidate in dated[split_index:]]
+    return calibration, validation
+
+
+def compute_champion_challenger_report(
+    candidates: list[dict],
+    champion: str = "coordinator",
+    challengers: list[str] | None = None,
+    holdout_fraction: float = DEFAULT_HOLDOUT_FRACTION,
+    stop_mult: float = ATR_STOP_MULT,
+    target_mult: float = ATR_TARGET_MULT,
+    expiry_bars: int = EXPIRY_BARS,
+    non_overlapping: bool = True,
+) -> dict:
+    """The actual champion/challenger report: champion is the
+    currently-live decision source (default "coordinator" — the real
+    system), challengers are any other direction_source(s) being
+    considered as a replacement or input to one (default: every other
+    entry in DIRECTION_SOURCES). Every source is run TWICE — once on
+    the calibration window, once on the held-out validation window —
+    with the exact same ATR/expiry/non-overlap config both times, so a
+    reader can see directly whether a challenger's apparent edge
+    survives on data it was never fitted to, or was only ever visible
+    on the window used to spot it in the first place.
+
+    This function only reports; it never picks a winner or flips
+    anything — matches Tier 3.10's inverse_analysis staying purely
+    diagnostic, and the standing project rule that any real trading-
+    logic change needs the user's explicit direction."""
+    if champion not in DIRECTION_SOURCES:
+        raise ValueError(f"unknown champion {champion!r} — must be one of {DIRECTION_SOURCES}")
+    challengers = challengers if challengers is not None else [s for s in DIRECTION_SOURCES if s != champion]
+    for c in challengers:
+        if c not in DIRECTION_SOURCES:
+            raise ValueError(f"unknown challenger {c!r} — must be one of {DIRECTION_SOURCES}")
+
+    calibration, validation = split_candidates_chronologically(candidates, holdout_fraction)
+
+    def _run(pool: list[dict], source: str) -> dict:
+        return run_barrier_backtest(
+            pool, direction_source=source, stop_mult=stop_mult, target_mult=target_mult,
+            expiry_bars=expiry_bars, non_overlapping=non_overlapping,
+        )
+
+    sources_to_run = [champion] + [c for c in challengers if c != champion]
+    return {
+        "config": {
+            "atr_stop_mult": stop_mult, "atr_target_mult": target_mult,
+            "expiry_bars": expiry_bars, "non_overlapping": non_overlapping,
+            "holdout_fraction": holdout_fraction,
+            "candidates_considered": len(candidates),
+            "calibration_candidates": len(calibration),
+            "validation_candidates": len(validation),
+        },
+        "champion": champion,
+        "challengers": [c for c in challengers if c != champion],
+        "by_source": {
+            source: {
+                "calibration": _run(calibration, source),
+                "validation": _run(validation, source),
+            }
+            for source in sources_to_run
         },
     }

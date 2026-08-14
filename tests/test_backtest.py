@@ -329,3 +329,93 @@ def test_compute_backtest_comparison_respects_requested_sources_subset(fresh_env
 
     result = backtest.compute_backtest_comparison([candidate], sources=["coordinator", "always_bearish"])
     assert set(result["by_source"].keys()) == {"coordinator", "always_bearish"}
+
+
+# ---------------------------------------------------------------------------
+# split_candidates_chronologically (Tier 3.11)
+# ---------------------------------------------------------------------------
+
+def test_split_chronologically_puts_earliest_in_calibration_and_latest_in_validation(fresh_env):
+    _, backtest = fresh_env
+    base = datetime(2026, 8, 11, 14, 0, 0, tzinfo=timezone.utc)
+    # 10 candidates, 1 minute apart, given to the function OUT OF
+    # ORDER (newest-first, matching get_candidate_history's real
+    # ordering) to confirm the split re-sorts chronologically itself.
+    candidates = [
+        _candidate(f"c{i}", "TEST", "5m", base + timedelta(minutes=i), atr=2.0)
+        for i in reversed(range(10))
+    ]
+    calibration, validation = backtest.split_candidates_chronologically(candidates, holdout_fraction=0.3)
+    assert len(calibration) == 7
+    assert len(validation) == 3
+    assert [c["candidate_id"] for c in calibration] == [f"c{i}" for i in range(7)]
+    assert [c["candidate_id"] for c in validation] == [f"c{i}" for i in range(7, 10)]
+
+
+def test_split_chronologically_drops_candidates_with_no_resolvable_anchor(fresh_env):
+    _, backtest = fresh_env
+    base = datetime(2026, 8, 11, 14, 0, 0, tzinfo=timezone.utc)
+    good = _candidate("c1", "TEST", "5m", base, atr=2.0)
+    bad = {"candidate_id": "c2", "symbol": "TEST", "timeframe": "5m", "bar": {}, "decision": {}}
+    calibration, validation = backtest.split_candidates_chronologically([good, bad], holdout_fraction=0.5)
+    total = len(calibration) + len(validation)
+    assert total == 1  # "bad" had no anchor timestamp anywhere and was dropped
+
+
+def test_split_chronologically_rejects_out_of_range_holdout_fraction(fresh_env):
+    _, backtest = fresh_env
+    with pytest.raises(ValueError):
+        backtest.split_candidates_chronologically([], holdout_fraction=0.0)
+    with pytest.raises(ValueError):
+        backtest.split_candidates_chronologically([], holdout_fraction=1.0)
+
+
+# ---------------------------------------------------------------------------
+# compute_champion_challenger_report (Tier 3.11)
+# ---------------------------------------------------------------------------
+
+def test_champion_challenger_report_shape_has_calibration_and_validation_per_source(fresh_env):
+    storage, backtest = fresh_env
+    base = datetime(2026, 8, 11, 14, 0, 0, tzinfo=timezone.utc)
+    candidates = [
+        _candidate(f"c{i}", "TEST", "5m", base + timedelta(minutes=i * 20), atr=2.0, decision="enter_long")
+        for i in range(6)
+    ]
+    for i in range(6):
+        _save_bar(
+            storage, "TEST", "5m", base + timedelta(minutes=i * 20 + 5),
+            open_=100.0, high=106.0, low=99.5, close=105.5,
+        )
+
+    report = backtest.compute_champion_challenger_report(
+        candidates, champion="coordinator", challengers=["always_bullish", "inverse_analysis"], holdout_fraction=0.5,
+    )
+    assert report["champion"] == "coordinator"
+    assert set(report["challengers"]) == {"always_bullish", "inverse_analysis"}
+    assert set(report["by_source"].keys()) == {"coordinator", "always_bullish", "inverse_analysis"}
+    for source_result in report["by_source"].values():
+        assert set(source_result.keys()) == {"calibration", "validation"}
+        assert "trades_taken" in source_result["calibration"]
+        assert "trades_taken" in source_result["validation"]
+    assert report["config"]["calibration_candidates"] + report["config"]["validation_candidates"] == 6
+
+
+def test_champion_challenger_report_defaults_challengers_to_every_other_source(fresh_env):
+    storage, backtest = fresh_env
+    base = datetime(2026, 8, 11, 14, 0, 0, tzinfo=timezone.utc)
+    candidate = _candidate("c1", "TEST", "5m", base, atr=2.0, decision="enter_long")
+    _save_bar(storage, "TEST", "5m", base + timedelta(minutes=5), open_=100.0, high=106.0, low=99.5, close=105.5)
+
+    report = backtest.compute_champion_challenger_report(
+        [candidate], champion="coordinator", holdout_fraction=0.5,
+    )
+    assert set(report["challengers"]) == set(backtest.DIRECTION_SOURCES) - {"coordinator"}
+    assert "coordinator" not in report["challengers"]  # champion never listed as its own challenger
+
+
+def test_champion_challenger_report_rejects_unknown_champion_or_challenger(fresh_env):
+    _, backtest = fresh_env
+    with pytest.raises(ValueError):
+        backtest.compute_champion_challenger_report([], champion="not_a_real_source")
+    with pytest.raises(ValueError):
+        backtest.compute_champion_challenger_report([], champion="coordinator", challengers=["not_a_real_source"])

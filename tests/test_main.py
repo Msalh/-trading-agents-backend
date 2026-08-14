@@ -585,3 +585,55 @@ def test_backtest_lite_endpoint_accepts_a_source_subset(client):
     body = r.json()
     assert set(body["by_source"].keys()) == {"coordinator", "always_bullish"}
     assert body["by_source"]["coordinator"]["wins"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Tier 3.11: champion/challenger (out-of-sample)
+# ---------------------------------------------------------------------------
+
+def test_champion_challenger_endpoint_returns_calibration_and_validation(client):
+    import app.storage as storage
+
+    base = "2026-08-11T14:00:00Z"
+    for i in range(6):
+        anchor = f"2026-08-11T{14 + i // 3}:{(i % 3) * 20:02d}:00Z"
+        bar = {"event_id": f"evt-cc-{i}", "symbol": "MNQ1!", "timeframe": "5m", "timestamp": anchor, "atr": 2.0}
+        decision = {
+            "decision": "enter_long", "timestamp": anchor,
+            "opinions_used": {"analysis": {"direction": "bullish", "timestamp": anchor}},
+        }
+        storage.save_candidate(candidate_id=f"cand-cc-{i}", symbol="MNQ1!", timeframe="5m", bar=bar, decision=decision)
+        _save_market_bar(
+            storage, "MNQ1!", "5m", f"2026-08-11T{14 + i // 3}:{(i % 3) * 20 + 5:02d}:00Z",
+            open_=20000.0, high=20060.0, low=19995.0, close=20055.0,
+        )
+
+    r = client.get(
+        "/candidates/history/backtest-lite/champion-challenger",
+        params={
+            "symbol": "MNQ1!", "timeframe": "5m", "champion": "coordinator",
+            "challengers": "always_bullish,inverse_analysis", "holdout_fraction": 0.5,
+        },
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["champion"] == "coordinator"
+    assert set(body["challengers"]) == {"always_bullish", "inverse_analysis"}
+    for source_result in body["by_source"].values():
+        assert set(source_result.keys()) == {"calibration", "validation"}
+
+
+def test_champion_challenger_endpoint_rejects_unknown_source(client):
+    r = client.get(
+        "/candidates/history/backtest-lite/champion-challenger",
+        params={"symbol": "MNQ1!", "timeframe": "5m", "champion": "not_a_real_source"},
+    )
+    assert r.status_code == 400
+
+
+def test_champion_challenger_endpoint_rejects_out_of_range_holdout_fraction(client):
+    r = client.get(
+        "/candidates/history/backtest-lite/champion-challenger",
+        params={"symbol": "MNQ1!", "timeframe": "5m", "holdout_fraction": 1.5},
+    )
+    assert r.status_code == 422  # FastAPI's own gt/lt Query validation, before our function ever runs

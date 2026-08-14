@@ -706,6 +706,50 @@ value. `COORDINATOR_THRESHOLD` and the Coordinator's own scoring are
 untouched — this is read-only analysis, same as every diagnostic tier
 before it.
 
+### `GET /candidates/history/backtest-lite/champion-challenger?symbol=MNQ1!&timeframe=5m&limit=300&champion=coordinator&challengers=analysis,inverse_analysis,always_bullish,always_bearish,vwap&holdout_fraction=0.3&atr_stop_mult=1.5&atr_target_mult=2.5&expiry_bars=24&non_overlapping=true`
+Tier 3.11 (champion/challenger, out-of-sample). The endpoint above's
+first real production run found `inverse_analysis` as the only source
+with `profit_factor > 1` — exactly the kind of finding the external
+review warned about, since it was found on the same historical sample
+any change would be justified against. Built on
+`app/backtest.compute_champion_challenger_report()`: holds out the
+most RECENT `holdout_fraction` (default `0.3`) of candidate history as
+a validation window (never a random split — regimes are
+time-correlated, a random split would leak the future into
+calibration), then runs `champion` (the currently-live decision
+source, default `coordinator`) plus every requested `challenger`
+through the identical backtest-lite barrier mechanics on BOTH the
+calibration window and the held-out validation window, separately.
+
+```json
+{
+  "symbol": "MNQ1!", "timeframe": "5m",
+  "config": {
+    "atr_stop_mult": 1.5, "atr_target_mult": 2.5, "expiry_bars": 24, "non_overlapping": true,
+    "holdout_fraction": 0.3, "candidates_considered": 156, "calibration_candidates": 109, "validation_candidates": 47
+  },
+  "champion": "coordinator",
+  "challengers": ["analysis", "inverse_analysis", "always_bullish", "always_bearish", "vwap"],
+  "by_source": {
+    "coordinator": {"calibration": { "...": "same shape as backtest-lite's per-source summary" }, "validation": { "...": "same shape" }},
+    "inverse_analysis": {"calibration": { "...": "..." }, "validation": { "...": "..." }},
+    "...": "one calibration/validation pair per source"
+  }
+}
+```
+Reads as: does a challenger's apparent edge on calibration still hold
+up on data it was never fitted to? A challenger that looks good on
+calibration but falls apart on validation is materially weaker
+evidence than one that holds up on both — reported side by side on
+purpose, not collapsed into a single number or an automatic pass/fail
+(a rigid threshold would be its own kind of overfitting at this sample
+size). Purely a report: never picks a winner, never flips anything.
+Same standing rule as every diagnostic tier before it — any real
+trading-logic change needs the user's explicit direction.
+`COORDINATOR_THRESHOLD` and Coordinator scoring untouched. 400 if
+`champion`/`challengers` contains an unrecognized source; 422 (FastAPI's
+own query validation) if `holdout_fraction` is outside `(0, 1)`.
+
 ---
 
 ## Auto-execution (Tier 3.9)
@@ -774,6 +818,7 @@ were NOT touched by this tier.
 | `BACKTEST_ATR_STOP_MULT` | no | `1.5` | Tier 3.10: ATR-barrier backtest-lite's default stop distance (multiple of the anchor bar's own ATR) — only affects the offline benchmark, never real trades or Execution's actual proposed geometry |
 | `BACKTEST_ATR_TARGET_MULT` | no | `2.5` | Tier 3.10: same, target distance |
 | `BACKTEST_EXPIRY_BARS` | no | `24` | Tier 3.10: how many forward bars a hypothetical barrier trade is walked before being marked "expired" (mark-to-last-seen-close) |
+| `BACKTEST_HOLDOUT_FRACTION` | no | `0.3` | Tier 3.11: fraction of candidate history (chronologically most recent) held out as the champion/challenger validation window |
 
 ---
 

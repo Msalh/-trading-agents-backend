@@ -517,6 +517,25 @@ data collection, no trading-logic change — COORDINATOR_THRESHOLD and
 the Coordinator's own scoring remain untouched, same as every
 diagnostic tier before it.
 
+Tier 3.11 (champion/challenger, out-of-sample): Tier 3.10's first real
+run against production found inverse_analysis (Analysis's calls
+flipped) as the only source with profit_factor > 1 — exactly the kind
+of finding the external review warned about, since it was found on
+the same historical sample it would be used to justify a change
+against. New app/backtest.split_candidates_chronologically() +
+compute_champion_challenger_report(), exposed at GET /candidates/
+history/backtest-lite/champion-challenger, hold out the most RECENT
+slice of candidate history (never a random split — regimes are
+time-correlated) and run every requested source through the identical
+backtest-lite barrier mechanics on BOTH the calibration window and the
+held-out validation window separately, so a challenger's apparent edge
+can be checked against data it was never fitted to before it's treated
+as real. Reports both windows side by side; never picks a winner or
+flips anything automatically — same standing rule as every diagnostic
+tier before it, any real trading-logic change needs the user's
+explicit direction. Entirely offline, no LLM calls, no new data
+collection. COORDINATOR_THRESHOLD and Coordinator scoring untouched.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -533,7 +552,15 @@ from fastapi.staticfiles import StaticFiles
 
 from app.account_risk import compute_current_drawdown_used, compute_daily_loss_used
 from app.analysis_agent import AnalysisAgentError, run_analysis
-from app.backtest import ATR_STOP_MULT, ATR_TARGET_MULT, DIRECTION_SOURCES, EXPIRY_BARS, compute_backtest_comparison
+from app.backtest import (
+    ATR_STOP_MULT,
+    ATR_TARGET_MULT,
+    DEFAULT_HOLDOUT_FRACTION,
+    DIRECTION_SOURCES,
+    EXPIRY_BARS,
+    compute_backtest_comparison,
+    compute_champion_challenger_report,
+)
 from app.candidates import (
     CandidateError,
     CandidateLockedError,
@@ -1642,6 +1669,71 @@ def candidates_history_backtest_lite(
             non_overlapping=non_overlapping,
         ),
     }
+
+
+@app.get("/candidates/history/backtest-lite/champion-challenger")
+def candidates_history_backtest_lite_champion_challenger(
+    symbol: str = Query(...),
+    timeframe: str = Query(...),
+    limit: int = Query(default=300, le=1000),
+    champion: str = Query(default="coordinator"),
+    challengers: str = Query(
+        default=None,
+        description="comma-separated challenger direction sources, e.g. analysis,inverse_analysis,always_bullish — omit for every source except the champion",
+    ),
+    holdout_fraction: float = Query(default=DEFAULT_HOLDOUT_FRACTION, gt=0.0, lt=1.0),
+    atr_stop_mult: float = Query(default=ATR_STOP_MULT),
+    atr_target_mult: float = Query(default=ATR_TARGET_MULT),
+    expiry_bars: int = Query(default=EXPIRY_BARS, le=200),
+    non_overlapping: bool = Query(default=True),
+) -> dict:
+    """Tier 3.11 (champion/challenger, out-of-sample): the backtest-
+    lite endpoint above found inverse_analysis as the only source with
+    profit_factor > 1 — exactly the kind of finding the external review
+    warned about, since it was found on the same historical sample any
+    change would be justified against. Built on
+    app/backtest.compute_champion_challenger_report(): holds out the
+    most RECENT `holdout_fraction` of candidate history as a validation
+    window (never a random split — regimes are time-correlated, a
+    random split would leak the future into calibration), and runs
+    `champion` (the currently-live decision source, default
+    "coordinator" — the real system) plus every requested `challenger`
+    through the SAME backtest-lite barrier mechanics on BOTH the
+    calibration window and the held-out validation window separately.
+
+    Reads as: does a challenger's apparent edge on the calibration
+    window still hold up on data it was never fitted to? A challenger
+    that looks good on calibration but falls apart on validation is a
+    materially different (weaker) result than one that holds up on
+    both — this endpoint reports both windows side by side specifically
+    so that distinction is visible, rather than collapsing it into a
+    single number or an automatic pass/fail verdict (a rigid threshold
+    would be its own kind of overfitting at this sample size).
+
+    Purely a report: never picks a winner, never flips anything. Same
+    standing rule as every diagnostic tier before it — any real
+    trading-logic change needs the user's explicit direction.
+    COORDINATOR_THRESHOLD and Coordinator scoring untouched. 400 if
+    `champion`/`challengers` contains an unrecognized source, or if
+    `holdout_fraction` is outside (0, 1)."""
+    challenger_list = [c.strip() for c in challengers.split(",") if c.strip()] if challengers else None
+
+    candidates = get_candidate_history(symbol=symbol, timeframe=timeframe, limit=limit)
+    try:
+        report = compute_champion_challenger_report(
+            candidates,
+            champion=champion,
+            challengers=challenger_list,
+            holdout_fraction=holdout_fraction,
+            stop_mult=atr_stop_mult,
+            target_mult=atr_target_mult,
+            expiry_bars=expiry_bars,
+            non_overlapping=non_overlapping,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {"symbol": symbol, "timeframe": timeframe, **report}
 
 
 @app.get("/candidates/{candidate_id}")
