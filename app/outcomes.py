@@ -60,6 +60,47 @@ behavior, unchanged) and "by_distinct_opinion" (each unique
 once, regardless of how many candidates reused it), plus
 "distinct_opinion_counts" so a caller can see directly how much
 duplication a given "by_candidate" number was resting on.
+
+Tier 3.8 (methodology fixes from external review): pulling Tier 3.7's
+per-opinion detail against production and finding Analysis's accuracy
+sitting around 30% raised two questions a raw accuracy number can't
+answer on its own, flagged in an external review of this project's
+full history. First: every opinion in this module was being anchored
+to opinion.get("timestamp") — set to datetime.now(timezone.utc) at
+LLM-call completion, wall-clock, not market time — or falling back to
+decision.get("timestamp"), the exact same category of value from
+coordinator.py's now_iso. Neither is guaranteed to line up with the
+market moment an opinion was actually about. _resolve_anchor_timestamp()
+fixes this for Analysis specifically, since Tier 3.1 (causal
+integrity) already pins every webhook-triggered candidate to the EXACT
+bar that triggered it — that bar's own real timestamp is now preferred
+over both wall-clock fallbacks. News/Macro are unaffected (unchanged
+behavior) — they aren't bar-triggered at all, so there's no better
+anchor available for them than their own opinion-completion timestamp.
+
+Second: is 30% actually bad? 50% coin-flip isn't automatically the
+right null baseline — if the market moved mostly one direction during
+the measurement window, a fixed directional bias will look
+artificially good or bad purely as a function of which way the window
+happened to move, independent of real skill. compute_baseline_comparison()
+computes the market's own base rate (via "always guess bullish" /
+"always guess bearish" predictors — their accuracy over a window IS
+that window's up-rate / down-rate) alongside a couple of trivial,
+LLM-independent predictors (VWAP side, and Analysis's own calls
+inverted as a pure diagnostic — never as something this module acts
+on) on the exact same candidate population and horizon machinery
+everything else here uses, so an agent's accuracy can be judged
+against what "knowing nothing" would already get you on this data,
+not an assumed 50%.
+
+Third: a single agent's opinions across one live trading day are
+correlated, not independent draws — a single bad regime can drag every
+opinion issued during it the same way. summarize_opinions_by_day()
+groups compute_agent_opinion_detail()'s records by calendar date so
+that clustering is visible directly, as a deliberately cheap first
+step (real block-bootstrap/clustered confidence intervals are left for
+once there's more data across more distinct days for the added
+complexity to earn its keep).
 """
 
 from dataclasses import dataclass
@@ -323,6 +364,43 @@ def _empty_horizon_counts(horizons: list[int]) -> dict[int, dict[str, int]]:
     return {h: {"correct": 0, "incorrect": 0, "flat": 0, "pending": 0, "no_data": 0} for h in horizons}
 
 
+def _resolve_anchor_timestamp(agent: str, candidate: dict, opinion: dict, decision: dict) -> str | None:
+    """Tier 3.8: which timestamp best represents the real-world market
+    moment an opinion's directional call was actually about, for
+    horizon-outcome anchoring. Both prior fallback candidates are
+    wall-clock, not market time: opinion.get("timestamp") is set to
+    datetime.now(timezone.utc) at LLM-call completion (see
+    analysis_agent.py/news_agent.py/macro_agent.py), and
+    decision.get("timestamp") is the exact same category of value —
+    coordinator.py's now_iso, captured at whatever wall-clock moment
+    compute_decision() happened to run — not the triggering bar's own
+    time either. Neither is guaranteed to line up with the market data
+    the opinion was actually formed from, and LLM call latency (a few
+    seconds to occasionally much longer) can in principle push the
+    anchor across a bar boundary.
+
+    For Analysis specifically there IS a real source-event anchor
+    available: Tier 3.1 (causal integrity) already pins every webhook-
+    triggered candidate to the EXACT market bar that triggered it
+    (candidate["bar"]), and that bar carries its own real "timestamp"
+    field — the actual market moment Analysis's read was about. Prefer
+    it over both wall-clock fallbacks when present.
+
+    News/Macro aren't bar-triggered at all — their own schedule,
+    symbol+"global" scope, web-search-based, not derived from any
+    specific market_state bar — so candidate["bar"]'s timestamp has no
+    particular relationship to when their opinion was actually formed.
+    There's no better anchor available for them than their own
+    opinion-completion timestamp, so their behavior is unchanged from
+    Tier 3.5/3.6."""
+    if agent == "analysis":
+        bar = candidate.get("bar") or {}
+        bar_timestamp = bar.get("timestamp")
+        if bar_timestamp:
+            return bar_timestamp
+    return opinion.get("timestamp") or decision.get("timestamp")
+
+
 def _finalize_agent_counts(per_agent_counts: dict[str, dict[int, dict[str, int]]]) -> dict:
     summary = {}
     for agent, by_horizon in per_agent_counts.items():
@@ -397,7 +475,7 @@ def compute_per_agent_accuracy(candidates: list[dict], horizons: list[int] = Non
             pseudo_decision = _OPINION_DIRECTION_TO_DECISION.get(opinion.get("direction"))
             if pseudo_decision is None:
                 continue  # neutral (or malformed) -- nothing to score
-            anchor_timestamp = opinion.get("timestamp") or decision.get("timestamp")
+            anchor_timestamp = _resolve_anchor_timestamp(agent, candidate, opinion, decision)
             if not anchor_timestamp:
                 continue
 
@@ -480,7 +558,7 @@ def compute_agent_opinion_detail(candidates: list[dict], agent: str, horizons: l
         pseudo_decision = _OPINION_DIRECTION_TO_DECISION.get(opinion.get("direction"))
         if pseudo_decision is None:
             continue  # neutral (or malformed) -- nothing to score
-        anchor_timestamp = opinion.get("timestamp") or decision.get("timestamp")
+        anchor_timestamp = _resolve_anchor_timestamp(agent, candidate, opinion, decision)
         if not anchor_timestamp:
             continue
 
@@ -510,3 +588,185 @@ def compute_agent_opinion_detail(candidates: list[dict], agent: str, horizons: l
         records_by_key[opinion_key]["reused_by_candidate_count"] += 1
 
     return sorted(records_by_key.values(), key=lambda r: r["opinion_timestamp"])
+
+
+# ---------------------------------------------------------------------------
+# Base rate + baseline comparison, and day-grouped summaries — Tier 3.8
+# ---------------------------------------------------------------------------
+
+def _candidate_anchor_timestamp(candidate: dict) -> str | None:
+    """The real-market-moment anchor for a candidate as a whole (not
+    tied to any one agent's opinion) — the triggering bar's own
+    timestamp when available (Tier 3.1 causal integrity), falling back
+    to the candidate's decision timestamp for candidates without a
+    stored bar (e.g. very old data, or the manual /coordinator/decide
+    path with no specific triggering event)."""
+    bar = candidate.get("bar") or {}
+    return bar.get("timestamp") or (candidate.get("decision") or {}).get("timestamp")
+
+
+def compute_baseline_comparison(candidates: list[dict], horizons: list[int] = None) -> dict:
+    """Tier 3.8: answers a question the raw "34% accuracy" and "30%
+    accuracy" numbers elsewhere in this module can't answer on their
+    own -- is that actually bad? 50% coin-flip is not automatically the
+    right null baseline. If the market rose in 65% of the measurement
+    window, an always-bullish predictor scores 65% "by accident," and
+    any agent showing a strong directional bias will look artificially
+    bad or good purely as a function of which way the window happened
+    to move, independent of whether it has real skill. This computes
+    the market's own base rate alongside a handful of trivial
+    predictors, on the SAME candidate population and SAME horizon
+    machinery every other accuracy figure in this project uses, so a
+    caller can tell whether an agent is actually adding anything over
+    "always guess up" / "guess the opposite of Analysis" / "guess from
+    which side of VWAP price is sitting."
+
+    Returns:
+      - "always_bullish" / "always_bearish": one prediction per
+        candidate (anchored to that candidate's own triggering bar
+        timestamp, or decision timestamp as fallback), regardless of
+        what any agent said. Their "accuracy" IS the market's own
+        up-rate / down-rate at each horizon over this window — the
+        real null baseline, not an assumed 50%.
+      - "inverse_of_analysis": Analysis's own directional call, anchor
+        and all, but FLIPPED (bullish <-> bearish; neutral/missing
+        skipped) — a cheap way to check whether a systematically wrong
+        agent might have a reversible anti-signal, WITHOUT acting on
+        it. Diagnostic only.
+      - "vwap_direction": predicts bullish when the triggering bar's
+        own distance_from_vwap_points > 0 (price above VWAP), bearish
+        when < 0, skipped when 0/missing — a simple, independent
+        technical baseline that doesn't depend on any LLM call at all.
+      - "candidates_considered": total candidates evaluated for the
+        always_bullish/always_bearish/vwap baselines (every candidate
+        with a resolvable anchor timestamp).
+      - "sample_sizes": {"inverse_of_analysis": n, "vwap_direction": n}
+        -- these two baselines only cover the subset of candidates
+        with the relevant data present, unlike always_bullish/
+        always_bearish/base-rate which cover every candidate.
+
+    Entirely offline, no LLM calls, no new data — same
+    compute_outcome_at_horizon() machinery as the rest of this
+    module."""
+    horizons = horizons or HORIZON_MINUTES_DEFAULT
+    always_bullish = _empty_horizon_counts(horizons)
+    always_bearish = _empty_horizon_counts(horizons)
+    inverse_of_analysis = _empty_horizon_counts(horizons)
+    vwap_direction = _empty_horizon_counts(horizons)
+    considered = 0
+    inverse_n = 0
+    vwap_n = 0
+
+    _FLIP = {"bullish": "bearish", "bearish": "bullish"}
+
+    for candidate in candidates:
+        symbol, timeframe = candidate["symbol"], candidate["timeframe"]
+        anchor_timestamp = _candidate_anchor_timestamp(candidate)
+        if not anchor_timestamp:
+            continue
+        considered += 1
+
+        for h in horizons:
+            for direction, bucket in (("enter_long", always_bullish), ("enter_short", always_bearish)):
+                outcome = compute_outcome_at_horizon(
+                    symbol=symbol, timeframe=timeframe,
+                    decision_timestamp=anchor_timestamp, decision_direction=direction,
+                    horizon_minutes=h,
+                ).outcome
+                bucket[h][outcome] = bucket[h].get(outcome, 0) + 1
+
+        bar = candidate.get("bar") or {}
+        vwap_distance = bar.get("distance_from_vwap_points")
+        if vwap_distance:
+            vwap_n += 1
+            vwap_pseudo_decision = "enter_long" if vwap_distance > 0 else "enter_short"
+            for h in horizons:
+                outcome = compute_outcome_at_horizon(
+                    symbol=symbol, timeframe=timeframe,
+                    decision_timestamp=anchor_timestamp, decision_direction=vwap_pseudo_decision,
+                    horizon_minutes=h,
+                ).outcome
+                vwap_direction[h][outcome] = vwap_direction[h].get(outcome, 0) + 1
+
+        decision = candidate.get("decision") or {}
+        opinions_used = decision.get("opinions_used") or {}
+        analysis_opinion = opinions_used.get("analysis")
+        if analysis_opinion:
+            flipped = _FLIP.get(analysis_opinion.get("direction"))
+            if flipped is not None:
+                flipped_pseudo_decision = _OPINION_DIRECTION_TO_DECISION[flipped]
+                flip_anchor = _resolve_anchor_timestamp("analysis", candidate, analysis_opinion, decision)
+                if flip_anchor:
+                    inverse_n += 1
+                    for h in horizons:
+                        outcome = compute_outcome_at_horizon(
+                            symbol=symbol, timeframe=timeframe,
+                            decision_timestamp=flip_anchor, decision_direction=flipped_pseudo_decision,
+                            horizon_minutes=h,
+                        ).outcome
+                        inverse_of_analysis[h][outcome] = inverse_of_analysis[h].get(outcome, 0) + 1
+
+    def _finalize(counts: dict[int, dict[str, int]]) -> dict:
+        out = {}
+        for h, c in counts.items():
+            resolved = c["correct"] + c["incorrect"]
+            out[h] = {**c, "accuracy": round(c["correct"] / resolved, 3) if resolved else None}
+        return out
+
+    return {
+        "candidates_considered": considered,
+        "always_bullish": _finalize(always_bullish),
+        "always_bearish": _finalize(always_bearish),
+        "inverse_of_analysis": _finalize(inverse_of_analysis),
+        "vwap_direction": _finalize(vwap_direction),
+        "sample_sizes": {"inverse_of_analysis": inverse_n, "vwap_direction": vwap_n},
+    }
+
+
+def summarize_opinions_by_day(opinions: list[dict], horizons: list[int] = None) -> dict:
+    """Tier 3.8: a deliberately cheap first response to "100
+    consecutive opinions from one agent aren't 100 independent
+    trials" — groups compute_agent_opinion_detail()'s per-opinion
+    records by calendar date (UTC, from each opinion's own
+    opinion_timestamp) so clustering across a single day's opinions
+    (e.g. one bad regime dragging down an entire day's worth of
+    correlated calls) is visible at a glance instead of hidden inside
+    one aggregate accuracy figure. Deliberately NOT real block-
+    bootstrap / clustered confidence intervals — the sample is still
+    small and growing; this is the cheap version to make the
+    correlation problem visible now, with real resampling statistics
+    left for once there's enough data across enough distinct days for
+    the added complexity to be worth it.
+
+    Takes the list returned by compute_agent_opinion_detail() directly.
+    Returns {day: {horizon: {correct, incorrect, flat, pending,
+    no_data, accuracy, n}}}, sorted by day."""
+    horizons = horizons or HORIZON_MINUTES_DEFAULT
+    by_day: dict[str, dict[int, dict[str, int]]] = {}
+
+    for opinion in opinions:
+        timestamp = opinion.get("opinion_timestamp") or ""
+        day = timestamp[:10]  # "YYYY-MM-DD" prefix of an ISO 8601 UTC timestamp
+        if not day:
+            continue
+        if day not in by_day:
+            by_day[day] = _empty_horizon_counts(horizons)
+        outcome_by_horizon = opinion.get("outcome_by_horizon") or {}
+        for h in horizons:
+            outcome = outcome_by_horizon.get(h)
+            if outcome is None:
+                continue
+            bucket = by_day[day][h]
+            bucket[outcome] = bucket.get(outcome, 0) + 1
+
+    result = {}
+    for day in sorted(by_day):
+        result[day] = {}
+        for h, counts in by_day[day].items():
+            resolved = counts["correct"] + counts["incorrect"]
+            result[day][h] = {
+                **counts,
+                "n": sum(counts.values()),
+                "accuracy": round(counts["correct"] / resolved, 3) if resolved else None,
+            }
+    return result

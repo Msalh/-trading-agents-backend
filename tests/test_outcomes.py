@@ -69,16 +69,22 @@ def _candidate(candidate_id, symbol, timeframe, decision, timestamp_dt):
     }
 
 
-def _candidate_with_opinions(candidate_id, symbol, timeframe, decision_timestamp_dt, opinions_used):
+def _candidate_with_opinions(candidate_id, symbol, timeframe, decision_timestamp_dt, opinions_used, bar=None):
     """Tier 3.5 candidate shape — unlike _candidate() above, this
     includes opinions_used, since compute_per_agent_accuracy() reads
     each individual agent's frozen opinion rather than the blended
     decision. `opinions_used` values are dicts like
-    {"direction": "bullish", "timestamp": <iso str or None>}."""
+    {"direction": "bullish", "timestamp": <iso str or None>}.
+
+    Tier 3.8: `bar` (optional) is the candidate's frozen triggering
+    bar (Tier 3.1) — a dict like {"timestamp": ..., "distance_from_vwap_points": ...}.
+    Omitted by default (None) since most existing tests predate this
+    field and should be unaffected by it."""
     return {
         "candidate_id": candidate_id,
         "symbol": symbol,
         "timeframe": timeframe,
+        "bar": bar,
         "decision": {
             "decision": "enter_long",
             "timestamp": _iso(decision_timestamp_dt),
@@ -639,3 +645,194 @@ def test_opinion_detail_excludes_reasoning_and_key_data(fresh_env):
     opinions = outcomes.compute_agent_opinion_detail([c], agent="analysis", horizons=[15])
     assert "reasoning" not in opinions[0]
     assert "key_data" not in opinions[0]
+
+
+# ---------------------------------------------------------------------------
+# _resolve_anchor_timestamp / event-time anchoring fix (Tier 3.8)
+# ---------------------------------------------------------------------------
+
+def test_analysis_anchor_prefers_bar_timestamp_over_opinion_timestamp(fresh_env):
+    """The core Tier 3.8 fix: opinion.timestamp is LLM-call-completion
+    wall-clock, not market time. Set up two entirely different price
+    regimes at the bar timestamp vs. the opinion timestamp -- if the
+    fix works, Analysis's outcome is computed from the BAR's price
+    action, not the opinion's own (wrong) timestamp."""
+    storage, pt, outcomes = fresh_env
+    bar_time = datetime.now(timezone.utc) - timedelta(minutes=60)
+    opinion_time = bar_time + timedelta(minutes=10)  # simulated LLM latency
+
+    # At the true bar anchor: price rises -> bullish should be "correct".
+    _save_bar(storage, "TEST", "5m", bar_time, 100.0)
+    _save_bar(storage, "TEST", "5m", bar_time + timedelta(minutes=15), 105.0)
+    # At the (wrong) opinion-timestamp anchor: an entirely different price level, falling -> would be "incorrect".
+    _save_bar(storage, "TEST", "5m", opinion_time, 200.0)
+    _save_bar(storage, "TEST", "5m", opinion_time + timedelta(minutes=15), 195.0)
+
+    c = _candidate_with_opinions(
+        "c1", "TEST", "5m", bar_time,
+        {"analysis": {"direction": "bullish", "timestamp": _iso(opinion_time)}},
+        bar={"timestamp": _iso(bar_time)},
+    )
+
+    summary = outcomes.compute_per_agent_accuracy([c], horizons=[15])
+    assert summary["by_candidate"]["analysis"][15]["correct"] == 1
+    assert summary["by_candidate"]["analysis"][15]["incorrect"] == 0
+
+    detail = outcomes.compute_agent_opinion_detail([c], agent="analysis", horizons=[15])
+    assert detail[0]["opinion_timestamp"] == _iso(bar_time)
+    assert detail[0]["outcome_by_horizon"][15] == "correct"
+
+
+def test_news_anchor_still_uses_opinion_timestamp_even_with_bar_present(fresh_env):
+    """News/Macro aren't bar-triggered -- candidate["bar"] must NOT
+    affect their anchoring, even when present on the candidate."""
+    storage, pt, outcomes = fresh_env
+    bar_time = datetime.now(timezone.utc) - timedelta(minutes=60)
+    opinion_time = bar_time + timedelta(minutes=10)
+
+    _save_bar(storage, "TEST", "5m", bar_time, 100.0)
+    _save_bar(storage, "TEST", "5m", bar_time + timedelta(minutes=15), 105.0)  # would be "correct" if (wrongly) anchored to bar
+    _save_bar(storage, "TEST", "5m", opinion_time, 200.0)
+    _save_bar(storage, "TEST", "5m", opinion_time + timedelta(minutes=15), 195.0)  # "incorrect" for bullish -- the real expected anchor
+
+    c = _candidate_with_opinions(
+        "c1", "TEST", "5m", bar_time,
+        {"news": {"direction": "bullish", "timestamp": _iso(opinion_time)}},
+        bar={"timestamp": _iso(bar_time)},
+    )
+
+    summary = outcomes.compute_per_agent_accuracy([c], horizons=[15])
+    assert summary["by_candidate"]["news"][15]["incorrect"] == 1
+    assert summary["by_candidate"]["news"][15]["correct"] == 0
+
+
+def test_analysis_anchor_falls_back_to_opinion_timestamp_when_no_bar(fresh_env):
+    """No candidate["bar"] (or bar with no timestamp) -- falls back to
+    the exact Tier 3.5/3.6 behavior, unchanged."""
+    storage, pt, outcomes = fresh_env
+    opinion_time = datetime.now(timezone.utc) - timedelta(minutes=30)
+    _save_bar(storage, "TEST", "5m", opinion_time, 100.0)
+    _save_bar(storage, "TEST", "5m", opinion_time + timedelta(minutes=15), 105.0)
+
+    c = _candidate_with_opinions(
+        "c1", "TEST", "5m", opinion_time,
+        {"analysis": {"direction": "bullish", "timestamp": _iso(opinion_time)}},
+        bar=None,
+    )
+    summary = outcomes.compute_per_agent_accuracy([c], horizons=[15])
+    assert summary["by_candidate"]["analysis"][15]["correct"] == 1
+
+
+# ---------------------------------------------------------------------------
+# compute_baseline_comparison (Tier 3.8)
+# ---------------------------------------------------------------------------
+
+def test_baseline_always_bullish_and_bearish_reflect_market_base_rate(fresh_env):
+    storage, pt, outcomes = fresh_env
+    t1 = datetime.now(timezone.utc) - timedelta(minutes=60)
+    t2 = datetime.now(timezone.utc) - timedelta(minutes=30)
+    _save_bar(storage, "TEST", "5m", t1, 100.0)
+    _save_bar(storage, "TEST", "5m", t1 + timedelta(minutes=15), 105.0)  # rose
+    _save_bar(storage, "TEST", "5m", t2, 200.0)
+    _save_bar(storage, "TEST", "5m", t2 + timedelta(minutes=15), 195.0)  # fell
+
+    c1 = _candidate_with_opinions("c1", "TEST", "5m", t1, {}, bar={"timestamp": _iso(t1)})
+    c2 = _candidate_with_opinions("c2", "TEST", "5m", t2, {}, bar={"timestamp": _iso(t2)})
+
+    result = outcomes.compute_baseline_comparison([c1, c2], horizons=[15])
+    assert result["candidates_considered"] == 2
+    assert result["always_bullish"][15]["correct"] == 1  # rose
+    assert result["always_bullish"][15]["incorrect"] == 1  # fell
+    assert result["always_bullish"][15]["accuracy"] == 0.5
+    assert result["always_bearish"][15]["correct"] == 1  # fell
+    assert result["always_bearish"][15]["incorrect"] == 1  # rose
+    assert result["always_bearish"][15]["accuracy"] == 0.5
+
+
+def test_baseline_vwap_direction_predicts_from_distance_from_vwap(fresh_env):
+    storage, pt, outcomes = fresh_env
+    t1 = datetime.now(timezone.utc) - timedelta(minutes=120)
+    t2 = datetime.now(timezone.utc) - timedelta(minutes=60)
+    t3 = datetime.now(timezone.utc) - timedelta(minutes=30)
+    _save_bar(storage, "TEST", "5m", t1, 100.0)
+    _save_bar(storage, "TEST", "5m", t1 + timedelta(minutes=15), 105.0)  # rose -- above-VWAP predicts bullish -> correct
+    _save_bar(storage, "TEST", "5m", t2, 200.0)
+    _save_bar(storage, "TEST", "5m", t2 + timedelta(minutes=15), 195.0)  # fell -- below-VWAP predicts bearish -> correct
+    _save_bar(storage, "TEST", "5m", t3, 300.0)
+    _save_bar(storage, "TEST", "5m", t3 + timedelta(minutes=15), 305.0)  # no vwap distance -- skipped
+
+    c1 = _candidate_with_opinions("c1", "TEST", "5m", t1, {}, bar={"timestamp": _iso(t1), "distance_from_vwap_points": 5.0})
+    c2 = _candidate_with_opinions("c2", "TEST", "5m", t2, {}, bar={"timestamp": _iso(t2), "distance_from_vwap_points": -3.0})
+    c3 = _candidate_with_opinions("c3", "TEST", "5m", t3, {}, bar={"timestamp": _iso(t3), "distance_from_vwap_points": None})
+
+    result = outcomes.compute_baseline_comparison([c1, c2, c3], horizons=[15])
+    assert result["sample_sizes"]["vwap_direction"] == 2
+    assert result["vwap_direction"][15]["correct"] == 2
+    assert result["vwap_direction"][15]["accuracy"] == 1.0
+
+
+def test_baseline_inverse_of_analysis_flips_direction(fresh_env):
+    storage, pt, outcomes = fresh_env
+    t1 = datetime.now(timezone.utc) - timedelta(minutes=30)
+    _save_bar(storage, "TEST", "5m", t1, 100.0)
+    _save_bar(storage, "TEST", "5m", t1 + timedelta(minutes=15), 95.0)  # fell -- bullish call is wrong, inverted (bearish) is right
+
+    c = _candidate_with_opinions(
+        "c1", "TEST", "5m", t1,
+        {"analysis": {"direction": "bullish", "timestamp": _iso(t1)}},
+        bar={"timestamp": _iso(t1)},
+    )
+    result = outcomes.compute_baseline_comparison([c], horizons=[15])
+    assert result["sample_sizes"]["inverse_of_analysis"] == 1
+    assert result["inverse_of_analysis"][15]["correct"] == 1
+
+
+def test_baseline_inverse_of_analysis_skips_neutral_and_missing(fresh_env):
+    storage, pt, outcomes = fresh_env
+    t1 = datetime.now(timezone.utc) - timedelta(minutes=30)
+    _save_bar(storage, "TEST", "5m", t1, 100.0)
+
+    c1 = _candidate_with_opinions("c1", "TEST", "5m", t1, {"analysis": {"direction": "neutral", "timestamp": _iso(t1)}}, bar={"timestamp": _iso(t1)})
+    c2 = _candidate_with_opinions("c2", "TEST", "5m", t1, {}, bar={"timestamp": _iso(t1)})
+
+    result = outcomes.compute_baseline_comparison([c1, c2], horizons=[15])
+    assert result["sample_sizes"]["inverse_of_analysis"] == 0
+
+
+# ---------------------------------------------------------------------------
+# summarize_opinions_by_day (Tier 3.8)
+# ---------------------------------------------------------------------------
+
+def test_summarize_opinions_by_day_groups_by_calendar_date(fresh_env):
+    storage, pt, outcomes = fresh_env
+    opinions = [
+        {"opinion_timestamp": "2026-08-12T13:30:00Z", "outcome_by_horizon": {15: "correct"}},
+        {"opinion_timestamp": "2026-08-12T14:00:00Z", "outcome_by_horizon": {15: "incorrect"}},
+        {"opinion_timestamp": "2026-08-13T09:00:00Z", "outcome_by_horizon": {15: "correct"}},
+    ]
+    result = outcomes.summarize_opinions_by_day(opinions, horizons=[15])
+    assert set(result.keys()) == {"2026-08-12", "2026-08-13"}
+    assert result["2026-08-12"][15]["correct"] == 1
+    assert result["2026-08-12"][15]["incorrect"] == 1
+    assert result["2026-08-12"][15]["accuracy"] == 0.5
+    assert result["2026-08-12"][15]["n"] == 2
+    assert result["2026-08-13"][15]["correct"] == 1
+    assert result["2026-08-13"][15]["accuracy"] == 1.0
+
+
+def test_summarize_opinions_by_day_skips_missing_timestamp(fresh_env):
+    storage, pt, outcomes = fresh_env
+    opinions = [{"opinion_timestamp": None, "outcome_by_horizon": {15: "correct"}}]
+    result = outcomes.summarize_opinions_by_day(opinions, horizons=[15])
+    assert result == {}
+
+
+def test_summarize_opinions_by_day_sorted_ascending(fresh_env):
+    storage, pt, outcomes = fresh_env
+    opinions = [
+        {"opinion_timestamp": "2026-08-13T09:00:00Z", "outcome_by_horizon": {15: "correct"}},
+        {"opinion_timestamp": "2026-08-11T09:00:00Z", "outcome_by_horizon": {15: "correct"}},
+        {"opinion_timestamp": "2026-08-12T09:00:00Z", "outcome_by_horizon": {15: "correct"}},
+    ]
+    result = outcomes.summarize_opinions_by_day(opinions, horizons=[15])
+    assert list(result.keys()) == ["2026-08-11", "2026-08-12", "2026-08-13"]

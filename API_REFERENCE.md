@@ -407,6 +407,66 @@ LLM-mediated fetch) — pull `/agents/{agent}/history` for full
 reasoning on a specific opinion. Entirely offline, no LLM calls, no
 trade side effects.
 
+**Tier 3.8 addition — `by_day=true`.** One agent's opinions across a
+single trading day are correlated, not independent draws — a bad
+regime can drag every opinion issued during it the same direction.
+Add `by_day=true` to group the same records by calendar date (UTC),
+returned as a sibling `"by_day"` key alongside the existing flat
+`"opinions"` list (off by default, so the Tier 3.7 response shape is
+unchanged unless asked for):
+```json
+"by_day": {
+  "2026-08-12": {"15": {"correct": 4, "incorrect": 15, "flat": 0, "pending": 0, "no_data": 0, "n": 19, "accuracy": 0.211}},
+  "2026-08-13": {"15": {"correct": 21, "incorrect": 32, "flat": 0, "pending": 0, "no_data": 0, "n": 53, "accuracy": 0.396}}
+}
+```
+Deliberately the cheap first version, not real block-bootstrap/
+clustered confidence intervals — good enough to make day-level
+clustering visible now; escalate once there's more data across more
+distinct days.
+
+### `GET /candidates/history/outcomes/baseline-comparison?symbol=MNQ1!&timeframe=5m&limit=100&horizons=15,30,60`
+Tier 3.8 (base rate + trivial-baseline comparison). 50% coin-flip is
+not automatically the right null baseline for judging an agent's
+accuracy — if the market moved mostly one direction during the
+measurement window, any fixed directional bias (like Analysis's own
+90%-bullish tendency, found via the endpoint above) looks artificially
+good or bad purely as a function of which way the window happened to
+move, independent of real skill. This computes the market's own base
+rate alongside a couple of trivial, mostly-LLM-independent predictors,
+on the exact same candidate population and horizon machinery every
+other accuracy figure in this project uses:
+```json
+{
+  "symbol": "MNQ1!", "timeframe": "5m",
+  "candidates_considered": 82,
+  "always_bullish": {"15": {"correct": 34, "incorrect": 48, "flat": 0, "pending": 0, "no_data": 0, "accuracy": 0.415}},
+  "always_bearish": {"15": {"correct": 48, "incorrect": 34, "flat": 0, "pending": 0, "no_data": 0, "accuracy": 0.585}},
+  "inverse_of_analysis": {"15": {"correct": 49, "incorrect": 26, "flat": 0, "pending": 2, "no_data": 1, "accuracy": 0.653}},
+  "vwap_direction": {"15": {"correct": 40, "incorrect": 38, "flat": 0, "pending": 0, "no_data": 0, "accuracy": 0.513}},
+  "sample_sizes": {"inverse_of_analysis": 78, "vwap_direction": 71}
+}
+```
+`always_bullish`/`always_bearish` are computed for every candidate
+with a resolvable anchor timestamp (`candidates_considered`) — their
+`accuracy` at a given horizon literally IS this window's up-rate /
+down-rate; that number, not an assumed 50%, is the real baseline an
+agent's accuracy should be judged against. `inverse_of_analysis` flips
+Analysis's own directional call (bullish↔bearish; neutral/missing
+skipped) as a pure diagnostic for whether a systematically wrong agent
+might have a reversible anti-signal — **this project has not acted on
+that inversion and has no plan to without much more out-of-sample
+evidence; it's here to inform, not to trigger a config change.**
+`vwap_direction` predicts from the triggering bar's own
+`distance_from_vwap_points` (bullish if price sits above VWAP, bearish
+if below, skipped if exactly 0 or missing) — a simple technical
+baseline with no LLM call behind it at all. `sample_sizes` reports how
+many candidates each of the latter two baselines actually covered,
+since unlike `always_bullish`/`always_bearish` they only apply where
+the relevant data exists. Entirely offline, no LLM calls, no trade
+side effects. 400 if `horizons` doesn't parse as comma-separated
+integers.
+
 ---
 
 ## Coordinator

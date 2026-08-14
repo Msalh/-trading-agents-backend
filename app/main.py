@@ -415,6 +415,46 @@ key_data to stay compact and WebFetch-reliable at scale — same design
 constraint that shaped every other endpoint in this project meant to
 be queried against production through this session.
 
+Pulling Tier 3.7 against production and finding Analysis's accuracy
+sitting around 30% across the board prompted a full external review of
+this project's history (methodology, not just the Analysis finding).
+Two concrete methodology gaps came out of it, addressed in Tier 3.8
+below; the review also explicitly recommended AGAINST touching
+Coordinator scoring/weights yet (confirmed the same by-agent evidence
+that would justify a change was discovered on, and would be used to
+calibrate, the same 100-opinion sample — fitting to history, not
+validation) and against deferring COORDINATOR_THRESHOLD tuning purely
+on volume grounds. Neither the Coordinator's scoring nor
+COORDINATOR_THRESHOLD have been touched as a result of this review —
+Tier 3.8 is, like 3.4-3.7 before it, read-only diagnostic tooling.
+
+Tier 3.8 (methodology fixes): (1) every accuracy figure in this module
+was anchoring an opinion's outcome to opinion.get("timestamp") — LLM-
+call-completion wall-clock, not market time — or decision.get
+("timestamp"), the exact same category of value from coordinator.py's
+now_iso. New app/outcomes._resolve_anchor_timestamp() fixes this for
+Analysis specifically: Tier 3.1 (causal integrity) already pins every
+webhook-triggered candidate to the exact bar that triggered it, and
+that bar's own real timestamp is now preferred. News/Macro are
+unaffected — not bar-triggered, no better anchor available for them.
+(2) New GET /candidates/history/outcomes/baseline-comparison, built on
+app/outcomes.compute_baseline_comparison(): 50% coin-flip isn't
+automatically the right null baseline for judging an agent's accuracy
+against — if the market moved mostly one direction during the
+measurement window, any fixed directional bias looks artificially
+good or bad regardless of real skill. Reports the market's own base
+rate (an "always guess bullish"/"always guess bearish" predictor's
+accuracy over a window literally IS that window's up-rate/down-rate)
+alongside a VWAP-side baseline and Analysis's own calls inverted as a
+pure diagnostic (never acted on) — all on the same candidate
+population and horizon machinery every other accuracy figure here
+uses. (3) New optional `by_day=true` on GET /candidates/history/
+outcomes/by-agent/detail, built on app/outcomes.summarize_opinions_by_day():
+one agent's opinions across a single trading day are correlated, not
+independent draws — this groups by calendar date so that clustering
+is visible directly, as a deliberately cheap first step ahead of real
+clustered/bootstrap statistics once there's more data across more days.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -449,9 +489,11 @@ from app.news_agent import NewsAgentError, run_news
 from app.outcomes import (
     HORIZON_MINUTES_DEFAULT,
     compute_agent_opinion_detail,
+    compute_baseline_comparison,
     compute_outcome_for_candidate,
     compute_outcomes_for_decision,
     compute_per_agent_accuracy,
+    summarize_opinions_by_day,
     summarize_outcomes,
 )
 from app.paper_trades import get_account_open_trade_count, open_trade_from_candidate, process_new_bar
@@ -1076,6 +1118,7 @@ def candidates_history_outcomes_by_agent_detail(
     agent: str = Query(...),
     limit: int = Query(default=100, le=500),
     horizons: str = Query(default="15,30,60"),
+    by_day: bool = Query(default=False),
 ) -> dict:
     """Tier 3.7 (per-opinion diagnostic detail): the by-agent endpoint
     above answers WHETHER an agent shows signal; this answers WHY, once
@@ -1101,7 +1144,15 @@ def candidates_history_outcomes_by_agent_detail(
     compact and reliable for large windows — see
     app/outcomes.compute_agent_opinion_detail()'s docstring for why.
     400 if `agent` isn't analysis/news/macro or `horizons` doesn't
-    parse as comma-separated integers."""
+    parse as comma-separated integers.
+
+    Tier 3.8: `by_day=true` additionally groups these same records by
+    calendar date (see app/outcomes.summarize_opinions_by_day()) — a
+    single agent's opinions across one live trading day are correlated,
+    not independent draws, so this makes day-level clustering visible
+    directly instead of hiding it inside one aggregate number. Off by
+    default to keep the existing flat response shape unchanged for
+    Tier 3.7 callers."""
     try:
         horizon_list = [int(h.strip()) for h in horizons.split(",") if h.strip()]
     except ValueError:
@@ -1113,12 +1164,54 @@ def candidates_history_outcomes_by_agent_detail(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    return {
+    result = {
         "symbol": symbol,
         "timeframe": timeframe,
         "agent": agent,
         "distinct_opinion_count": len(opinions),
         "opinions": opinions,
+    }
+    if by_day:
+        result["by_day"] = summarize_opinions_by_day(opinions, horizons=horizon_list)
+    return result
+
+
+@app.get("/candidates/history/outcomes/baseline-comparison")
+def candidates_history_outcomes_baseline_comparison(
+    symbol: str = Query(...),
+    timeframe: str = Query(...),
+    limit: int = Query(default=100, le=500),
+    horizons: str = Query(default="15,30,60"),
+) -> dict:
+    """Tier 3.8 (base rate + trivial-baseline comparison): built after
+    an external review of this project's full history correctly
+    pointed out that Analysis's ~30% accuracy figure (by-agent/detail
+    above) can't be judged against an assumed 50% coin-flip baseline —
+    if the market moved mostly one direction during the measurement
+    window, ANY fixed directional bias looks artificially good or bad
+    purely as a function of which way the window happened to move,
+    independent of real skill. Computes the market's own base rate
+    (via "always guess bullish" / "always guess bearish" — their
+    accuracy over a window literally IS that window's up-rate/
+    down-rate) alongside two trivial, mostly-LLM-independent
+    predictors (VWAP side, and Analysis's own calls inverted as a pure
+    diagnostic — this project has NOT acted on that inversion and has
+    no plan to without much more evidence) on the exact same candidate
+    population and horizon machinery every other accuracy figure here
+    uses. See app/outcomes.compute_baseline_comparison()'s docstring
+    for the full breakdown of each field. Entirely offline, no LLM
+    calls, no trade side effects. 400 if `horizons` doesn't parse as
+    comma-separated integers."""
+    try:
+        horizon_list = [int(h.strip()) for h in horizons.split(",") if h.strip()]
+    except ValueError:
+        raise HTTPException(status_code=400, detail="horizons must be comma-separated integers")
+
+    candidates = get_candidate_history(symbol=symbol, timeframe=timeframe, limit=limit)
+    return {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        **compute_baseline_comparison(candidates, horizons=horizon_list),
     }
 
 
