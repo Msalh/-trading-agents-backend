@@ -272,3 +272,238 @@ def test_risk_and_execution_locked_after_trade_committed(client, monkeypatch):
     candidate = storage.get_latest_candidate(symbol="MNQ1!", timeframe="5m")
     assert candidate["execution"]["entry_price"] == 100.0
     assert candidate["risk"]["decision"] == "approve"
+
+
+# ---------------------------------------------------------------------------
+# Tier 3.9: auto-execution (opt-in, off by default)
+# ---------------------------------------------------------------------------
+
+def _seed_directional_candidate(storage, candidate_id="cand-auto-1", decision="enter_long", direction="bullish"):
+    bar = {
+        "event_id": "evt-auto-1", "symbol": "MNQ1!", "timeframe": "5m",
+        "timestamp": "2026-08-11T14:00:00Z", "close": 20000.0,
+    }
+    decision_json = {
+        "decision": decision,
+        "direction": direction,
+        "timestamp": "2026-08-11T14:00:01Z",
+        "opinions_used": {
+            "analysis": {"key_data": {"key_levels": [20050.0, 19950.0]}},
+        },
+    }
+    storage.save_candidate(
+        candidate_id=candidate_id, symbol="MNQ1!", timeframe="5m", bar=bar, decision=decision_json
+    )
+    return storage.get_candidate_by_id(candidate_id)
+
+
+def _fake_planned_execution(**kwargs):
+    from app.execution_agent import ExecutionOpinion
+    return ExecutionOpinion(
+        agent="execution", timestamp="2026-08-11T14:00:02Z", symbol="MNQ1!", timeframe="5m",
+        status="planned", direction="bullish", order_type="market",
+        entry_price=20000.0, stop_loss=19950.0, targets=[20100.0], ready_now=True,
+        reasoning="t", flags=[], validation_error=None,
+    )
+
+
+def test_auto_execute_disabled_by_default(client):
+    """AUTO_EXECUTE_ENABLED must default to false — the webhook flow
+    must never auto-open trades unless it's explicitly set."""
+    import app.main as main
+
+    assert main.AUTO_EXECUTE_ENABLED is False
+
+
+def test_auto_execute_opens_a_trade_for_a_qualifying_candidate(client, monkeypatch):
+    """The main happy path: a directional candidate, walked through
+    the real evaluate_risk_gate/size_position (only plan_execution is
+    mocked, same as the manual-flow test above), ends with a committed
+    paper trade — no human click involved."""
+    import app.main as main
+    import app.storage as storage
+
+    candidate = _seed_directional_candidate(storage)
+    monkeypatch.setattr(main, "plan_execution", _fake_planned_execution)
+
+    main._auto_execute_candidate(candidate)
+
+    trade = storage.get_trade_by_candidate_id(candidate["candidate_id"])
+    assert trade is not None
+    assert trade["status"] == "pending_fill"
+    assert trade["entry_price"] == 20000.0
+
+    refreshed = storage.get_candidate_by_id(candidate["candidate_id"])
+    assert refreshed["risk"]["decision"] == "approve"
+    assert refreshed["risk"]["stage"] == "size"
+    assert refreshed["execution"]["status"] == "planned"
+
+
+def test_auto_execute_skips_non_directional_candidate(client, monkeypatch):
+    import app.main as main
+    import app.storage as storage
+
+    candidate = _seed_directional_candidate(
+        storage, candidate_id="cand-auto-nodir", decision="no_trade", direction=None
+    )
+
+    def fail_if_called(*a, **k):
+        raise AssertionError("evaluate_risk_gate should never be reached for a non-directional decision")
+
+    monkeypatch.setattr(main, "evaluate_risk_gate", fail_if_called)
+
+    main._auto_execute_candidate(candidate)
+
+    refreshed = storage.get_candidate_by_id(candidate["candidate_id"])
+    assert refreshed["risk"] is None
+    assert refreshed["execution"] is None
+
+
+def test_auto_execute_stops_at_gate_reject_without_calling_execution(client, monkeypatch):
+    import app.main as main
+    import app.storage as storage
+    from app.risk_agent import RiskOpinion
+
+    candidate = _seed_directional_candidate(storage, candidate_id="cand-auto-reject")
+
+    def fail_if_called(**kwargs):
+        raise AssertionError("plan_execution should never be reached when the gate rejects")
+
+    monkeypatch.setattr(main, "plan_execution", fail_if_called)
+    monkeypatch.setattr(
+        main,
+        "evaluate_risk_gate",
+        lambda **kwargs: RiskOpinion(
+            agent="risk", timestamp="2026-08-11T14:00:01Z", symbol="MNQ1!", timeframe="5m",
+            stage="gate", decision="reject", original_size=1, suggested_size=None,
+            reasoning="test reject", key_data={}, flags=["max_positions_reached"],
+        ),
+    )
+
+    main._auto_execute_candidate(candidate)
+
+    refreshed = storage.get_candidate_by_id(candidate["candidate_id"])
+    assert refreshed["risk"]["decision"] == "reject"
+    assert refreshed["execution"] is None
+
+
+def test_auto_execute_does_not_size_when_execution_declines(client, monkeypatch):
+    import app.main as main
+    import app.storage as storage
+
+    candidate = _seed_directional_candidate(storage, candidate_id="cand-auto-noexec")
+
+    def fake_no_action(**kwargs):
+        from app.execution_agent import ExecutionOpinion
+        return ExecutionOpinion(
+            agent="execution", timestamp="2026-08-11T14:00:02Z", symbol="MNQ1!", timeframe="5m",
+            status="no_action", direction=None, order_type=None, entry_price=None, stop_loss=None,
+            targets=None, ready_now=None, reasoning="no clean setup", flags=[], validation_error=None,
+        )
+
+    monkeypatch.setattr(main, "plan_execution", fake_no_action)
+
+    main._auto_execute_candidate(candidate)
+
+    trade = storage.get_trade_by_candidate_id(candidate["candidate_id"])
+    assert trade is None
+    refreshed = storage.get_candidate_by_id(candidate["candidate_id"])
+    assert refreshed["risk"]["decision"] == "pending_execution"  # still gate stage — size never ran
+    assert refreshed["execution"]["status"] == "no_action"
+
+
+def test_auto_execute_never_raises_on_internal_error(client, monkeypatch):
+    import app.main as main
+    import app.storage as storage
+
+    candidate = _seed_directional_candidate(storage, candidate_id="cand-auto-err")
+
+    def boom(**kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(main, "evaluate_risk_gate", boom)
+
+    main._auto_execute_candidate(candidate)  # must not raise
+
+
+def test_auto_execute_skips_when_already_committed(client, monkeypatch):
+    import app.main as main
+    import app.storage as storage
+
+    candidate = _seed_directional_candidate(storage, candidate_id="cand-auto-locked")
+    monkeypatch.setattr(main, "plan_execution", _fake_planned_execution)
+    main._auto_execute_candidate(candidate)
+    assert storage.get_trade_by_candidate_id(candidate["candidate_id"]) is not None
+
+    def fail_if_called(**kwargs):
+        raise AssertionError("evaluate_risk_gate should never re-run once a trade is committed")
+
+    monkeypatch.setattr(main, "evaluate_risk_gate", fail_if_called)
+    main._auto_execute_candidate(candidate)  # same (now-stale) candidate dict — candidate_id is what matters
+
+
+def test_system_status_reports_auto_execute_enabled_flag(client):
+    r = client.get("/system/status")
+    assert r.json()["auto_execute_enabled"] is False
+
+
+def test_webhook_background_task_calls_auto_execute_when_enabled(monkeypatch):
+    """AUTO_EXECUTE_ENABLED is read once at app.main import time — this
+    test reloads app.main with it set to true and confirms the
+    webhook's background task actually invokes _auto_execute_candidate
+    after a successful candidate creation, wiring verified independent
+    of _auto_execute_candidate's own internal behavior (covered above)."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.close()
+    monkeypatch.setenv("DB_PATH", tmp.name)
+    monkeypatch.setenv("WEBHOOK_SECRET", "test-secret")
+    monkeypatch.setenv("AUTO_EXECUTE_ENABLED", "true")
+
+    import app.storage as storage
+    importlib.reload(storage)
+    storage.init_db()
+
+    for mod_name in (
+        "app.timing_agent", "app.trading_calendar", "app.coordinator", "app.candidates",
+        "app.outcomes", "app.replay", "app.paper_trades", "app.risk_agent", "app.account_risk",
+        "app.main",
+    ):
+        importlib.reload(importlib.import_module(mod_name))
+
+    import app.main as main
+
+    assert main.AUTO_EXECUTE_ENABLED is True
+
+    called = {"n": 0, "candidate": None}
+
+    def fake_auto_execute(candidate):
+        called["n"] += 1
+        called["candidate"] = candidate
+
+    monkeypatch.setattr(main, "_auto_execute_candidate", fake_auto_execute)
+
+    def fake_run_analysis(symbol, timeframe, bars):
+        from app.analysis_agent import AnalysisOpinion
+        from datetime import datetime, timezone
+        return AnalysisOpinion(
+            agent="analysis", timestamp=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            symbol=symbol, timeframe=timeframe, direction="bullish", confidence=90,
+            reasoning="test", key_data={"key_levels": []}, flags=[],
+        )
+
+    monkeypatch.setattr(main, "run_analysis", fake_run_analysis)
+
+    # TestClient runs BackgroundTasks synchronously as part of the
+    # request/response cycle, so the webhook POST alone is enough to
+    # exercise _run_auto_analysis_and_coordinator — no need to also
+    # call it directly (that would run it a second time).
+    test_client = TestClient(main.app)
+    test_client.post(
+        "/webhook/tradingview",
+        json=_payload("2026-08-11T14:00:00Z", "2026-08-11", event_id="evt-auto-webhook"),
+    )
+
+    assert called["n"] == 1
+    assert called["candidate"]["symbol"] == "MNQ1!"
+
+    os.unlink(tmp.name)

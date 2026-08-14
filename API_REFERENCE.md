@@ -23,6 +23,7 @@ each of those was (`null` if it's never happened yet).
   "server_time_utc": "2026-08-09T13:22:25Z",
   "scheduler_enabled": true,
   "scheduler_intervals_minutes": {"news": 20, "macro": 20},
+  "auto_execute_enabled": false,
   "last_webhook_received": "2026-08-09 13:22:25",
   "minutes_since_last_webhook": 4.2,
   "agents": {
@@ -33,6 +34,11 @@ each of those was (`null` if it's never happened yet).
   }
 }
 ```
+`auto_execute_enabled` (Tier 3.9) reflects `AUTO_EXECUTE_ENABLED` —
+whether every qualifying candidate is currently being walked through
+Risk → Execution → Risk automatically, without a human click. See
+`AUTO_EXECUTE_ENABLED` under Environment variables and the webhook
+section below.
 
 ---
 
@@ -65,6 +71,17 @@ time at/after 18:00 belongs to the next day's session), or a short
 string describing the mismatch otherwise. A mismatch is logged and
 surfaced here but never rejected — the bar is still stored either way
 (`status` is unaffected).
+
+**Tier 3.9 (auto-execution):** when a new bar produces a directional
+candidate (`enter_long`/`enter_short`) inside the webhook's background
+task, and `AUTO_EXECUTE_ENABLED=true`, that candidate is immediately
+walked through the same Risk-gate → Execution → Risk-size pipeline
+`GET /agents/risk/evaluate` and `GET /agents/execution/plan` drive
+manually — same underlying functions, same guardrails (position
+limits, drawdown/daily-loss room, write-once candidate locking), no
+human click. Off by default; nothing here changes if the env var isn't
+set. This exists to remove selection bias from paper-trade data
+collection — see Environment variables below.
 
 ---
 
@@ -625,6 +642,44 @@ numbers.
 
 ---
 
+## Auto-execution (Tier 3.9)
+
+Every prior tier's paper trades were opened by a human manually
+calling `GET /agents/risk/evaluate` then `GET /agents/execution/plan`
+then `GET /agents/risk/evaluate` again for whichever candidates they
+chose to act on. An external review (2026-08-14) flagged that this
+selection is itself a source of bias: which candidates get executed
+ends up conflating the system's own signal quality with the
+operator's judgment, availability, and mood, which makes the
+resulting "real trade" data unreliable for judging the system on its
+own. The fix is to make execution mechanical and non-selective.
+
+Set `AUTO_EXECUTE_ENABLED=true` and every directional candidate
+(`enter_long`/`enter_short` — i.e. one that already cleared
+`COORDINATOR_THRESHOLD`) is automatically walked through Risk-gate →
+Execution → Risk-size inside the webhook's background task, right
+after the candidate itself is created — no manual step. This calls
+the exact same functions the manual endpoints call
+(`evaluate_risk_gate`, `plan_execution`, `size_position`,
+`open_trade_from_candidate`), so every existing guardrail (position
+limits, drawdown/daily-loss room, write-once candidate locking, the
+atomic account-wide open-position check) applies identically. A
+candidate the gate rejects, or one Execution declines/fails to
+produce a valid geometry for, is simply left at that stage — same
+outcome as if a human had stopped there manually.
+
+Off by default. Setting it has a real, ongoing cost: Execution's LLM
+call now fires on every qualifying candidate instead of only the ones
+a human chose to click through, and every candidate that clears the
+gate opens a real (paper) trade. The user was offered a conservative
+(stay manual), a sampled, and a fully-automatic policy, and chose the
+fully-automatic one — execute every qualifying candidate — to get the
+most complete, least-biased dataset as fast as possible, accepting
+the added cost. `COORDINATOR_THRESHOLD` and the Coordinator's scoring
+were NOT touched by this tier.
+
+---
+
 ## Environment variables
 
 | Variable | Required | Default | Notes |
@@ -633,6 +688,7 @@ numbers.
 | `ANTHROPIC_API_KEY` | yes | — | for Analysis/News/Macro |
 | `DB_PATH` | no | `./data/market_state.db` | point at a Railway Volume mount for persistence |
 | `ENABLE_SCHEDULER` | no | `false` | set `true` in production to auto-run News/Macro |
+| `AUTO_EXECUTE_ENABLED` | no | `false` | Tier 3.9: set `true` to auto-run Risk → Execution → Risk on every qualifying candidate, no manual click — see "Auto-execution (Tier 3.9)" above |
 | `NEWS_SYMBOL` | no | `MNQ1!` | |
 | `NEWS_INTERVAL_MINUTES` | no | `20` | |
 | `MACRO_SYMBOL` | no | (= `NEWS_SYMBOL`) | |
@@ -679,3 +735,7 @@ same endpoint, different stage depending on whether Execution has
 run yet. Steps 9–10 need no manual trigger at all — trade opening and
 fill/close monitoring both happen automatically as side effects of
 step 8 and every subsequent webhook bar, respectively.
+
+With `AUTO_EXECUTE_ENABLED=true` (Tier 3.9) as well, steps 5–8 also
+happen on their own, immediately after step 2 — nothing left to
+trigger manually for a candidate that clears the gate.

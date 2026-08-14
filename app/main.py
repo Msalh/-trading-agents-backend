@@ -455,6 +455,35 @@ independent draws — this groups by calendar date so that clustering
 is visible directly, as a deliberately cheap first step ahead of real
 clustered/bootstrap statistics once there's more data across more days.
 
+Tier 3.9 (auto-execution): the same external review flagged a
+methodology gap Tier 3.8 didn't touch — every real paper trade taken
+so far was manually selected by a human clicking through
+/agents/risk/evaluate and /agents/execution/plan for whichever
+candidates they chose to act on. That selection is itself a source of
+bias: which candidates get executed conflates the system's own signal
+quality with the operator's judgment, availability, and mood, which
+undermines using the resulting trades to judge the system on its own
+merits. New env var AUTO_EXECUTE_ENABLED (off by default, same
+explicit-opt-in pattern as ENABLE_SCHEDULER) makes execution
+mechanical instead: when set, _auto_execute_candidate() walks every
+directional candidate (enter_long/enter_short) through the exact same
+evaluate_risk_gate -> plan_execution -> size_position ->
+open_trade_from_candidate pipeline the manual endpoints call, inside
+the webhook's background task, immediately after the candidate is
+created — no duplicated logic, so every existing guardrail (position
+limits, drawdown/daily-loss room, write-once candidate locking, the
+atomic account-wide open-position check in
+storage.open_trade_if_room()) applies identically whether a human or
+this function is driving it. The user chose the most complete,
+highest-cost policy available — auto-execute every qualifying
+candidate rather than a sampled subset — over staying manual,
+accepting the added ongoing Execution LLM cost that comes with firing
+on every candidate instead of only the ones a human would have
+clicked through. Never raises: a Risk/Execution failure inside it must
+not affect the candidate/decision work already saved by the same
+background task. As with every tier before it, COORDINATOR_THRESHOLD
+and the Coordinator's own scoring were not touched.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -541,6 +570,16 @@ from app.trading_calendar import check_trading_date
 
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 
+# Tier 3.9 (auto-execution): off by default, same "explicit opt-in env
+# var, following the ENABLE_SCHEDULER precedent" pattern used for the
+# in-process scheduler — this must not silently start opening paper
+# trades just because this code shipped. See _auto_execute_candidate
+# below for the full reasoning (removing selection bias from paper-
+# trade data collection, per the 2026-08-14 external review and the
+# user's explicit choice to auto-execute every qualifying candidate
+# rather than a sampled subset).
+AUTO_EXECUTE_ENABLED = os.environ.get("AUTO_EXECUTE_ENABLED", "false").lower() == "true"
+
 
 def _check_secret(x_webhook_secret: str | None) -> None:
     """Shared guard for any endpoint that costs money (LLM/search
@@ -623,6 +662,11 @@ def system_status(symbol: str = Query(default=NEWS_SYMBOL)) -> dict:
             "news": int(os.environ.get("NEWS_INTERVAL_MINUTES", "60")),
             "macro": int(os.environ.get("MACRO_INTERVAL_MINUTES", "60")),
         },
+        # Tier 3.9: surfaced here for the same reason scheduler_enabled
+        # is — so it's visible from a single read-only call whether the
+        # system is currently allowed to auto-open real (paper) trades
+        # without a human click, not something you have to infer.
+        "auto_execute_enabled": AUTO_EXECUTE_ENABLED,
         "last_webhook_received": last_webhook,
         "minutes_since_last_webhook": _minutes_since(last_webhook),
         "agents": agents,
@@ -735,10 +779,161 @@ def _run_auto_analysis_and_coordinator(symbol: str, timeframe: str, event_id: st
                 timestamp=candidate["decision"]["timestamp"],
                 decision=candidate["decision"],
             )
+            # Tier 3.9: opt-in, off by default (AUTO_EXECUTE_ENABLED).
+            # Runs in the same try block, after the candidate is
+            # already saved — a failure here must never affect the
+            # candidate/decision work above, which is why
+            # _auto_execute_candidate has its own internal try/except
+            # and never raises.
+            if AUTO_EXECUTE_ENABLED:
+                _auto_execute_candidate(candidate)
         except Exception as e:  # noqa: BLE001 - background task, log and move on
             logging.getLogger("webhook").error("auto-candidate failed: %s", e)
     except AnalysisAgentError as e:
         logging.getLogger("webhook").error("auto-analysis failed: %s", e)
+
+
+def _auto_execute_candidate(candidate: dict) -> None:
+    """Tier 3.9 (auto-execution / removing selection bias from paper-
+    trade data collection). When AUTO_EXECUTE_ENABLED is set, every
+    directional candidate (enter_long/enter_short — i.e. one that
+    already cleared COORDINATOR_THRESHOLD) is walked through the exact
+    same Risk-gate -> Execution -> Risk-size pipeline the dashboard's
+    manual buttons drive via /agents/risk/evaluate and
+    /agents/execution/plan, by calling the SAME underlying functions
+    (evaluate_risk_gate, plan_execution, size_position,
+    open_trade_from_candidate) directly rather than duplicating any of
+    that logic. Every existing guardrail therefore applies identically,
+    automatically, without a human click: Tier 2.2's gate/size staging,
+    Tier 2.10's live drawdown/daily-loss room, Tier 3.1's write-once
+    candidate locking, and Tier 3.3's atomic account-wide position
+    limit (the real enforcement is still open_trade_from_candidate's
+    call into storage.open_trade_if_room() — this function does not
+    duplicate that check, it just reaches the same call).
+
+    Why this exists: a human manually choosing which candidates to
+    execute as real trades conflates the system's own signal quality
+    with the operator's judgment, availability, and timing of presence
+    — the exact selection-bias critique raised in the 2026-08-14
+    external review. Auto-execution makes every trade a mechanical,
+    pre-registered, reproducible decision instead. The user was asked
+    to choose between a conservative (still-manual), a sampled, and a
+    fully-automatic policy, and explicitly chose the fully-automatic
+    one: execute every qualifying candidate, accepting the added
+    ongoing Execution LLM cost that comes with it.
+
+    Never raises — this runs inside the webhook's background task,
+    after the candidate/decision it's acting on has already been
+    saved, and a Risk/Execution failure here must not be able to
+    affect anything already committed."""
+    candidate_id = candidate["candidate_id"]
+    symbol, timeframe = candidate["symbol"], candidate["timeframe"]
+    decision = candidate.get("decision") or {}
+
+    if decision.get("decision") not in ("enter_long", "enter_short"):
+        return
+
+    try:
+        if get_committed_trade(candidate_id) is not None:
+            return  # already committed somehow (e.g. a manual click won a race) — leave it alone
+
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        closed_trades = get_all_closed_trades_chronological()
+        current_drawdown_used = compute_current_drawdown_used(trades=closed_trades)
+        daily_loss_used = compute_daily_loss_used(now_iso, trades=closed_trades)
+        open_positions = get_account_open_trade_count()
+
+        gate_opinion = evaluate_risk_gate(
+            symbol=symbol,
+            timeframe=timeframe,
+            coordinator_decision=decision,
+            current_open_positions=open_positions,
+            current_drawdown_used=current_drawdown_used,
+            daily_loss_used=daily_loss_used,
+        )
+        try:
+            record_risk_result(candidate_id, gate_opinion.to_dict())
+        except CandidateLockedError:
+            return
+        save_opinion(
+            agent="risk",
+            symbol=symbol,
+            timeframe=timeframe,
+            timestamp=gate_opinion.timestamp,
+            opinion=gate_opinion.to_dict(),
+        )
+
+        if gate_opinion.decision != "pending_execution":
+            # "reject" (position limit / daily loss / drawdown) or
+            # "no_action" — nothing further to do, same as the manual
+            # dashboard flow would stop here too.
+            return
+
+        analysis_opinion = decision.get("opinions_used", {}).get("analysis")
+        key_levels = (analysis_opinion or {}).get("key_data", {}).get("key_levels")
+        try:
+            execution_opinion = plan_execution(
+                symbol=symbol,
+                timeframe=timeframe,
+                coordinator_decision=decision,
+                latest_bar=candidate["bar"],
+                analysis_key_levels=key_levels,
+            )
+        except ExecutionAgentError as e:
+            logging.getLogger("webhook").error(
+                "auto-execute: execution planning failed for candidate_id=%s: %s", candidate_id, e
+            )
+            return
+        try:
+            record_execution_result(candidate_id, execution_opinion.to_dict())
+        except CandidateLockedError:
+            return
+        save_opinion(
+            agent="execution",
+            symbol=symbol,
+            timeframe=timeframe,
+            timestamp=execution_opinion.timestamp,
+            opinion=execution_opinion.to_dict(),
+        )
+
+        if execution_opinion.status != "planned":
+            # no_action / error / invalid — Execution declined or its
+            # proposed geometry failed validation. Nothing to size.
+            return
+
+        # Re-check drawdown/daily-loss room — the Execution LLM call
+        # above took real time, during which another trade could have
+        # closed and changed either figure. Same double-check pattern
+        # /agents/risk/evaluate's size stage already uses.
+        closed_trades = get_all_closed_trades_chronological()
+        current_drawdown_used = compute_current_drawdown_used(trades=closed_trades)
+        daily_loss_used = compute_daily_loss_used(now_iso, trades=closed_trades)
+        size_opinion = size_position(
+            symbol=symbol,
+            timeframe=timeframe,
+            entry_price=execution_opinion.entry_price,
+            stop_loss=execution_opinion.stop_loss,
+            current_drawdown_used=current_drawdown_used,
+            daily_loss_used=daily_loss_used,
+        )
+        try:
+            record_risk_result(candidate_id, size_opinion.to_dict())
+        except CandidateLockedError:
+            return
+        save_opinion(
+            agent="risk",
+            symbol=symbol,
+            timeframe=timeframe,
+            timestamp=size_opinion.timestamp,
+            opinion=size_opinion.to_dict(),
+        )
+
+        if size_opinion.decision in ("approve", "modify"):
+            refreshed = get_candidate_by_id(candidate_id)
+            if refreshed is not None:
+                open_trade_from_candidate(refreshed)
+    except Exception as e:  # noqa: BLE001 - background task, log and move on
+        logging.getLogger("webhook").error("auto-execute failed for candidate_id=%s: %s", candidate_id, e)
 
 
 def _process_paper_trades(symbol: str, timeframe: str, bar: dict) -> None:
