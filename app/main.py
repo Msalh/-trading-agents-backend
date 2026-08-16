@@ -621,6 +621,28 @@ break or mask the actual agent call it's observing. Purely additive
 and read-only from the trading system's perspective — no agent's
 behavior, prompt, or output changes. COORDINATOR_THRESHOLD untouched.
 
+Tier 3.16 (Coordinator/Analysis divergence + ablation): the third
+external review's second priority item, after Tier 3.15's cost
+telemetry. Every backtest-lite/paired/grid result since Tier 3.10 has
+shown Coordinator performing at or below Analysis alone, but a plain
+"do the two directions match?" check conflates several genuinely
+different situations into one number and can't say whether
+Coordinator's blending of News/Macro/Timing on top of Analysis ever
+actually changes an outcome. New app/coordinator_diagnostics.py and
+GET /candidates/history/coordinator-divergence answer this with a
+five-way named breakdown (same direction, opposite direction,
+Coordinator no_trade while Analysis was directional, Coordinator
+insufficient_data, Analysis neutral while Coordinator was directional
+anyway), News/Macro presence-and-opposition impact stats, a Timing-
+block count, and a real causal ablation per directional agent — reuse
+app/replay.py's existing replay_candidate() to re-score every
+candidate's frozen opinions snapshot with one agent's weight zeroed
+and report how often the final decision actually changes, not just
+how often that agent happened to agree with Analysis. Entirely
+offline, read-only, no LLM calls, no new candidates or trades — a
+zeroed weight only ever applies to a single replay pass, never to the
+live WEIGHTS config. COORDINATOR_THRESHOLD untouched.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -673,6 +695,7 @@ from app.outcomes import (
     summarize_opinions_by_day,
     summarize_outcomes,
 )
+from app.coordinator_diagnostics import compute_coordinator_divergence_report
 from app.paper_trades import get_account_open_trade_count, open_trade_from_candidate, process_new_bar
 from app.replay import replay_candidate, replay_candidates_for_symbol, summarize_replay, sweep_thresholds
 from app.risk_agent import (
@@ -1719,6 +1742,60 @@ def candidates_history_replay_threshold_sweep(
         min_available_weight=min_available_weight,
         horizons=_parse_replay_horizons(horizons),
     )
+
+
+@app.get("/candidates/history/coordinator-divergence")
+def candidates_history_coordinator_divergence(
+    symbol: str = Query(...),
+    timeframe: str = Query(...),
+    limit: int = Query(default=300, le=1000),
+) -> dict:
+    """Tier 3.16 (Coordinator/Analysis divergence + ablation): backtest-
+    lite has shown Coordinator's blended decision performing at or
+    below Analysis alone since Tier 3.10, and the Tier 3.12/3.14 paired
+    and grid comparisons went further — on the small accepted-candidate
+    sets tested so far, Coordinator and Analysis produced byte-for-byte
+    IDENTICAL trade outcomes. The third external review endorsed
+    investigating this directly, but specifically NOT as a shallow
+    "are the directions identical?" check — that conflates several
+    different situations (agreement, abstention, active override,
+    inability to decide) into one number and misses whether Coordinator's
+    blending ever causally changes an outcome.
+
+    Built on app/coordinator_diagnostics.compute_coordinator_divergence_report(),
+    which walks candidate history using ONLY already-existing tooling:
+    every candidate already freezes its opinions_used/contributions/
+    conflict_flags snapshot (Tier 2.1), and app/replay.py's
+    replay_candidate() can already re-score that frozen snapshot under
+    a hypothetical weights dict, entirely offline.
+
+    `cross_tab` is the complete picture: analysis_bucket ("directional"/
+    "neutral"/"unavailable") -> coordinator_decision -> count.
+    `named_categories` reads the reviewer's five specific categories
+    directly off it. `news_impact`/`macro_impact` report how often each
+    agent was present with a real directional opinion, its average
+    |contribution| to the weighted score when present, and how often
+    its direction actively opposed Analysis's own direction (a same-
+    direction contribution mostly just reinforces Analysis; an opposing
+    one is where blending could actually change the outcome).
+    `timing_blocked_count` is how many candidates had Timing's veto
+    (market closed) or dampen (low liquidity) flag actually fire.
+    `ablation` replays every candidate three times, each time with
+    ONLY one directional agent's weight zeroed (the other weights held
+    at their live values), and reports how many final decisions
+    actually change — a causal answer ("would this decision have been
+    different without News?"), not just a correlational one.
+
+    Entirely offline: no LLM calls, no new candidates, no trades.
+    COORDINATOR_THRESHOLD and the live WEIGHTS config are untouched —
+    the zeroed weight in each ablation pass only ever applies to that
+    one offline replay, never to a real decision."""
+    candidates = get_candidate_history(symbol=symbol, timeframe=timeframe, limit=limit)
+    return {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        **compute_coordinator_divergence_report(candidates),
+    }
 
 
 @app.get("/candidates/history/backtest-lite")

@@ -999,6 +999,95 @@ output in any way.
 
 ---
 
+## Coordinator/Analysis divergence + ablation (Tier 3.16)
+
+Every backtest-lite/paired/grid result since Tier 3.10 has shown
+Coordinator's own blended decision performing at or below Analysis
+alone, and the third external review pushed back on investigating
+that with a plain "do the two directions match?" check — it
+conflates several genuinely different situations into one number and
+can't say whether Coordinator's blending of News/Macro/Timing on top
+of Analysis ever actually changes an outcome (versus just agreeing or
+staying silent). `app/coordinator_diagnostics.py` answers this by
+reusing the existing `app/replay.py` replay machinery (Tier 2.5)
+rather than new scoring logic: every candidate already freezes its
+full `opinions_used`/`contributions`/`conflict_flags` snapshot, so a
+causal "would this specific decision have been different without
+News?" question can be answered entirely offline by re-scoring that
+frozen snapshot with one agent's weight zeroed.
+
+### `GET /candidates/history/coordinator-divergence?symbol=MNQ1!&timeframe=5m&limit=300`
+
+```json
+{
+  "symbol": "MNQ1!",
+  "timeframe": "5m",
+  "candidates_considered": 197,
+  "cross_tab": {
+    "directional": {
+      "enter_long": 41, "enter_short": 33, "no_trade": 96, "insufficient_data": 4
+    },
+    "neutral": { "no_trade": 12, "enter_long": 3 },
+    "unavailable": { "insufficient_data": 8 }
+  },
+  "named_categories": {
+    "analysis_directional_coordinator_same_direction": 68,
+    "analysis_directional_coordinator_opposite_direction": 6,
+    "analysis_directional_coordinator_no_trade": 96,
+    "analysis_directional_coordinator_insufficient_data": 4,
+    "analysis_neutral_coordinator_directional": 3,
+    "analysis_neutral_coordinator_no_trade": 12,
+    "analysis_unavailable_coordinator_insufficient_data": 8
+  },
+  "news_impact": {
+    "present_and_directional": 140,
+    "opposed_analysis_direction": 22,
+    "avg_abs_contribution_when_present": 14.7
+  },
+  "macro_impact": {
+    "present_and_directional": 118,
+    "opposed_analysis_direction": 15,
+    "avg_abs_contribution_when_present": 9.3
+  },
+  "timing_blocked_count": 9,
+  "ablation": {
+    "analysis_removed": {
+      "candidates_considered": 197, "decision_changed": 31, "decision_unchanged": 166,
+      "transitions": { "enter_long -> no_trade": 18, "no_trade -> enter_short": 7, "enter_short -> enter_long": 6 }
+    },
+    "news_removed": { "...": "same shape" },
+    "macro_removed": { "...": "same shape" }
+  }
+}
+```
+
+`cross_tab` is the complete picture — every candidate falls into
+exactly one `analysis_bucket -> coordinator_decision` cell.
+`named_categories` reads the reviewer's five specific categories
+directly off that same cross_tab (same direction, opposite direction,
+Coordinator `no_trade`/`insufficient_data` while Analysis was
+directional, and Analysis neutral while Coordinator was directional
+anyway). `news_impact`/`macro_impact` report how often each agent was
+present and directional, its average absolute weighted contribution
+when present, and how often its direction opposed Analysis's own
+direction — a same-direction contribution mostly just reinforces
+Analysis, an opposing one is where blending could actually change the
+outcome. `timing_blocked_count` counts candidates where Timing's
+veto (`timing_market_closed`) or dampen (`timing_low_liquidity_dampened`)
+flag actually fired. `ablation` replays every candidate three times,
+once per directional agent, with only that agent's weight zeroed
+(`app/coordinator.WEIGHTS` itself is never touched) and reports how
+many final decisions actually change — a real causal measure of
+whether that agent's presence changes outcomes, not just how often it
+happened to agree with Analysis; `transitions` breaks changed
+decisions down by `"{original} -> {replayed}"` pair.
+
+Entirely offline and read-only — no LLM calls, no new candidates or
+trades, no effect on `COORDINATOR_THRESHOLD` or the live scoring
+config.
+
+---
+
 ## Environment variables
 
 | Variable | Required | Default | Notes |

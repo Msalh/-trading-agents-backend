@@ -810,3 +810,54 @@ def test_llm_usage_endpoint_filters_recent_calls_by_agent(client):
     assert r.status_code == 200
     body = r.json()
     assert all(c["agent"] == "macro" for c in body["recent_calls"])
+
+
+# ---------------------------------------------------------------------------
+# Tier 3.16: Coordinator/Analysis divergence + ablation diagnostic
+# ---------------------------------------------------------------------------
+
+def test_coordinator_divergence_endpoint_returns_report_shape(client):
+    import app.storage as storage
+
+    anchor = "2026-08-11T14:00:00Z"
+    bar = {"event_id": "evt-cd-1", "symbol": "MNQ1!", "timeframe": "5m", "timestamp": anchor}
+    decision = {
+        "decision": "enter_long",
+        "score": 30.0,
+        "threshold": 25.0,
+        "opinions_used": {
+            "analysis": {"direction": "bullish", "confidence": 80, "timestamp": anchor},
+        },
+        "missing_agents": [],
+        "stale_agents": [],
+        "contributions": {
+            "analysis": {"direction": "bullish", "confidence": 80, "weight": 0.4, "contribution": 32.0},
+        },
+        "conflict_flags": [],
+        "timestamp": anchor,
+    }
+    storage.save_candidate(candidate_id="cand-cd-1", symbol="MNQ1!", timeframe="5m", bar=bar, decision=decision)
+
+    r = client.get(
+        "/candidates/history/coordinator-divergence",
+        params={"symbol": "MNQ1!", "timeframe": "5m"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["symbol"] == "MNQ1!"
+    assert body["timeframe"] == "5m"
+    assert body["candidates_considered"] == 1
+    assert body["named_categories"] == {"analysis_directional_coordinator_same_direction": 1}
+    assert set(body["ablation"].keys()) == {"analysis_removed", "news_removed", "macro_removed"}
+    assert body["ablation"]["analysis_removed"]["candidates_considered"] == 1
+
+
+def test_coordinator_divergence_endpoint_empty_history(client):
+    r = client.get(
+        "/candidates/history/coordinator-divergence",
+        params={"symbol": "NOSUCH", "timeframe": "5m"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["candidates_considered"] == 0
+    assert body["named_categories"] == {}
