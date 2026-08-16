@@ -11,7 +11,7 @@ Run with: pytest tests/test_coordinator_diagnostics.py -v
 
 import itertools
 
-from app.coordinator import WEIGHTS, _score_opinions
+from app.coordinator import MIN_AVAILABLE_WEIGHT, WEIGHTS, _score_opinions
 from app.coordinator_diagnostics import compute_coordinator_divergence_report
 
 _candidate_ids = itertools.count(1)
@@ -30,12 +30,23 @@ def _candidate(
     missing_agents=None,
     stale_agents=None,
     threshold=25.0,
+    min_available_weight=0.0,
 ):
     """Builds a candidate-shaped dict {"symbol", "timeframe", "decision"}
     around a REAL CoordinatorDecision computed via _score_opinions —
     same function every real candidate is scored through — so tests
     exercise compute_coordinator_divergence_report() against the exact
-    shape it sees in production, not a hand-rolled approximation."""
+    shape it sees in production, not a hand-rolled approximation.
+
+    min_available_weight defaults to 0.0 to keep most fixtures simple
+    (not testing the availability gate) -- BUT note that ablation
+    replays always run under the LIVE MIN_AVAILABLE_WEIGHT (app.
+    coordinator.MIN_AVAILABLE_WEIGHT, 0.6 by default) regardless of
+    this override, since replay_candidate() falls back to the live
+    global whenever a replay doesn't explicitly pass one. Any fixture
+    whose ablation behavior is under test should pass
+    min_available_weight=coordinator.MIN_AVAILABLE_WEIGHT here so the
+    original decision and its replay are scored under the same gate."""
     opinions = {}
     if analysis is not None:
         opinions["analysis"] = analysis
@@ -52,7 +63,7 @@ def _candidate(
         stale_agents=stale_agents or [],
         weights=WEIGHTS,
         threshold=threshold,
-        min_available_weight=0.0,  # keep test fixtures simple -- not testing the gate here
+        min_available_weight=min_available_weight,
     )
     return {
         "candidate_id": f"test-candidate-{next(_candidate_ids)}",
@@ -140,32 +151,65 @@ def test_macro_impact_zero_when_never_present():
 
 
 def test_ablation_reports_a_changed_decision_when_removing_the_deciding_agent():
-    # News alone is what pushes Coordinator over threshold; Analysis's
-    # much weaker opposing lean isn't enough by itself.
-    # original score = (-0.4*10 + 0.25*95) / 0.65 = 30.4 -> enter_long
-    # with News's weight zeroed: (-0.4*10) / 0.4 = -10 -> no_trade
+    # News is the deciding factor: Analysis and Macro's weak opposition
+    # (-0.4*10 + 0.15*20 = -1) alone wouldn't clear the threshold, but
+    # News's strong confirmation pushes it over.
+    # All three present, so Tier 3.17's fix (removing News's OPINION,
+    # not zeroing its weight) leaves Analysis+Macro's combined weight
+    # (0.55/0.8 = 0.6875) safely above the 0.6 availability gate --
+    # this candidate is a clean test of News's real influence, with no
+    # availability-gate side effect muddying the result.
+    # original: (-0.4*10 + 0.25*95 + 0.15*20) / 0.8 = 28.4 -> enter_long
+    # News's opinion removed: (-0.4*10 + 0.15*20) / 0.8 = -1.0 -> no_trade
     candidate = _candidate(
         analysis=_opinion("bearish", 10),
         news=_opinion("bullish", 95),
+        macro=_opinion("bullish", 20),
     )
     report = compute_coordinator_divergence_report([candidate])
     ablation = report["ablation"]["news_removed"]
     assert ablation["candidates_considered"] == 1
+    assert ablation["agent_present_count"] == 1
     assert ablation["decision_changed"] == 1
 
 
 def test_ablation_reports_unchanged_when_agent_was_never_pivotal():
-    # Analysis alone already clears the threshold in the same
-    # direction News points -- removing News's weight shouldn't flip
-    # anything here.
+    # Analysis+Macro alone already clear the threshold in the same
+    # direction News points, and stay above the 0.6 availability gate
+    # without News (0.55/0.8 = 0.6875) -- removing News's opinion
+    # shouldn't flip anything here.
+    # original: (0.4*95 + 0.25*10 + 0.15*80) / 0.8 = 65.625 -> enter_long
+    # News's opinion removed: (0.4*95 + 0.15*80) / 0.8 = 62.5 -> enter_long
     candidate = _candidate(
         analysis=_opinion("bullish", 95),
-        news=_opinion("bullish", 30),
+        news=_opinion("bullish", 10),
+        macro=_opinion("bullish", 80),
     )
     report = compute_coordinator_divergence_report([candidate])
     ablation = report["ablation"]["news_removed"]
+    assert ablation["agent_present_count"] == 1
     assert ablation["decision_changed"] == 0
     assert ablation["decision_unchanged"] == 1
+
+
+def test_ablation_never_flips_a_candidate_where_the_agent_was_absent():
+    # Tier 3.17 regression test: the bug this tier fixed. Only Analysis
+    # is present (News/Macro both absent) -- available_fraction is
+    # 0.4/0.8 = 0.5, below the live 0.6 gate, so this candidate is
+    # itself insufficient_data (built with min_available_weight=
+    # MIN_AVAILABLE_WEIGHT so the original decision is scored under the
+    # SAME gate the ablation replay will use). Ablating News or Macro
+    # -- neither ever present -- must be a true no-op: it must NOT flip
+    # this out of insufficient_data purely from the availability gate's
+    # denominator shrinking (the exact production bug this tier fixed:
+    # 36/197 real candidates falsely flipped this way pre-fix).
+    candidate = _candidate(analysis=_opinion("bullish", 95), min_available_weight=MIN_AVAILABLE_WEIGHT)
+    assert candidate["decision"]["decision"] == "insufficient_data"
+    report = compute_coordinator_divergence_report([candidate])
+    for key in ("news_removed", "macro_removed"):
+        ablation = report["ablation"][key]
+        assert ablation["agent_present_count"] == 0
+        assert ablation["decision_changed"] == 0
 
 
 def test_timing_blocked_count(monkeypatch):
@@ -183,3 +227,4 @@ def test_empty_candidate_list_returns_zeroed_report():
     assert report["timing_blocked_count"] == 0
     for agent_key in ("analysis_removed", "news_removed", "macro_removed"):
         assert report["ablation"][agent_key]["candidates_considered"] == 0
+        assert report["ablation"][agent_key]["agent_present_count"] == 0

@@ -21,17 +21,51 @@ new scoring logic: every trade candidate already freezes its full
 opinions_used/contributions/conflict_flags snapshot (Tier 2.1), and
 app/replay.py's replay_candidate() can already re-score that frozen
 snapshot under a hypothetical weights dict entirely offline. The
-"ablation" here is exactly that: replay each candidate with one
-directional agent's weight zeroed out and see whether the final
-decision changes — a real causal answer ("would this specific decision
-have been different without News?"), not just a correlational one
-("how often do Analysis and Coordinator happen to agree?").
+"ablation" here is a per-candidate causal replay: remove one
+directional agent's actual opinion from the frozen snapshot (as if it
+had never been gathered for that specific decision) and see whether
+the final decision changes — a real causal answer ("would this
+specific decision have been different without News?"), not just a
+correlational one ("how often do Analysis and Coordinator happen to
+agree?").
+
+Tier 3.17 correction: the original Tier 3.16 implementation modeled
+"remove agent X" by zeroing X's weight in the WEIGHTS dict passed to
+replay_candidate (weights={**WEIGHTS, X: 0.0}). That looked
+equivalent but wasn't: _score_opinions' MIN_AVAILABLE_WEIGHT gate
+divides by directional_weight_total = sum(weights[a] for a in
+DIRECTIONAL_AGENTS), computed over ALL three agents regardless of
+whether they were actually present for a given candidate. Zeroing
+X's weight shrinks that denominator for EVERY candidate being
+replayed, including ones where X was never present to begin with —
+which can push a previously-insufficient_data candidate over the
+0.6 availability bar through pure renormalization, with nothing to
+do with X's real influence. Checked against production data
+(2026-08-16, 197 candidates): 36 candidates where only Analysis was
+present (News and Macro both absent) flipped out of insufficient_data
+under BOTH the news-ablation AND macro-ablation pass, with identical
+transition splits — a clear signature of this artifact, not a real
+finding about News or Macro's influence.
+
+The fix (_ablate_agent below): instead of zeroing a weight in the
+WEIGHTS config, remove the ablated agent's opinion from the frozen
+opinions_used snapshot and add it to missing_agents — exactly modeling
+"this agent's input was genuinely unavailable for this decision" the
+same way a real missing-agent scenario already works, under the
+UNMODIFIED live WEIGHTS/directional_weight_total. A candidate where
+the agent was never present to begin with is now correctly a no-op
+(the modified snapshot is identical to the original), so it can no
+longer produce a false "changed" result. Each ablation entry also now
+reports agent_present_count — how many candidates actually had that
+agent's opinion to remove — so decision_changed can never exceed it,
+a built-in sanity check the old zeroed-weight approach didn't have.
 
 Read-only, offline, no LLM calls, no new candidates or trades — this
 walks candidate history exactly as backtest.py and replay.py already
-do. COORDINATOR_THRESHOLD and Coordinator scoring are untouched;
-zeroing a weight for a single replay pass here never touches the live
-WEIGHTS config used for real decisions.
+do. COORDINATOR_THRESHOLD and Coordinator scoring are untouched; the
+per-candidate opinion removal here is a throwaway copy used only for
+one offline replay, never persisted and never touching the live
+WEIGHTS config or a stored candidate.
 """
 
 from app.coordinator import DIRECTIONAL_AGENTS, WEIGHTS
@@ -77,7 +111,35 @@ def _named_category(analysis_bucket: str, analysis_direction: str | None, coordi
     return f"analysis_{analysis_bucket}_coordinator_{coordinator_decision}"
 
 
-def _ablation_summary(replay_results: list[dict]) -> dict:
+def _ablate_agent(candidate: dict, agent: str) -> dict:
+    """Returns a candidate-shaped dict identical to `candidate` except
+    with `agent`'s opinion removed from opinions_used and added to
+    missing_agents — modeling "this agent's input was genuinely
+    unavailable for this decision" under the SAME live WEIGHTS/
+    directional_weight_total as everything else, rather than zeroing
+    the agent's weight in the WEIGHTS config (see the Tier 3.17 note
+    in the module docstring for why that alternative is wrong: it
+    also shrinks the availability gate's denominator for candidates
+    where the agent was never even present). A candidate where `agent`
+    wasn't in opinions_used to begin with comes back unchanged — a
+    true no-op, not a false flip. Never mutates the input candidate."""
+    decision = candidate["decision"]
+    opinions_used = dict(decision.get("opinions_used") or {})
+    missing_agents = list(decision.get("missing_agents") or [])
+    opinions_used.pop(agent, None)
+    if agent not in missing_agents:
+        missing_agents.append(agent)
+    return {
+        **candidate,
+        "decision": {
+            **decision,
+            "opinions_used": opinions_used,
+            "missing_agents": missing_agents,
+        },
+    }
+
+
+def _ablation_summary(replay_results: list[dict], agent_present_count: int) -> dict:
     changed = [r for r in replay_results if r["changed"]]
     transitions: dict[str, int] = {}
     for r in changed:
@@ -85,6 +147,7 @@ def _ablation_summary(replay_results: list[dict]) -> dict:
         transitions[key] = transitions.get(key, 0) + 1
     return {
         "candidates_considered": len(replay_results),
+        "agent_present_count": agent_present_count,
         "decision_changed": len(changed),
         "decision_unchanged": len(replay_results) - len(changed),
         "transitions": transitions,
@@ -107,10 +170,13 @@ def compute_coordinator_divergence_report(candidates: list[dict]) -> dict:
     - timing_blocked: how many candidates had Timing's veto (market
       closed) or dampen (low liquidity) flag actually fire.
     - ablation: for each of analysis/news/macro, replay every candidate
-      with ONLY that agent's weight zeroed (the other weights held at
-      their live values) and report how many final decisions actually
-      change — a real causal measure of whether that agent's presence
-      changes outcomes, not just how often it agrees with Analysis."""
+      with that agent's actual opinion removed from the frozen snapshot
+      (Tier 3.17 — not a zeroed weight; see module docstring) and
+      report how many final decisions actually change — a real causal
+      measure of whether that agent's presence changes outcomes, not
+      just how often it agrees with Analysis. agent_present_count says
+      how many candidates actually had that agent's opinion to remove;
+      decision_changed can never exceed it."""
     cross_tab: dict[str, dict[str, int]] = {}
     named_categories: dict[str, int] = {}
 
@@ -173,12 +239,15 @@ def compute_coordinator_divergence_report(candidates: list[dict]) -> dict:
 
     ablation = {}
     for agent in sorted(DIRECTIONAL_AGENTS):
-        zeroed_weights = {**WEIGHTS, agent: 0.0}
         replay_results = [
-            replay_candidate(candidate, weights=zeroed_weights)
+            replay_candidate(_ablate_agent(candidate, agent), weights=WEIGHTS)
             for candidate in candidates
         ]
-        ablation[f"{agent}_removed"] = _ablation_summary(replay_results)
+        agent_present_count = sum(
+            1 for c in candidates
+            if agent in ((c.get("decision") or {}).get("opinions_used") or {})
+        )
+        ablation[f"{agent}_removed"] = _ablation_summary(replay_results, agent_present_count)
 
     return {
         "candidates_considered": len(candidates),

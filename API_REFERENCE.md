@@ -999,7 +999,7 @@ output in any way.
 
 ---
 
-## Coordinator/Analysis divergence + ablation (Tier 3.16)
+## Coordinator/Analysis divergence + ablation (Tier 3.16, corrected Tier 3.17)
 
 Every backtest-lite/paired/grid result since Tier 3.10 has shown
 Coordinator's own blended decision performing at or below Analysis
@@ -1014,9 +1014,12 @@ rather than new scoring logic: every candidate already freezes its
 full `opinions_used`/`contributions`/`conflict_flags` snapshot, so a
 causal "would this specific decision have been different without
 News?" question can be answered entirely offline by re-scoring that
-frozen snapshot with one agent's weight zeroed.
+frozen snapshot with that agent's opinion removed.
 
-### `GET /candidates/history/coordinator-divergence?symbol=MNQ1!&timeframe=5m&limit=300`
+### `GET /candidates/history/coordinator-divergence?symbol=MNQ1!&timeframe=5m&limit=1000`
+
+Real production response (197 candidates, 2026-08-16), cross-verified
+via two independently-phrased fetches:
 
 ```json
 {
@@ -1024,42 +1027,51 @@ frozen snapshot with one agent's weight zeroed.
   "timeframe": "5m",
   "candidates_considered": 197,
   "cross_tab": {
-    "directional": {
-      "enter_long": 41, "enter_short": 33, "no_trade": 96, "insufficient_data": 4
-    },
-    "neutral": { "no_trade": 12, "enter_long": 3 },
-    "unavailable": { "insufficient_data": 8 }
+    "neutral": { "no_trade": 23, "insufficient_data": 13, "enter_long": 2 },
+    "directional": { "no_trade": 36, "insufficient_data": 23, "enter_long": 97, "enter_short": 2 },
+    "unavailable": { "enter_long": 1 }
   },
   "named_categories": {
-    "analysis_directional_coordinator_same_direction": 68,
-    "analysis_directional_coordinator_opposite_direction": 6,
-    "analysis_directional_coordinator_no_trade": 96,
-    "analysis_directional_coordinator_insufficient_data": 4,
-    "analysis_neutral_coordinator_directional": 3,
-    "analysis_neutral_coordinator_no_trade": 12,
-    "analysis_unavailable_coordinator_insufficient_data": 8
+    "analysis_neutral_coordinator_no_trade": 23,
+    "analysis_directional_coordinator_no_trade": 36,
+    "analysis_directional_coordinator_insufficient_data": 23,
+    "analysis_neutral_coordinator_insufficient_data": 13,
+    "analysis_directional_coordinator_same_direction": 99,
+    "analysis_neutral_coordinator_directional": 2,
+    "analysis_unavailable_coordinator_enter_long": 1
   },
   "news_impact": {
-    "present_and_directional": 140,
-    "opposed_analysis_direction": 22,
-    "avg_abs_contribution_when_present": 14.7
+    "present_and_directional": 123, "opposed_analysis_direction": 30,
+    "avg_abs_contribution_when_present": 14.827
   },
   "macro_impact": {
-    "present_and_directional": 118,
-    "opposed_analysis_direction": 15,
-    "avg_abs_contribution_when_present": 9.3
+    "present_and_directional": 94, "opposed_analysis_direction": 12,
+    "avg_abs_contribution_when_present": 10.414
   },
-  "timing_blocked_count": 9,
+  "timing_blocked_count": 0,
   "ablation": {
     "analysis_removed": {
-      "candidates_considered": 197, "decision_changed": 31, "decision_unchanged": 166,
-      "transitions": { "enter_long -> no_trade": 18, "no_trade -> enter_short": 7, "enter_short -> enter_long": 6 }
+      "candidates_considered": 197, "agent_present_count": 196,
+      "decision_changed": "...", "decision_unchanged": "...", "transitions": { "...": "..." }
     },
-    "news_removed": { "...": "same shape" },
-    "macro_removed": { "...": "same shape" }
+    "news_removed": {
+      "candidates_considered": 197, "agent_present_count": 123,
+      "decision_changed": "...", "decision_unchanged": "...", "transitions": { "...": "..." }
+    },
+    "macro_removed": {
+      "candidates_considered": 197, "agent_present_count": 94,
+      "decision_changed": "...", "decision_unchanged": "...", "transitions": { "...": "..." }
+    }
   }
 }
 ```
+
+The shape above (including `agent_present_count`) is exact; the
+`ablation` counts are left as placeholders because they're specific to
+whichever code version produced them — see the Tier 3.17 note below
+for why the pre-fix and post-fix numbers differ and why this doc
+doesn't assert a specific post-fix figure without re-querying
+production.
 
 `cross_tab` is the complete picture — every candidate falls into
 exactly one `analysis_bucket -> coordinator_decision` cell.
@@ -1067,20 +1079,66 @@ exactly one `analysis_bucket -> coordinator_decision` cell.
 directly off that same cross_tab (same direction, opposite direction,
 Coordinator `no_trade`/`insufficient_data` while Analysis was
 directional, and Analysis neutral while Coordinator was directional
-anyway). `news_impact`/`macro_impact` report how often each agent was
-present and directional, its average absolute weighted contribution
-when present, and how often its direction opposed Analysis's own
-direction — a same-direction contribution mostly just reinforces
-Analysis, an opposing one is where blending could actually change the
-outcome. `timing_blocked_count` counts candidates where Timing's
-veto (`timing_market_closed`) or dampen (`timing_low_liquidity_dampened`)
-flag actually fired. `ablation` replays every candidate three times,
-once per directional agent, with only that agent's weight zeroed
-(`app/coordinator.WEIGHTS` itself is never touched) and reports how
-many final decisions actually change — a real causal measure of
-whether that agent's presence changes outcomes, not just how often it
-happened to agree with Analysis; `transitions` breaks changed
-decisions down by `"{original} -> {replayed}"` pair.
+anyway). Notably, `analysis_directional_coordinator_opposite_direction`
+doesn't appear at all in the production data above — 0 out of 99
+directional-vs-directional candidates, meaning Coordinator's blend has
+never once flipped to the opposite side of Analysis's own lean in this
+history; it only ever reinforces or withholds. `news_impact`/
+`macro_impact` report how often each agent was present and
+directional, its average absolute weighted contribution when present,
+and how often its direction opposed Analysis's own direction — a
+same-direction contribution mostly just reinforces Analysis, an
+opposing one is where blending could actually change the outcome.
+`timing_blocked_count` counts candidates where Timing's veto
+(`timing_market_closed`) or dampen (`timing_low_liquidity_dampened`)
+flag actually fired (0/197 in this history so far).
+
+`ablation` replays every candidate three times, once per directional
+agent, with that agent's actual opinion removed from its frozen
+snapshot (added to `missing_agents`, `app/coordinator.WEIGHTS` itself
+never touched) and reports how many final decisions actually change —
+a real causal measure of whether that agent's presence changes
+outcomes, not just how often it happened to agree with Analysis.
+`agent_present_count` is how many candidates actually had that
+agent's opinion to remove; `decision_changed` can never exceed it.
+`transitions` breaks changed decisions down by
+`"{original} -> {replayed}"` pair.
+
+**Tier 3.17 correction.** The first cut of this ablation (shipped as
+Tier 3.16) modeled "remove agent X" by zeroing X's weight in the
+`WEIGHTS` dict passed to the replay. That looked equivalent to
+removing X's opinion but wasn't: the `MIN_AVAILABLE_WEIGHT` gate's
+denominator (`directional_weight_total`) sums weights over ALL three
+directional agents regardless of which were actually present for a
+given candidate, so zeroing a weight shrank that denominator for
+*every* candidate being replayed — including ones where the ablated
+agent was never present to begin with, artificially pushing some of
+them over the 0.6 availability bar through pure renormalization.
+
+The pre-fix production numbers (same 197-candidate dataset above) were
+`analysis_removed.decision_changed=68`, `news_removed.decision_changed=51`,
+`macro_removed.decision_changed=39`. Tracing the transition breakdown
+by hand: exactly 36 candidates — every one of them "Analysis alone
+present" (News and Macro both absent) — flipped out of
+`insufficient_data` under BOTH the News-ablation and the Macro-ablation
+pass, with an identical `6/13/17` transition split each time. That
+duplication across two supposedly-independent ablations, on candidates
+where the "removed" agent was never present in the first place, is the
+signature of the renormalization artifact, not a real finding about
+either agent's influence — subtracting it gives a rough hand-checked
+estimate of ~15/123 (12%) for News's genuine effect and ~3/94 (3%) for
+Macro's, versus ~35% and ~20% raw.
+
+The fix removes the agent's actual opinion from the frozen snapshot
+instead of zeroing its weight, keeping `directional_weight_total` at
+its normal live value — a candidate where the agent was never present
+is now provably a no-op (see the Tier 3.17 regression test in
+`tests/test_coordinator_diagnostics.py`). The exact post-fix production
+counts haven't been re-pulled as of this writing (they require
+`agent_present_count`, deployed only in this fix); expect them to be
+close to the hand-subtracted estimate above but treat that as an
+estimate, not a confirmed figure, until the live endpoint is re-queried
+after this fix ships.
 
 Entirely offline and read-only — no LLM calls, no new candidates or
 trades, no effect on `COORDINATOR_THRESHOLD` or the live scoring

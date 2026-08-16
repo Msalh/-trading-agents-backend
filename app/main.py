@@ -643,6 +643,26 @@ offline, read-only, no LLM calls, no new candidates or trades — a
 zeroed weight only ever applies to a single replay pass, never to the
 live WEIGHTS config. COORDINATOR_THRESHOLD untouched.
 
+Tier 3.17 (ablation methodology correction): pulling Tier 3.16's real
+numbers from production surfaced a genuine bug in its own ablation
+mechanism. Modeling "remove agent X" by zeroing X's weight in the
+WEIGHTS dict also shrinks directional_weight_total — the availability
+gate's (MIN_AVAILABLE_WEIGHT) denominator — for every candidate being
+replayed, including ones where X was never present at all. On the
+197-candidate production history, this falsely flipped the same 36
+"Analysis alone present" candidates out of insufficient_data under
+BOTH the News-ablation and Macro-ablation passes, with identical
+transition splits — a renormalization artifact, not a real finding
+about either agent's influence. Fixed by having app/coordinator_
+diagnostics._ablate_agent() remove the agent's actual opinion from
+the frozen snapshot (added to missing_agents) instead of zeroing a
+weight, keeping directional_weight_total at its normal live value so
+a candidate where the agent was never present is now correctly a
+no-op. Each ablation entry also now reports agent_present_count, a
+built-in sanity bound (decision_changed can never exceed it). Purely
+a bugfix to Tier 3.16's own diagnostic — no scoring, weights, or
+threshold used by real decisions changed.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -1780,16 +1800,40 @@ def candidates_history_coordinator_divergence(
     one is where blending could actually change the outcome).
     `timing_blocked_count` is how many candidates had Timing's veto
     (market closed) or dampen (low liquidity) flag actually fire.
-    `ablation` replays every candidate three times, each time with
-    ONLY one directional agent's weight zeroed (the other weights held
-    at their live values), and reports how many final decisions
-    actually change — a causal answer ("would this decision have been
-    different without News?"), not just a correlational one.
+    `ablation` replays every candidate three times, each time with one
+    directional agent's actual OPINION removed from its frozen
+    snapshot (added to missing_agents, as if that agent's input was
+    genuinely unavailable for this decision) — not a zeroed weight in
+    the WEIGHTS config. Each entry reports agent_present_count (how
+    many candidates actually had that agent's opinion to remove) plus
+    how many final decisions actually changed — a causal answer
+    ("would this decision have been different without News?"), not
+    just a correlational one; decision_changed can never exceed
+    agent_present_count.
+
+    Tier 3.17 correction: the original Tier 3.16 ablation zeroed the
+    agent's weight in the WEIGHTS dict instead of removing its
+    opinion. That looked equivalent but wasn't — the MIN_AVAILABLE_
+    WEIGHT gate's denominator (directional_weight_total) is computed
+    over ALL three directional agents regardless of which were
+    actually present, so zeroing a weight shrank that denominator for
+    every candidate being replayed, including ones where the ablated
+    agent was never present to begin with. On real production data
+    this flipped 36/197 candidates (all of them "Analysis alone
+    present") out of insufficient_data under BOTH the News-ablation
+    AND the Macro-ablation pass, with identical transition splits —
+    an artifact of the availability math, not a real finding about
+    either agent's influence. Removing the agent's opinion instead of
+    zeroing its weight keeps directional_weight_total at its normal
+    live value, so a candidate where the agent was never present is
+    now correctly a no-op.
 
     Entirely offline: no LLM calls, no new candidates, no trades.
     COORDINATOR_THRESHOLD and the live WEIGHTS config are untouched —
-    the zeroed weight in each ablation pass only ever applies to that
-    one offline replay, never to a real decision."""
+    each ablation pass builds a throwaway modified copy of one
+    candidate's frozen snapshot for a single offline replay, never
+    persisted and never touching a stored candidate or the live
+    config."""
     candidates = get_candidate_history(symbol=symbol, timeframe=timeframe, limit=limit)
     return {
         "symbol": symbol,
