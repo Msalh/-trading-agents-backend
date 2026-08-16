@@ -711,3 +711,50 @@ def test_paired_backtest_endpoint_excludes_candidates_ineligible_for_any_source(
     assert body["config"]["eligible_candidates"] == 0
     assert body["by_source"]["analysis"]["trades_taken"] == 0
     assert body["by_source"]["coordinator"]["trades_taken"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Tier 3.14: pre-registered parameter sensitivity grid
+# ---------------------------------------------------------------------------
+
+def test_sensitivity_grid_endpoint_runs_the_default_27_combination_grid(client):
+    import app.storage as storage
+
+    anchor = "2026-08-11T14:00:00Z"
+    bar = {"event_id": "evt-grid-1", "symbol": "MNQ1!", "timeframe": "5m", "timestamp": anchor, "atr": 2.0}
+    decision = {
+        "decision": "enter_long", "timestamp": anchor,
+        "opinions_used": {"analysis": {"direction": "bullish", "timestamp": anchor}},
+    }
+    storage.save_candidate(candidate_id="cand-grid-1", symbol="MNQ1!", timeframe="5m", bar=bar, decision=decision)
+    for i in range(1, 25):
+        _save_market_bar(
+            storage, "MNQ1!", "5m", f"2026-08-11T14:{5 * i:02d}:00Z" if 5 * i < 60 else f"2026-08-11T15:{5 * i - 60:02d}:00Z",
+            open_=20000.0, high=20060.0, low=19995.0, close=20055.0,
+        )
+
+    r = client.get(
+        "/candidates/history/backtest-lite/sensitivity-grid",
+        params={"symbol": "MNQ1!", "timeframe": "5m", "sources": "coordinator"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["grid"]["total_combinations"] == 27
+    assert len(body["combinations"]) == 27
+    assert "coordinator" in body["robustness"]
+
+
+def test_sensitivity_grid_endpoint_rejects_unknown_source(client):
+    r = client.get(
+        "/candidates/history/backtest-lite/sensitivity-grid",
+        params={"symbol": "MNQ1!", "timeframe": "5m", "sources": "not_a_real_source"},
+    )
+    assert r.status_code == 400
+
+
+def test_sensitivity_grid_endpoint_requires_at_least_one_source(client):
+    r = client.get(
+        "/candidates/history/backtest-lite/sensitivity-grid",
+        params={"symbol": "MNQ1!", "timeframe": "5m", "sources": ""},
+    )
+    assert r.status_code == 400

@@ -124,6 +124,29 @@ equity dip across the trade sequence in the order it was taken, i.e.
 None of this changes which trades are simulated or how — purely
 additional read-only reporting on results already being computed,
 same as every diagnostic tier before it.
+
+Tier 3.14 (parameter sensitivity grid): every result reported through
+Tier 3.13 used ONE geometry (1.5x ATR stop, 2.5x ATR target, 24-bar
+expiry) — a source that only looks good under that one specific choice
+could just be an artifact of that choice, not a real edge. The
+external review's own recommendation was a small, PRE-REGISTERED grid
+(fixed before looking at results, so nobody can quietly keep re-running
+different geometries until one looks favorable — that would just be
+overfitting by another name). run_sensitivity_grid() below runs
+run_paired_barrier_backtest() (Tier 3.12's corrected paired comparison)
+across a small fixed grid (default stops {1.0, 1.5, 2.0}x ATR, targets
+{1.5, 2.0, 2.5}x ATR, expiry {6, 12, 24} bars = 27 combinations,
+env-configurable via BACKTEST_GRID_STOP_MULTS / BACKTEST_GRID_TARGET_
+MULTS / BACKTEST_GRID_EXPIRY_BARS — deliberately NOT a per-request
+query parameter, since letting a caller pick the grid per-request
+would defeat the entire point of pre-registration). Reports a compact
+per-combination result per source, plus a robustness summary (how many
+of the 27 combinations were net positive / had profit_factor > 1, and
+the range of total_pnl_usd across the whole grid) — a source with a
+real edge should look decent across MOST reasonable geometries, not
+just the one first tested. Entirely offline, no LLM calls, no new
+trades simulated beyond what backtest-lite already simulates per
+combination — COORDINATOR_THRESHOLD untouched.
 """
 
 import math
@@ -140,6 +163,28 @@ from app.storage import get_bars_after
 ATR_STOP_MULT = float(os.environ.get("BACKTEST_ATR_STOP_MULT", "1.5"))
 ATR_TARGET_MULT = float(os.environ.get("BACKTEST_ATR_TARGET_MULT", "2.5"))
 EXPIRY_BARS = int(os.environ.get("BACKTEST_EXPIRY_BARS", "24"))
+
+
+def _parse_float_list(env_value: str | None, default: tuple[float, ...]) -> tuple[float, ...]:
+    if not env_value:
+        return default
+    return tuple(float(x.strip()) for x in env_value.split(",") if x.strip())
+
+
+def _parse_int_list(env_value: str | None, default: tuple[int, ...]) -> tuple[int, ...]:
+    if not env_value:
+        return default
+    return tuple(int(x.strip()) for x in env_value.split(",") if x.strip())
+
+
+# Tier 3.14: the pre-registered sensitivity grid. Env-configurable
+# (deploy-time only, NOT a query parameter) so the grid stays fixed
+# across requests -- letting a caller pass an arbitrary grid per
+# request would reopen the exact "keep trying configs until one looks
+# good" risk this feature exists to guard against.
+GRID_STOP_MULTS = _parse_float_list(os.environ.get("BACKTEST_GRID_STOP_MULTS"), (1.0, 1.5, 2.0))
+GRID_TARGET_MULTS = _parse_float_list(os.environ.get("BACKTEST_GRID_TARGET_MULTS"), (1.5, 2.0, 2.5))
+GRID_EXPIRY_BARS = _parse_int_list(os.environ.get("BACKTEST_GRID_EXPIRY_BARS"), (6, 12, 24))
 
 DIRECTION_SOURCES = (
     "analysis",
@@ -886,4 +931,103 @@ def compute_champion_challenger_report(
             }
             for source in sources_to_run
         },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tier 3.14: pre-registered parameter sensitivity grid
+# ---------------------------------------------------------------------------
+
+_GRID_SUMMARY_FIELDS = (
+    "trades_taken",
+    "win_rate",
+    "win_rate_ci95_low",
+    "win_rate_ci95_high",
+    "profit_factor",
+    "total_pnl_usd",
+)
+
+
+def _summarize_robustness(combo_results: list[dict]) -> dict:
+    """How consistent a source's results are across the whole grid --
+    a real edge should hold up across MOST reasonable geometries, not
+    just look good on the one config that happened to get tested
+    first."""
+    win_rates = sorted(r["win_rate"] for r in combo_results if r["win_rate"] is not None)
+    median_win_rate = None
+    if win_rates:
+        n = len(win_rates)
+        mid = n // 2
+        median_win_rate = round(win_rates[mid] if n % 2 == 1 else (win_rates[mid - 1] + win_rates[mid]) / 2, 4)
+    pnls = [r["total_pnl_usd"] for r in combo_results]
+    return {
+        "combinations_run": len(combo_results),
+        "combinations_with_positive_pnl": sum(1 for p in pnls if p > 0),
+        "combinations_with_profit_factor_above_1": sum(
+            1 for r in combo_results if r["profit_factor"] is not None and r["profit_factor"] > 1
+        ),
+        "median_win_rate_across_grid": median_win_rate,
+        "min_total_pnl_usd": min(pnls) if pnls else None,
+        "max_total_pnl_usd": max(pnls) if pnls else None,
+    }
+
+
+def run_sensitivity_grid(
+    candidates: list[dict],
+    sources: list[str],
+    stop_mults: tuple[float, ...] = GRID_STOP_MULTS,
+    target_mults: tuple[float, ...] = GRID_TARGET_MULTS,
+    expiry_bars_list: tuple[int, ...] = GRID_EXPIRY_BARS,
+    size: int = 1,
+) -> dict:
+    """Runs run_paired_barrier_backtest() (the corrected, Tier 3.12
+    paired comparison) once per (stop_mult, target_mult, expiry_bars)
+    combination in the pre-registered grid, for every requested
+    source. Each combination's per-source result is compacted to just
+    the fields relevant to judging robustness (trades_taken, win_rate
+    + its CI, profit_factor, total_pnl_usd) rather than the full
+    summary shape, to stay a reasonable response size across a grid
+    this size. Same validation as the paired endpoint: at least one
+    recognized source required."""
+    if len(sources) < 1:
+        raise ValueError("run_sensitivity_grid needs at least one source")
+    unknown = [s for s in sources if s not in DIRECTION_SOURCES]
+    if unknown:
+        raise ValueError(f"unknown source(s) {unknown} — must be one of {DIRECTION_SOURCES}")
+
+    combinations: dict[str, dict] = {}
+    per_source_results: dict[str, list[dict]] = {source: [] for source in sources}
+
+    for stop_mult in stop_mults:
+        for target_mult in target_mults:
+            for expiry_bars in expiry_bars_list:
+                paired = run_paired_barrier_backtest(
+                    candidates, sources, stop_mult=stop_mult, target_mult=target_mult,
+                    expiry_bars=expiry_bars, size=size,
+                )
+                combo_key = f"stop{stop_mult}x_target{target_mult}x_expiry{expiry_bars}b"
+                combo_by_source = {}
+                for source in sources:
+                    full = paired["by_source"][source]
+                    compact = {field: full[field] for field in _GRID_SUMMARY_FIELDS}
+                    combo_by_source[source] = compact
+                    per_source_results[source].append(compact)
+                combinations[combo_key] = {
+                    "stop_mult": stop_mult,
+                    "target_mult": target_mult,
+                    "expiry_bars": expiry_bars,
+                    "accepted_candidates": paired["config"]["accepted_candidates"],
+                    "by_source": combo_by_source,
+                }
+
+    return {
+        "grid": {
+            "stop_mults": list(stop_mults),
+            "target_mults": list(target_mults),
+            "expiry_bars": list(expiry_bars_list),
+            "total_combinations": len(combinations),
+        },
+        "sources": sources,
+        "robustness": {source: _summarize_robustness(results) for source, results in per_source_results.items()},
+        "combinations": combinations,
     }

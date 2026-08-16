@@ -655,3 +655,75 @@ def test_paired_backtest_reports_small_sample_stats_per_source(fresh_env):
         assert "median_pnl_usd" in source_summary
         assert "max_drawdown_usd" in source_summary
         assert "_pnl_sequence" not in source_summary
+
+
+# ---------------------------------------------------------------------------
+# Tier 3.14: pre-registered parameter sensitivity grid
+# ---------------------------------------------------------------------------
+
+def test_sensitivity_grid_runs_every_combination_in_the_default_grid(fresh_env):
+    storage, backtest = fresh_env
+    anchor = datetime(2026, 8, 11, 14, 0, 0, tzinfo=timezone.utc)
+    candidate = _candidate("c1", "TEST", "5m", anchor, atr=2.0, decision="enter_long")
+    # Plenty of forward bars so every (stop, target, expiry) combo in
+    # the default grid -- up to 24 bars out -- has data to walk.
+    for i in range(1, 25):
+        _save_bar(
+            storage, "TEST", "5m", anchor + timedelta(minutes=5 * i),
+            open_=100.0 + i * 0.1, high=100.5 + i * 0.1, low=99.5 + i * 0.1, close=100.2 + i * 0.1,
+        )
+
+    result = backtest.run_sensitivity_grid([candidate], sources=["coordinator"])
+    # Default grid: 3 stop mults x 3 target mults x 3 expiry values.
+    assert result["grid"]["total_combinations"] == 27
+    assert len(result["combinations"]) == 27
+    assert set(result["sources"]) == {"coordinator"}
+
+
+def test_sensitivity_grid_respects_a_custom_grid(fresh_env):
+    storage, backtest = fresh_env
+    anchor = datetime(2026, 8, 11, 14, 0, 0, tzinfo=timezone.utc)
+    candidate = _candidate("c1", "TEST", "5m", anchor, atr=2.0, decision="enter_long")
+    _save_bar(storage, "TEST", "5m", anchor + timedelta(minutes=5), open_=100.0, high=106.0, low=99.5, close=105.5)
+
+    result = backtest.run_sensitivity_grid(
+        [candidate], sources=["coordinator"],
+        stop_mults=(1.5,), target_mults=(2.5,), expiry_bars_list=(24,),
+    )
+    assert result["grid"]["total_combinations"] == 1
+    combo = list(result["combinations"].values())[0]
+    assert combo["stop_mult"] == 1.5
+    assert combo["target_mult"] == 2.5
+    assert combo["expiry_bars"] == 24
+    assert combo["by_source"]["coordinator"]["trades_taken"] == 1
+
+
+def test_sensitivity_grid_reports_a_robustness_summary_per_source(fresh_env):
+    storage, backtest = fresh_env
+    anchor = datetime(2026, 8, 11, 14, 0, 0, tzinfo=timezone.utc)
+    candidate = _candidate("c1", "TEST", "5m", anchor, atr=2.0, decision="enter_long")
+    _save_bar(storage, "TEST", "5m", anchor + timedelta(minutes=5), open_=100.0, high=106.0, low=99.5, close=105.5)
+
+    result = backtest.run_sensitivity_grid(
+        [candidate], sources=["coordinator"],
+        stop_mults=(1.0, 1.5), target_mults=(2.0,), expiry_bars_list=(24,),
+    )
+    robustness = result["robustness"]["coordinator"]
+    assert robustness["combinations_run"] == 2
+    assert "combinations_with_positive_pnl" in robustness
+    assert "combinations_with_profit_factor_above_1" in robustness
+    assert "median_win_rate_across_grid" in robustness
+    assert "min_total_pnl_usd" in robustness
+    assert "max_total_pnl_usd" in robustness
+
+
+def test_sensitivity_grid_requires_at_least_one_source(fresh_env):
+    _, backtest = fresh_env
+    with pytest.raises(ValueError):
+        backtest.run_sensitivity_grid([], sources=[])
+
+
+def test_sensitivity_grid_rejects_unknown_source(fresh_env):
+    _, backtest = fresh_env
+    with pytest.raises(ValueError):
+        backtest.run_sensitivity_grid([], sources=["not_a_real_source"])

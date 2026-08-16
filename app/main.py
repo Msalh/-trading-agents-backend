@@ -585,6 +585,25 @@ were actually taken). Purely additional read-only reporting on
 results already computed — no new trades simulated, no trading-logic
 change, COORDINATOR_THRESHOLD untouched.
 
+Tier 3.14 (parameter sensitivity grid): every result reported through
+Tier 3.13 used one specific geometry (1.5x ATR stop, 2.5x ATR target,
+24-bar expiry) — a source that only looks good under that one choice
+could be an artifact of the choice, not a real edge. New
+app/backtest.run_sensitivity_grid(), exposed at GET /candidates/
+history/backtest-lite/sensitivity-grid, runs the Tier 3.12 paired
+comparison across a small, PRE-REGISTERED grid (default 3 stop
+multiples x 3 target multiples x 3 expiry values = 27 combinations,
+fixed via env vars BACKTEST_GRID_STOP_MULTS/BACKTEST_GRID_TARGET_MULTS/
+BACKTEST_GRID_EXPIRY_BARS at deploy time — deliberately not a query
+parameter, since a caller-chosen grid would defeat the point of
+pre-registering it before looking at results). Reports a compact
+per-combination result per source plus a robustness summary (how many
+combinations were net positive / had profit_factor > 1, the range of
+total_pnl_usd across the grid) — a real edge should hold up across
+most reasonable geometries, not just the one tested first. Entirely
+offline, no LLM calls, no new data collection. COORDINATOR_THRESHOLD
+untouched.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -610,6 +629,7 @@ from app.backtest import (
     compute_backtest_comparison,
     compute_champion_challenger_report,
     run_paired_barrier_backtest,
+    run_sensitivity_grid,
 )
 from app.candidates import (
     CandidateError,
@@ -1851,6 +1871,62 @@ def candidates_history_backtest_lite_paired(
             target_mult=atr_target_mult,
             expiry_bars=expiry_bars,
         )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {"symbol": symbol, "timeframe": timeframe, **result}
+
+
+@app.get("/candidates/history/backtest-lite/sensitivity-grid")
+def candidates_history_backtest_lite_sensitivity_grid(
+    symbol: str = Query(...),
+    timeframe: str = Query(...),
+    limit: int = Query(default=300, le=1000),
+    sources: str = Query(
+        ...,
+        description="comma-separated direction sources to run across the grid, e.g. analysis,coordinator,inverse_analysis — at least one required",
+    ),
+) -> dict:
+    """Tier 3.14 (parameter sensitivity grid): every backtest-lite/
+    paired/champion-challenger result reported so far used ONE
+    geometry (the default 1.5x ATR stop, 2.5x ATR target, 24-bar
+    expiry) — a source that only looks good under that one specific
+    choice could just be an artifact of that choice, not a real edge.
+
+    Runs app/backtest.run_paired_barrier_backtest() (the corrected,
+    Tier 3.12 paired comparison) once per combination in a small,
+    PRE-REGISTERED grid: default stops {1.0, 1.5, 2.0}x ATR, targets
+    {1.5, 2.0, 2.5}x ATR, expiry {6, 12, 24} bars = 27 combinations.
+    Deliberately NOT configurable via query parameters — the grid is
+    fixed at deploy time via BACKTEST_GRID_STOP_MULTS /
+    BACKTEST_GRID_TARGET_MULTS / BACKTEST_GRID_EXPIRY_BARS env vars.
+    Letting a caller pick the grid per-request would defeat the whole
+    point of pre-registration: fixing the parameter space BEFORE
+    looking at results, so nobody can quietly keep re-running different
+    geometries until one happens to look favorable (that would just be
+    overfitting under a different name — exactly what this feature
+    exists to guard against).
+
+    `robustness` per source reports how many of the grid's combinations
+    were net positive / had profit_factor > 1, plus the range of
+    total_pnl_usd across the whole grid, and the median win_rate across
+    all combinations — a source with a real edge should hold up across
+    MOST reasonable geometries, not just the one that happened to be
+    tested first. `combinations` has one compact entry per grid point
+    (trades_taken, win_rate + its 95% CI, profit_factor, total_pnl_usd
+    per source) — the full per-trade detail is intentionally omitted to
+    keep the response a reasonable size across 27 combinations.
+
+    Entirely offline: no LLM calls, no new data collection, nothing
+    written to any trade table. 400 if `sources` is empty or contains
+    an unrecognized value. COORDINATOR_THRESHOLD and the Coordinator's
+    own scoring are untouched — read-only analysis, same as every
+    diagnostic tier before it."""
+    source_list = [s.strip() for s in sources.split(",") if s.strip()]
+
+    candidates = get_candidate_history(symbol=symbol, timeframe=timeframe, limit=limit)
+    try:
+        result = run_sensitivity_grid(candidates, sources=source_list)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 

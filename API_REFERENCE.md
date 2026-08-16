@@ -837,6 +837,64 @@ if `sources` is empty or contains an unrecognized value.
 untouched — read-only analysis, same as every diagnostic tier before
 it.
 
+### `GET /candidates/history/backtest-lite/sensitivity-grid?symbol=MNQ1!&timeframe=5m&limit=300&sources=analysis,coordinator,inverse_analysis`
+Tier 3.14 (parameter sensitivity grid). Every result reported through
+Tier 3.13 used one specific geometry (1.5x ATR stop, 2.5x ATR target,
+24-bar expiry) — a source that only looks good under that one choice
+could just be an artifact of the choice, not a real edge. This
+endpoint, built on `app/backtest.run_sensitivity_grid()`, runs the
+Tier 3.12 paired comparison across a small, PRE-REGISTERED grid:
+default stops `{1.0, 1.5, 2.0}`x ATR, targets `{1.5, 2.0, 2.5}`x ATR,
+expiry `{6, 12, 24}` bars — 27 combinations. The grid itself is fixed
+at deploy time via `BACKTEST_GRID_STOP_MULTS` / `BACKTEST_GRID_TARGET_
+MULTS` / `BACKTEST_GRID_EXPIRY_BARS` env vars, deliberately **not** a
+query parameter on this endpoint — letting a caller choose the grid
+per request would defeat the entire point of pre-registering it before
+looking at results (that would just be overfitting under a different
+name). `sources` is required (comma-separated, at least one recognized
+source).
+
+```json
+{
+  "symbol": "MNQ1!", "timeframe": "5m",
+  "grid": {"stop_mults": [1.0, 1.5, 2.0], "target_mults": [1.5, 2.0, 2.5], "expiry_bars": [6, 12, 24], "total_combinations": 27},
+  "sources": ["analysis", "coordinator", "inverse_analysis"],
+  "robustness": {
+    "analysis": {
+      "combinations_run": 27, "combinations_with_positive_pnl": 9, "combinations_with_profit_factor_above_1": 7,
+      "median_win_rate_across_grid": 0.31, "min_total_pnl_usd": -180.4, "max_total_pnl_usd": 62.1
+    },
+    "coordinator": { "...": "same shape" },
+    "inverse_analysis": { "...": "same shape" }
+  },
+  "combinations": {
+    "stop1.0x_target1.5x_expiry6b": {
+      "stop_mult": 1.0, "target_mult": 1.5, "expiry_bars": 6, "accepted_candidates": 12,
+      "by_source": {
+        "analysis": {"trades_taken": 12, "win_rate": 0.25, "win_rate_ci95_low": 0.0865, "win_rate_ci95_high": 0.5195, "profit_factor": 0.71, "total_pnl_usd": -84.2},
+        "coordinator": { "...": "same shape" },
+        "inverse_analysis": { "...": "same shape" }
+      }
+    },
+    "...": "one entry per grid combination (27 by default)"
+  }
+}
+```
+`robustness` is the headline read: `combinations_with_positive_pnl` /
+`combinations_with_profit_factor_above_1` out of `combinations_run`
+show how often a source cleared a basic bar across the whole grid —
+a real edge should hold up across most reasonable geometries, not just
+the one config tested first. `combinations` has one compact entry per
+grid point (full per-trade detail intentionally omitted to keep the
+response a reasonable size across 27 combinations — for per-trade
+detail on any single configuration, use the `paired` or `backtest-lite`
+endpoints above with `include_trades=True` via direct/programmatic use
+of `app/backtest`). Entirely offline: no LLM calls, no new data
+collection, nothing written to any trade table. 400 if `sources` is
+empty or contains an unrecognized value. `COORDINATOR_THRESHOLD` and
+the Coordinator's own scoring are untouched — read-only analysis, same
+as every diagnostic tier before it.
+
 ---
 
 ## Auto-execution (Tier 3.9)
@@ -906,6 +964,9 @@ were NOT touched by this tier.
 | `BACKTEST_ATR_TARGET_MULT` | no | `2.5` | Tier 3.10: same, target distance |
 | `BACKTEST_EXPIRY_BARS` | no | `24` | Tier 3.10: how many forward bars a hypothetical barrier trade is walked before being marked "expired" (mark-to-last-seen-close, `SLIPPAGE_POINTS` applied against the trader as of Tier 3.12 — this exit is itself a market order, previously priced with no slippage, inconsistent with every other exit type) |
 | `BACKTEST_HOLDOUT_FRACTION` | no | `0.3` | Tier 3.11: fraction of candidate history (chronologically most recent) held out as the champion/challenger validation window |
+| `BACKTEST_GRID_STOP_MULTS` | no | `1.0,1.5,2.0` | Tier 3.14: comma-separated ATR stop multiples in the pre-registered sensitivity grid — deploy-time only, deliberately not a query parameter (see the sensitivity-grid endpoint above) |
+| `BACKTEST_GRID_TARGET_MULTS` | no | `1.5,2.0,2.5` | Tier 3.14: same, target multiples |
+| `BACKTEST_GRID_EXPIRY_BARS` | no | `6,12,24` | Tier 3.14: same, expiry bar counts |
 
 ---
 
