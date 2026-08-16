@@ -100,6 +100,25 @@ CREATE INDEX IF NOT EXISTS idx_trades_symbol_timeframe_status
     ON paper_trades (symbol, timeframe, status);
 CREATE INDEX IF NOT EXISTS idx_trades_candidate_id
     ON paper_trades (candidate_id);
+
+CREATE TABLE IF NOT EXISTS llm_call_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    called_at TEXT NOT NULL DEFAULT (datetime('now')),
+    agent TEXT NOT NULL,
+    model TEXT NOT NULL,
+    trigger_context TEXT,
+    success INTEGER NOT NULL,
+    error_message TEXT,
+    latency_ms REAL,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    cache_creation_input_tokens INTEGER,
+    cache_read_input_tokens INTEGER,
+    web_search_requests INTEGER,
+    estimated_cost_usd REAL
+);
+CREATE INDEX IF NOT EXISTS idx_llm_call_log_agent_called_at
+    ON llm_call_log (agent, called_at DESC);
 """
 
 
@@ -984,5 +1003,136 @@ def cancel_trade(
         )
         conn.commit()
         return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Tier 3.15: LLM call cost/usage telemetry
+# ---------------------------------------------------------------------------
+
+def record_llm_call(
+    *,
+    agent: str,
+    model: str,
+    trigger_context: str | None,
+    success: bool,
+    error_message: str | None,
+    latency_ms: float | None,
+    input_tokens: int | None,
+    output_tokens: int | None,
+    cache_creation_input_tokens: int | None,
+    cache_read_input_tokens: int | None,
+    web_search_requests: int | None,
+    estimated_cost_usd: float | None,
+) -> None:
+    """One row per client.messages.create() call site, success or
+    failure -- see app/llm_telemetry.track_llm_call(), which is what
+    every agent module actually calls (this function is the storage
+    layer underneath it, kept here for the same reason every other
+    table's read/write pair lives in this module)."""
+    conn = get_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO llm_call_log (
+                agent, model, trigger_context, success, error_message, latency_ms,
+                input_tokens, output_tokens, cache_creation_input_tokens,
+                cache_read_input_tokens, web_search_requests, estimated_cost_usd
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                agent, model, trigger_context, 1 if success else 0, error_message, latency_ms,
+                input_tokens, output_tokens, cache_creation_input_tokens,
+                cache_read_input_tokens, web_search_requests, estimated_cost_usd,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_llm_call_summary(since: str | None = None) -> dict:
+    """Aggregates llm_call_log by agent: call counts (total/success/
+    failure), token totals, total estimated cost, average latency, and
+    total web_search calls. `since` (ISO timestamp) restricts to calls
+    at or after that time; omit for all-time. Returns an `overall`
+    rollup plus one entry per agent under `by_agent`."""
+    conn = get_connection()
+    try:
+        where = "WHERE called_at >= ?" if since else ""
+        params = (since,) if since else ()
+        rows = conn.execute(
+            f"""
+            SELECT
+                agent,
+                COUNT(*) AS total_calls,
+                SUM(success) AS successful_calls,
+                SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS failed_calls,
+                COALESCE(SUM(input_tokens), 0) AS total_input_tokens,
+                COALESCE(SUM(output_tokens), 0) AS total_output_tokens,
+                COALESCE(SUM(web_search_requests), 0) AS total_web_search_requests,
+                COALESCE(SUM(estimated_cost_usd), 0.0) AS total_estimated_cost_usd,
+                AVG(latency_ms) AS avg_latency_ms
+            FROM llm_call_log
+            {where}
+            GROUP BY agent
+            ORDER BY agent
+            """,
+            params,
+        ).fetchall()
+
+        by_agent = {}
+        overall = {
+            "total_calls": 0, "successful_calls": 0, "failed_calls": 0,
+            "total_input_tokens": 0, "total_output_tokens": 0,
+            "total_web_search_requests": 0, "total_estimated_cost_usd": 0.0,
+        }
+        for row in rows:
+            entry = {
+                "total_calls": row["total_calls"],
+                "successful_calls": row["successful_calls"] or 0,
+                "failed_calls": row["failed_calls"] or 0,
+                "total_input_tokens": row["total_input_tokens"],
+                "total_output_tokens": row["total_output_tokens"],
+                "total_web_search_requests": row["total_web_search_requests"],
+                "total_estimated_cost_usd": round(row["total_estimated_cost_usd"], 4),
+                "avg_latency_ms": round(row["avg_latency_ms"], 1) if row["avg_latency_ms"] is not None else None,
+            }
+            by_agent[row["agent"]] = entry
+            overall["total_calls"] += entry["total_calls"]
+            overall["successful_calls"] += entry["successful_calls"]
+            overall["failed_calls"] += entry["failed_calls"]
+            overall["total_input_tokens"] += entry["total_input_tokens"]
+            overall["total_output_tokens"] += entry["total_output_tokens"]
+            overall["total_web_search_requests"] += entry["total_web_search_requests"]
+            overall["total_estimated_cost_usd"] = round(
+                overall["total_estimated_cost_usd"] + entry["total_estimated_cost_usd"], 4
+            )
+        return {"since": since, "overall": overall, "by_agent": by_agent}
+    finally:
+        conn.close()
+
+
+def get_recent_llm_calls(limit: int = 50, agent: str | None = None) -> list[dict]:
+    """Most recent raw llm_call_log rows, newest first -- for spot-
+    checking individual calls (e.g. a recent failure's error_message)
+    rather than the aggregated summary above."""
+    conn = get_connection()
+    try:
+        if agent:
+            rows = conn.execute(
+                """
+                SELECT * FROM llm_call_log WHERE agent = ?
+                ORDER BY called_at DESC, id DESC LIMIT ?
+                """,
+                (agent, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM llm_call_log ORDER BY called_at DESC, id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
     finally:
         conn.close()

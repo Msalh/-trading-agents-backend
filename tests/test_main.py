@@ -758,3 +758,55 @@ def test_sensitivity_grid_endpoint_requires_at_least_one_source(client):
         params={"symbol": "MNQ1!", "timeframe": "5m", "sources": ""},
     )
     assert r.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Tier 3.15: LLM call cost/usage telemetry
+# ---------------------------------------------------------------------------
+
+def test_llm_usage_endpoint_reports_overall_and_by_agent(client):
+    import app.storage as storage
+
+    storage.record_llm_call(
+        agent="analysis", model="claude-sonnet-5", trigger_context="MNQ1!/5m",
+        success=True, error_message=None, latency_ms=150.0,
+        input_tokens=300, output_tokens=120, cache_creation_input_tokens=0,
+        cache_read_input_tokens=0, web_search_requests=0, estimated_cost_usd=0.0018,
+    )
+    storage.record_llm_call(
+        agent="news", model="claude-sonnet-5", trigger_context="MNQ1!",
+        success=False, error_message="timeout", latency_ms=6000.0,
+        input_tokens=None, output_tokens=None, cache_creation_input_tokens=None,
+        cache_read_input_tokens=None, web_search_requests=None, estimated_cost_usd=None,
+    )
+
+    r = client.get("/system/llm-usage")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["overall"]["total_calls"] == 2
+    assert body["overall"]["successful_calls"] == 1
+    assert body["overall"]["failed_calls"] == 1
+    assert body["by_agent"]["analysis"]["total_input_tokens"] == 300
+    assert len(body["recent_calls"]) == 2
+
+
+def test_llm_usage_endpoint_filters_recent_calls_by_agent(client):
+    import app.storage as storage
+
+    storage.record_llm_call(
+        agent="macro", model="claude-sonnet-5", trigger_context="MNQ1!",
+        success=True, error_message=None, latency_ms=400.0,
+        input_tokens=50, output_tokens=20, cache_creation_input_tokens=0,
+        cache_read_input_tokens=0, web_search_requests=1, estimated_cost_usd=0.0005,
+    )
+    storage.record_llm_call(
+        agent="execution", model="claude-sonnet-5", trigger_context="MNQ1!/5m",
+        success=True, error_message=None, latency_ms=900.0,
+        input_tokens=200, output_tokens=90, cache_creation_input_tokens=0,
+        cache_read_input_tokens=0, web_search_requests=0, estimated_cost_usd=0.0013,
+    )
+
+    r = client.get("/system/llm-usage", params={"recent_agent": "macro"})
+    assert r.status_code == 200
+    body = r.json()
+    assert all(c["agent"] == "macro" for c in body["recent_calls"])

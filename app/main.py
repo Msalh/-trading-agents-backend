@@ -604,6 +604,23 @@ most reasonable geometries, not just the one tested first. Entirely
 offline, no LLM calls, no new data collection. COORDINATOR_THRESHOLD
 untouched.
 
+Tier 3.15 (LLM call cost/usage telemetry): three external review
+cycles in a row named the same gap — this project had no visibility
+into what its own LLM calls actually cost, and it kept getting
+deferred in favor of whatever looked more urgent at the time. New
+app/llm_telemetry.track_llm_call() wraps every client.messages.create()
+call site in Analysis/News/Macro/Execution and logs exactly one row
+per call, success or failure, to the new llm_call_log table (agent,
+model, a short trigger_context, latency, input/output/cache token
+counts, web_search call count, and an estimated USD cost — pricing
+constants are env-configurable since this project has no Anthropic
+Console billing access to verify actual charges). New GET /system/
+llm-usage reports aggregated totals per agent plus a small recent-
+calls tail. A telemetry write failure is swallowed, never allowed to
+break or mask the actual agent call it's observing. Purely additive
+and read-only from the trading system's perspective — no agent's
+behavior, prompt, or output changes. COORDINATOR_THRESHOLD untouched.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -682,10 +699,12 @@ from app.storage import (
     get_latest,
     get_latest_candidate,
     get_latest_opinion,
+    get_llm_call_summary,
     get_open_or_pending_trades,
     get_recent,
     get_recent_as_of,
     get_recent_decisions,
+    get_recent_llm_calls,
     get_recent_opinions,
     get_recent_trades,
     get_trade_by_id,
@@ -802,6 +821,43 @@ def system_status(symbol: str = Query(default=NEWS_SYMBOL)) -> dict:
         "minutes_since_last_webhook": _minutes_since(last_webhook),
         "agents": agents,
     }
+
+
+@app.get("/system/llm-usage")
+def system_llm_usage(
+    since: str | None = Query(default=None, description="ISO timestamp — restrict to calls at or after this time; omit for all-time"),
+    recent_limit: int = Query(default=20, le=200, description="how many raw recent calls to include, most recent first"),
+    recent_agent: str | None = Query(default=None, description="restrict the recent-calls list to one agent (analysis/news/macro/execution)"),
+) -> dict:
+    """Tier 3.15 (LLM call cost/usage telemetry): closes a gap named by
+    three external review cycles in a row — this project had no
+    visibility into what its own LLM calls actually cost. Every
+    `client.messages.create()` call site in Analysis/News/Macro/
+    Execution is now wrapped (see app/llm_telemetry.track_llm_call())
+    and logs exactly one row per call, success or failure, to the new
+    llm_call_log table: agent, model, a short trigger_context (symbol/
+    timeframe), latency, input/output/cache token counts, web_search
+    call count (News/Macro use Claude's hosted web_search tool), and
+    an estimated USD cost.
+
+    `overall`/`by_agent` report call counts (total/success/failure),
+    token totals, total web_search calls, total estimated cost, and
+    average latency — `since` restricts the window (omit for all-
+    time). `recent_calls` is a small raw tail (default 20, optionally
+    filtered to one agent) for spot-checking an individual call, e.g.
+    a recent failure's error message.
+
+    `estimated_cost_usd` throughout is exactly that — an ESTIMATE
+    computed from this project's own token counts against pricing
+    constants that are env-configurable (TELEMETRY_INPUT_COST_PER_MTOK
+    etc., see API_REFERENCE.md) since this project has no Anthropic
+    Console billing access to verify actual charges. Useful for
+    relative comparison and trend-watching (which agent costs the
+    most, is cost trending up), not as an authoritative invoice.
+    Entirely read-only — does not affect any agent's behavior."""
+    summary = get_llm_call_summary(since=since)
+    recent = get_recent_llm_calls(limit=recent_limit, agent=recent_agent)
+    return {**summary, "recent_calls": recent}
 
 
 @app.post("/admin/wipe-all-data")

@@ -18,6 +18,8 @@ from datetime import datetime, timezone
 
 import anthropic
 
+from app.llm_telemetry import track_llm_call
+
 MODEL = "claude-sonnet-5"
 
 SYSTEM_PROMPT = """You are a technical analyst specialized in MNQ (Micro E-mini Nasdaq-100). You receive recent price bars across the timeframe given to you.
@@ -138,12 +140,14 @@ def run_analysis(symbol: str, timeframe: str, bars: list[dict]) -> AnalysisOpini
     client = anthropic.Anthropic(api_key=api_key)
     user_message = _build_user_message(symbol, timeframe, bars)
 
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=1024,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_message}],
-    )
+    with track_llm_call("analysis", MODEL, trigger_context=f"{symbol}/{timeframe}") as call:
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=1024,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_message}],
+        )
+        call.record(response)
     raw_text = "".join(block.text for block in response.content if block.type == "text")
     parsed = _parse_response(raw_text)
 

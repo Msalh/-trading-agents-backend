@@ -935,6 +935,70 @@ were NOT touched by this tier.
 
 ---
 
+## Cost/usage telemetry (Tier 3.15)
+
+Three external review cycles in a row named the same gap: this
+project had no visibility into what its own LLM calls actually cost.
+Every `client.messages.create()` call site in Analysis/News/Macro/
+Execution is now wrapped by `app/llm_telemetry.track_llm_call()`,
+which logs exactly one row — success or failure — to a new
+`llm_call_log` table: agent, model, a short `trigger_context`
+(symbol/timeframe or similar), latency, input/output/cache token
+counts, web_search call count (News/Macro use Claude's hosted
+`web_search` tool), and an estimated USD cost. A telemetry write
+failure is swallowed, never allowed to break or mask the actual agent
+call it's observing — this is purely observational, it never changes
+what an agent does.
+
+### `GET /system/llm-usage?since=2026-08-16T00:00:00Z&recent_limit=20&recent_agent=analysis`
+`since` (optional, ISO timestamp) restricts the aggregation window;
+omit for all-time. `recent_limit`/`recent_agent` control the raw
+recent-calls tail (default last 20 calls across all agents).
+
+```json
+{
+  "since": null,
+  "overall": {
+    "total_calls": 214, "successful_calls": 211, "failed_calls": 3,
+    "total_input_tokens": 187400, "total_output_tokens": 52100,
+    "total_web_search_requests": 38, "total_estimated_cost_usd": 1.2137
+  },
+  "by_agent": {
+    "analysis": {
+      "total_calls": 120, "successful_calls": 119, "failed_calls": 1,
+      "total_input_tokens": 96000, "total_output_tokens": 28000,
+      "total_web_search_requests": 0, "total_estimated_cost_usd": 0.472,
+      "avg_latency_ms": 1840.3
+    },
+    "news": { "...": "same shape" },
+    "macro": { "...": "same shape" },
+    "execution": { "...": "same shape" }
+  },
+  "recent_calls": [
+    {
+      "id": 214, "called_at": "2026-08-16 12:03:44", "agent": "analysis", "model": "claude-sonnet-5",
+      "trigger_context": "MNQ1!/5m", "success": 1, "error_message": null, "latency_ms": 1712.4,
+      "input_tokens": 812, "output_tokens": 240, "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0, "web_search_requests": 0, "estimated_cost_usd": 0.004024
+    }
+  ]
+}
+```
+
+`estimated_cost_usd` throughout is exactly that — an **estimate**
+computed from this project's own logged token counts against pricing
+constants, not an authoritative billing figure (this project has no
+Anthropic Console billing access to verify actual charges against).
+Useful for relative comparison and trend-watching (which agent costs
+the most, is cost trending up over time), not as an invoice. Pricing
+constants are env-configurable (see below) since actual API pricing
+changes over time.
+
+Entirely read-only — does not affect any agent's behavior, prompt, or
+output in any way.
+
+---
+
 ## Environment variables
 
 | Variable | Required | Default | Notes |
@@ -967,6 +1031,11 @@ were NOT touched by this tier.
 | `BACKTEST_GRID_STOP_MULTS` | no | `1.0,1.5,2.0` | Tier 3.14: comma-separated ATR stop multiples in the pre-registered sensitivity grid — deploy-time only, deliberately not a query parameter (see the sensitivity-grid endpoint above) |
 | `BACKTEST_GRID_TARGET_MULTS` | no | `1.5,2.0,2.5` | Tier 3.14: same, target multiples |
 | `BACKTEST_GRID_EXPIRY_BARS` | no | `6,12,24` | Tier 3.14: same, expiry bar counts |
+| `TELEMETRY_INPUT_COST_PER_MTOK` | no | `2.0` | Tier 3.15: estimated USD cost per million input tokens for `GET /system/llm-usage`'s `estimated_cost_usd` figures — confirmed against Claude Sonnet 5's published pricing on 2026-08-16, adjust if pricing changes |
+| `TELEMETRY_OUTPUT_COST_PER_MTOK` | no | `10.0` | Tier 3.15: same, output tokens |
+| `TELEMETRY_CACHE_WRITE_MULTIPLIER` | no | `1.25` | Tier 3.15: cache-write token cost as a multiple of the base input rate (Anthropic's standard prompt-caching formula) |
+| `TELEMETRY_CACHE_READ_MULTIPLIER` | no | `0.1` | Tier 3.15: same, cache-read tokens |
+| `TELEMETRY_WEB_SEARCH_COST_PER_SEARCH` | no | `0.01` | Tier 3.15: estimated USD cost per `web_search` tool call (News/Macro) — $10 per 1,000 searches |
 
 ---
 

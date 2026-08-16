@@ -42,6 +42,8 @@ from datetime import datetime, timezone
 
 import anthropic
 
+from app.llm_telemetry import track_llm_call
+
 MODEL = "claude-sonnet-5"
 
 # Minimum acceptable reward:risk, measured against the NEAREST target
@@ -237,12 +239,14 @@ def plan_execution(
         indent=2,
     )
 
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=4096,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_message}],
-    )
+    with track_llm_call("execution", MODEL, trigger_context=f"{symbol}/{timeframe}") as call:
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=4096,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_message}],
+        )
+        call.record(response)
     raw_text = "".join(block.text for block in response.content if getattr(block, "type", None) == "text")
     parsed = _parse_response(raw_text)
 

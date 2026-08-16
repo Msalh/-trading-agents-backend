@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 
 import anthropic
 
+from app.llm_telemetry import track_llm_call
 from app.text_utils import clean_opinion_text_fields
 
 MODEL = "claude-sonnet-5"
@@ -98,13 +99,15 @@ def run_macro(symbol: str) -> MacroOpinion:
         f"instructed."
     )
 
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=4096,
-        system=SYSTEM_PROMPT,
-        tools=[{"type": "web_search_20250305", "name": "web_search"}],
-        messages=[{"role": "user", "content": user_message}],
-    )
+    with track_llm_call("macro", MODEL, trigger_context=symbol) as call:
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=4096,
+            system=SYSTEM_PROMPT,
+            tools=[{"type": "web_search_20250305", "name": "web_search"}],
+            messages=[{"role": "user", "content": user_message}],
+        )
+        call.record(response)
 
     raw_text = "".join(
         block.text for block in response.content if getattr(block, "type", None) == "text"
