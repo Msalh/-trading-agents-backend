@@ -1052,26 +1052,29 @@ via two independently-phrased fetches:
   "ablation": {
     "analysis_removed": {
       "candidates_considered": 197, "agent_present_count": 196,
-      "decision_changed": "...", "decision_unchanged": "...", "transitions": { "...": "..." }
+      "decision_changed": 161, "decision_unchanged": 36,
+      "transitions": { "no_trade -> insufficient_data": 59, "enter_long -> insufficient_data": 100, "enter_short -> insufficient_data": 2 }
     },
     "news_removed": {
-      "candidates_considered": 197, "agent_present_count": 123,
-      "decision_changed": "...", "decision_unchanged": "...", "transitions": { "...": "..." }
+      "candidates_considered": 197, "agent_present_count": 138,
+      "decision_changed": 65, "decision_unchanged": 132,
+      "transitions": { "no_trade -> enter_short": 25, "enter_long -> no_trade": 2, "enter_long -> insufficient_data": 26, "no_trade -> insufficient_data": 10, "enter_short -> insufficient_data": 2 }
     },
     "macro_removed": {
-      "candidates_considered": 197, "agent_present_count": 94,
-      "decision_changed": "...", "decision_unchanged": "...", "transitions": { "...": "..." }
+      "candidates_considered": 197, "agent_present_count": 124,
+      "decision_changed": 26, "decision_unchanged": 171,
+      "transitions": { "enter_long -> no_trade": 2, "enter_long -> insufficient_data": 19, "no_trade -> insufficient_data": 3, "enter_short -> insufficient_data": 2 }
     }
   }
 }
 ```
 
-The shape above (including `agent_present_count`) is exact; the
-`ablation` counts are left as placeholders because they're specific to
-whichever code version produced them — see the Tier 3.17 note below
-for why the pre-fix and post-fix numbers differ and why this doc
-doesn't assert a specific post-fix figure without re-querying
-production.
+Real, post-fix production response, re-pulled and cross-verified via
+two independently-phrased fetches after Tier 3.17 (`cf442c2`) deployed
+(2026-08-16). `agent_present_count` for News (138) and Macro (124) is
+noticeably higher than their `present_and_directional` counts above
+(123/94) — presence includes candidates where the agent had a
+`neutral` opinion, not just a directional one.
 
 `cross_tab` is the complete picture — every candidate falls into
 exactly one `analysis_bucket -> coordinator_decision` cell.
@@ -1125,20 +1128,28 @@ pass, with an identical `6/13/17` transition split each time. That
 duplication across two supposedly-independent ablations, on candidates
 where the "removed" agent was never present in the first place, is the
 signature of the renormalization artifact, not a real finding about
-either agent's influence — subtracting it gives a rough hand-checked
-estimate of ~15/123 (12%) for News's genuine effect and ~3/94 (3%) for
-Macro's, versus ~35% and ~20% raw.
+either agent's influence.
 
 The fix removes the agent's actual opinion from the frozen snapshot
 instead of zeroing its weight, keeping `directional_weight_total` at
 its normal live value — a candidate where the agent was never present
 is now provably a no-op (see the Tier 3.17 regression test in
-`tests/test_coordinator_diagnostics.py`). The exact post-fix production
-counts haven't been re-pulled as of this writing (they require
-`agent_present_count`, deployed only in this fix); expect them to be
-close to the hand-subtracted estimate above but treat that as an
-estimate, not a confirmed figure, until the live endpoint is re-queried
-after this fix ships.
+`tests/test_coordinator_diagnostics.py`). The confirmed post-fix
+production numbers (in the response above) turned out noticeably
+*higher* than a naive hand-subtraction of the 36-candidate artifact
+would suggest — News is genuinely pivotal in 65/138 (47%) of the
+candidates where it actually had an opinion, and Macro in 26/124
+(21%), both well above the pre-fix raw percentages (26% and 20% of
+all 197). Analysis is pivotal in 161/196 (82%) — and this one has a
+clean structural explanation, not just "Analysis is very influential":
+`WEIGHTS` gives News+Macro a combined 0.25+0.15=0.40 of the 0.80
+directional total, which can never reach the 0.6 `MIN_AVAILABLE_
+WEIGHT` fraction (0.40/0.80=0.50 < 0.6) even with BOTH present and
+fully confident. Under the current config, Coordinator structurally
+cannot reach a directional decision on News+Macro alone, regardless
+of signal strength — Analysis isn't just the most-weighted agent, its
+presence is a hard precondition for the system to decide anything at
+all. That's a sharper, previously-invisible finding this fix exposed.
 
 Entirely offline and read-only — no LLM calls, no new candidates or
 trades, no effect on `COORDINATOR_THRESHOLD` or the live scoring
