@@ -105,8 +105,28 @@ slippage, inconsistent with every other exit type in the function —
 fixed to apply the same against-the-trader slippage as a stop-out.
 All three are read-only methodology fixes: no trading-logic change,
 COORDINATOR_THRESHOLD untouched.
+
+Tier 3.13 (small-sample statistics): every backtest-lite/champion-
+challenger result so far has been read off win_rate and profit_factor
+alone, which are exactly the two statistics that are most volatile at
+the sample sizes this project actually has (paired comparisons run as
+low as single-digit trade counts, Tier 3.12's own paired endpoint
+returned 7 accepted trades on its first production run). A 5/7 vs 2/7
+split LOOKS like a big difference in win_rate but is well within noise
+at that N. Each summary now also reports win_rate_ci95_low/
+win_rate_ci95_high (a Wilson score interval on wins/decided, the
+standard correction for small-N binomial proportions — plain
+Wald/normal-approximation intervals misbehave badly below ~30 trades),
+median_pnl_usd (a robustness check against a single large win or loss
+dominating the mean), and max_drawdown_usd (largest peak-to-trough
+equity dip across the trade sequence in the order it was taken, i.e.
+"how bad did it get along the way" rather than just the ending total).
+None of this changes which trades are simulated or how — purely
+additional read-only reporting on results already being computed,
+same as every diagnostic tier before it.
 """
 
+import math
 import os
 
 from app.outcomes import _candidate_anchor_timestamp, _resolve_anchor_timestamp, compute_baseline_comparison
@@ -300,6 +320,58 @@ def _direction_for_source(source: str, candidate: dict) -> tuple[str | None, str
     raise ValueError(f"unknown direction_source {source!r} — must be one of {DIRECTION_SOURCES}")
 
 
+def _wilson_score_interval(wins: int, n: int, z: float = 1.959964) -> tuple[float, float] | None:
+    """95% Wilson score confidence interval on a binomial proportion
+    (wins/n). Returns None when n == 0 (nothing decided yet).
+
+    Deliberately NOT the plain normal-approximation interval
+    (phat +/- z*sqrt(phat*(1-phat)/n)) -- that one is well known to
+    misbehave (can go negative, or exceed 1, or be badly miscalibrated)
+    at exactly the small-N regime this project actually has (single-
+    digit to low-double-digit trade counts). Wilson's interval stays
+    well-behaved down to very small n and is the standard correction
+    for this, at the cost of being slightly more involved to compute."""
+    if n == 0:
+        return None
+    phat = wins / n
+    z2 = z * z
+    denominator = 1 + z2 / n
+    center = phat + z2 / (2 * n)
+    margin = z * math.sqrt((phat * (1 - phat) / n) + (z2 / (4 * n * n)))
+    lower = (center - margin) / denominator
+    upper = (center + margin) / denominator
+    return (round(max(0.0, lower), 4), round(min(1.0, upper), 4))
+
+
+def _median(values: list[float]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    n = len(ordered)
+    mid = n // 2
+    if n % 2 == 1:
+        return round(ordered[mid], 2)
+    return round((ordered[mid - 1] + ordered[mid]) / 2, 2)
+
+
+def _max_drawdown(pnl_sequence: list[float]) -> float:
+    """Largest peak-to-trough dip in the running equity curve, in the
+    order trades were actually taken (chronological -- pnl_sequence is
+    appended in accepted-trade order, not sorted after the fact).
+    Returns 0.0 for an empty or all-winning sequence (no drawdown)."""
+    peak = 0.0
+    running = 0.0
+    max_dd = 0.0
+    for pnl in pnl_sequence:
+        running += pnl
+        if running > peak:
+            peak = running
+        drawdown = peak - running
+        if drawdown > max_dd:
+            max_dd = drawdown
+    return round(max_dd, 2)
+
+
 def _empty_summary() -> dict:
     return {
         "trades_taken": 0,
@@ -315,9 +387,14 @@ def _empty_summary() -> dict:
         "gross_profit_usd": 0.0,
         "gross_loss_usd": 0.0,
         "win_rate": None,
+        "win_rate_ci95_low": None,
+        "win_rate_ci95_high": None,
         "profit_factor": None,
         "avg_pnl_usd": None,
+        "median_pnl_usd": None,
+        "max_drawdown_usd": None,
         "trades": [],
+        "_pnl_sequence": [],
     }
 
 
@@ -330,6 +407,7 @@ def _accumulate_trade_result(summary: dict, result: dict) -> None:
     pnl = result["pnl_usd"]
     if pnl is not None:
         summary["total_pnl_usd"] = round(summary["total_pnl_usd"] + pnl, 2)
+        summary["_pnl_sequence"].append(pnl)
         if pnl > 0:
             summary["wins"] += 1
             summary["gross_profit_usd"] = round(summary["gross_profit_usd"] + pnl, 2)
@@ -343,20 +421,29 @@ def _accumulate_trade_result(summary: dict, result: dict) -> None:
 
 
 def _finalize_summary(summary: dict) -> None:
-    """Shared tail computation (win_rate/profit_factor/avg_pnl_usd),
-    in place — same reasoning both callers share: profit_factor is
-    null (not a misleading infinity) when there are no losses to
-    divide by, and win_rate/avg_pnl_usd stay null until something has
-    actually resolved to a decided win/loss."""
+    """Shared tail computation (win_rate/profit_factor/avg_pnl_usd plus
+    the Tier 3.13 small-sample additions), in place — same reasoning
+    both callers share: profit_factor is null (not a misleading
+    infinity) when there are no losses to divide by, and
+    win_rate/avg_pnl_usd stay null until something has actually
+    resolved to a decided win/loss. Pops the internal _pnl_sequence
+    scratch list before returning -- it's bookkeeping only, never part
+    of the public summary shape."""
     decided = summary["wins"] + summary["losses"]
     if decided > 0:
         summary["win_rate"] = round(summary["wins"] / decided, 4)
+        ci = _wilson_score_interval(summary["wins"], decided)
+        if ci is not None:
+            summary["win_rate_ci95_low"], summary["win_rate_ci95_high"] = ci
     if summary["gross_loss_usd"] > 0:
         summary["profit_factor"] = round(summary["gross_profit_usd"] / summary["gross_loss_usd"], 4)
     elif summary["gross_profit_usd"] > 0:
         summary["profit_factor"] = None
     if summary["trades_taken"] > 0:
         summary["avg_pnl_usd"] = round(summary["total_pnl_usd"] / summary["trades_taken"], 2)
+    pnl_sequence = summary.pop("_pnl_sequence")
+    summary["median_pnl_usd"] = _median(pnl_sequence)
+    summary["max_drawdown_usd"] = _max_drawdown(pnl_sequence)
 
 
 def run_barrier_backtest(

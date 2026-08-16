@@ -569,6 +569,22 @@ sanity-check alongside the existing per-source results. All three
 fixes are purely methodological — no trading-logic change, no
 COORDINATOR_THRESHOLD change, entirely offline.
 
+Tier 3.13 (small-sample statistics): win_rate and profit_factor are
+exactly the two statistics most volatile at the trade counts this
+project actually produces — Tier 3.12's own paired endpoint returned
+just 7 accepted trades on its first production run, where a 5/7 vs
+2/7 split LOOKS like a large difference but is well within noise.
+Every backtest-lite/champion-challenger/paired summary now also
+reports win_rate_ci95_low/win_rate_ci95_high (a Wilson score interval
+on wins/decided — the standard small-N correction, since the plain
+normal-approximation interval misbehaves badly below roughly 30
+trades), median_pnl_usd (a robustness check against one large win or
+loss dominating the mean), and max_drawdown_usd (the deepest
+peak-to-trough dip in the running equity curve, in the order trades
+were actually taken). Purely additional read-only reporting on
+results already computed — no new trades simulated, no trading-logic
+change, COORDINATOR_THRESHOLD untouched.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """

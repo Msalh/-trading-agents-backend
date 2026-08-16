@@ -553,3 +553,105 @@ def test_paired_backtest_rejects_unknown_source(fresh_env):
     _, backtest = fresh_env
     with pytest.raises(ValueError):
         backtest.run_paired_barrier_backtest([], sources=["not_a_real_source"])
+
+
+# ---------------------------------------------------------------------------
+# Tier 3.13: small-sample statistics (Wilson CI, median, max drawdown)
+# ---------------------------------------------------------------------------
+
+def test_wilson_score_interval_is_none_for_zero_trades(fresh_env):
+    _, backtest = fresh_env
+    assert backtest._wilson_score_interval(0, 0) is None
+
+
+def test_wilson_score_interval_brackets_the_point_estimate(fresh_env):
+    _, backtest = fresh_env
+    lower, upper = backtest._wilson_score_interval(wins=5, n=10)
+    assert 0.0 <= lower < 0.5 < upper <= 1.0
+
+
+def test_wilson_score_interval_narrows_as_sample_size_grows(fresh_env):
+    _, backtest = fresh_env
+    small_low, small_high = backtest._wilson_score_interval(wins=5, n=10)
+    large_low, large_high = backtest._wilson_score_interval(wins=500, n=1000)
+    # Same 50% point estimate either way -- the interval around it must
+    # be tighter with 100x the evidence, exactly the point of reporting
+    # a CI instead of the bare win_rate at these small trade counts.
+    assert (large_high - large_low) < (small_high - small_low)
+
+
+def test_wilson_score_interval_is_bounded_at_the_extremes(fresh_env):
+    _, backtest = fresh_env
+    lower, upper = backtest._wilson_score_interval(wins=0, n=3)
+    assert lower == 0.0
+    assert 0.0 < upper < 1.0
+    lower, upper = backtest._wilson_score_interval(wins=3, n=3)
+    assert 0.0 < lower < 1.0
+    assert upper == 1.0
+
+
+def test_median_of_empty_list_is_none(fresh_env):
+    _, backtest = fresh_env
+    assert backtest._median([]) is None
+
+
+def test_median_odd_length_is_the_middle_value(fresh_env):
+    _, backtest = fresh_env
+    assert backtest._median([10.0, -5.0, 20.0]) == 10.0
+
+
+def test_median_even_length_averages_the_two_middle_values(fresh_env):
+    _, backtest = fresh_env
+    assert backtest._median([10.0, -5.0, 20.0, 30.0]) == 15.0
+
+
+def test_max_drawdown_of_all_wins_is_zero(fresh_env):
+    _, backtest = fresh_env
+    assert backtest._max_drawdown([10.0, 20.0, 5.0]) == 0.0
+
+
+def test_max_drawdown_computes_deepest_peak_to_trough_dip(fresh_env):
+    _, backtest = fresh_env
+    # Equity curve: +100, +50 (peak 150), -80 (down to 70 -- dd=80),
+    # +10 (80), -120 (down to -40 -- dd=190, the deepest point measured
+    # from the running peak of 150).
+    dd = backtest._max_drawdown([100.0, 50.0, -80.0, 10.0, -120.0])
+    assert dd == 190.0
+
+
+def test_run_barrier_backtest_reports_median_drawdown_and_confidence_interval(fresh_env):
+    storage, backtest = fresh_env
+    anchor1 = datetime(2026, 8, 11, 14, 0, 0, tzinfo=timezone.utc)
+    anchor2 = anchor1 + timedelta(hours=1)
+    c1 = _candidate("c1", "TEST", "5m", anchor1, atr=2.0, decision="enter_long")
+    c2 = _candidate("c2", "TEST", "5m", anchor2, atr=2.0, decision="enter_long")
+
+    # c1 wins (target hit), c2 loses (stop hit).
+    _save_bar(storage, "TEST", "5m", anchor1 + timedelta(minutes=5), open_=100.0, high=106.0, low=99.5, close=105.5)
+    _save_bar(storage, "TEST", "5m", anchor2 + timedelta(minutes=5), open_=100.0, high=100.5, low=94.0, close=94.5)
+
+    summary = backtest.run_barrier_backtest([c1, c2], direction_source="coordinator")
+    assert summary["trades_taken"] == 2
+    assert summary["wins"] == 1
+    assert summary["losses"] == 1
+    # A CI on a 1/2 point estimate must straddle it.
+    assert summary["win_rate_ci95_low"] is not None
+    assert summary["win_rate_ci95_low"] < summary["win_rate"] < summary["win_rate_ci95_high"]
+    assert summary["median_pnl_usd"] is not None
+    assert summary["max_drawdown_usd"] is not None
+    # Internal scratch list must never leak into the public summary shape.
+    assert "_pnl_sequence" not in summary
+
+
+def test_paired_backtest_reports_small_sample_stats_per_source(fresh_env):
+    storage, backtest = fresh_env
+    anchor = datetime(2026, 8, 11, 14, 0, 0, tzinfo=timezone.utc)
+    candidate = _candidate("c1", "TEST", "5m", anchor, atr=2.0, decision="enter_long", analysis_direction="bullish")
+    _save_bar(storage, "TEST", "5m", anchor + timedelta(minutes=5), open_=100.0, high=106.0, low=99.5, close=105.5)
+
+    result = backtest.run_paired_barrier_backtest([candidate], sources=["analysis", "coordinator"])
+    for source_summary in result["by_source"].values():
+        assert "win_rate_ci95_low" in source_summary
+        assert "median_pnl_usd" in source_summary
+        assert "max_drawdown_usd" in source_summary
+        assert "_pnl_sequence" not in source_summary

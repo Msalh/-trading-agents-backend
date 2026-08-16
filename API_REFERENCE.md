@@ -691,7 +691,8 @@ constraint.
       "skipped_overlapping": 17, "skipped_no_forward_data": 0,
       "wins": 27, "losses": 33, "breakeven": 1, "expired": 9,
       "total_pnl_usd": -412.0, "gross_profit_usd": 890.0, "gross_loss_usd": 1302.0,
-      "win_rate": 0.45, "profit_factor": 0.6834, "avg_pnl_usd": -6.75,
+      "win_rate": 0.45, "win_rate_ci95_low": 0.3387, "win_rate_ci95_high": 0.5734,
+      "profit_factor": 0.6834, "avg_pnl_usd": -6.75, "median_pnl_usd": -8.5, "max_drawdown_usd": 612.3,
       "trades": []
     },
     "always_bullish": { "...": "same shape" },
@@ -715,6 +716,20 @@ no new data collection. 400 if `sources` contains an unrecognized
 value. `COORDINATOR_THRESHOLD` and the Coordinator's own scoring are
 untouched — this is read-only analysis, same as every diagnostic tier
 before it.
+
+**Tier 3.13 additions:** `win_rate_ci95_low`/`win_rate_ci95_high` are a
+95% Wilson score confidence interval on `wins / (wins + losses)` — at
+the trade counts this project actually produces (single digits to low
+double digits per source), the bare `win_rate` alone is not enough to
+tell a real edge from noise; treat two sources' `win_rate` figures as
+meaningfully different only if their intervals don't overlap much, not
+just because the point estimates differ. `median_pnl_usd` is the
+median (not mean) trade P&L, a check against one large win or loss
+dominating `avg_pnl_usd`. `max_drawdown_usd` is the deepest
+peak-to-trough dip in the running equity curve, in the order trades
+were actually taken — "how bad did it get along the way," not just the
+ending total. All three are `null`/absent-equivalent under the same
+"nothing decided yet" conditions as `win_rate`/`avg_pnl_usd`.
 
 ### `GET /candidates/history/backtest-lite/champion-challenger?symbol=MNQ1!&timeframe=5m&limit=300&champion=coordinator&challengers=analysis,inverse_analysis,always_bullish,always_bearish,vwap&holdout_fraction=0.3&atr_stop_mult=1.5&atr_target_mult=2.5&expiry_bars=24&non_overlapping=true`
 Tier 3.11 (champion/challenger, out-of-sample). The endpoint above's
