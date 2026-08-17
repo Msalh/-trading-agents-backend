@@ -685,6 +685,13 @@ constraint.
 {
   "symbol": "MNQ1!", "timeframe": "5m",
   "config": {"atr_stop_mult": 1.5, "atr_target_mult": 2.5, "expiry_bars": 24, "non_overlapping": true, "candidates_considered": 100},
+  "day_session": {
+    "candidates_considered": 100, "distinct_trading_days": 14,
+    "candidates_per_day": {"min": 2, "median": 6.5, "max": 19},
+    "by_session_name": {"RTH": 71, "OVERNIGHT": 29},
+    "by_timing_session_label": {"new_york": 38, "london": 22, "new_york_pm": 11, "london_ny_overlap": 9, "outside_sessions": 20},
+    "unknown_trading_date_count": 0
+  },
   "by_source": {
     "analysis": {
       "trades_taken": 61, "skipped_no_direction": 22, "skipped_no_atr": 0,
@@ -703,6 +710,15 @@ constraint.
   }
 }
 ```
+**Tier 3.18 addition:** `day_session` — see the dedicated section below
+for the full field explanation — reports how many genuinely
+independent trading days/sessions `candidates_considered` actually
+spans, computed once over the input candidate set (not per-source,
+since it's a property of the sample, not of any one direction signal).
+This is the "day/session counts as a primary metric, not buried"
+addition the third external review asked for; the same object is now
+in every backtest-lite/paired/grid/champion-challenger response.
+
 `trades` is always `[]` at this endpoint's compact default — per-trade
 detail exists in `app/backtest.run_barrier_backtest(..., include_trades=True)`
 for direct/programmatic use, but is deliberately excluded from the
@@ -764,9 +780,20 @@ calibration window and the held-out validation window, separately.
   "base_rate": {
     "calibration": { "...": "same shape as GET /candidates/history/baseline-comparison" },
     "validation": { "...": "same shape" }
+  },
+  "day_session": {
+    "calibration": { "...": "same shape as the day/session section below" },
+    "validation": { "...": "same shape" }
   }
 }
 ```
+**Tier 3.18 addition:** `day_session` is reported PER WINDOW here
+(unlike the other backtest-lite endpoints, which report it once) —
+out-of-sample validity depends directly on how many independent
+trading days each window actually spans, so a validation window with
+`distinct_trading_days: 2` is much weaker out-of-sample evidence than
+one with `distinct_trading_days: 15`, even at the same
+`validation_candidates` count.
 Reads as: does a challenger's apparent edge on calibration still hold
 up on data it was never fitted to? A challenger that looks good on
 calibration but falls apart on validation is materially weaker
@@ -819,6 +846,7 @@ influence which candidates make the comparison. `sources` is required
     "atr_stop_mult": 1.5, "atr_target_mult": 2.5, "expiry_bars": 24,
     "candidates_considered": 156, "eligible_candidates": 61, "accepted_candidates": 38
   },
+  "day_session": { "...": "same shape as the day/session section below, computed over the full input candidates" },
   "sources": ["analysis", "coordinator", "inverse_analysis"],
   "by_source": {
     "analysis": { "...": "same shape as backtest-lite's per-source summary" },
@@ -858,6 +886,7 @@ source).
 {
   "symbol": "MNQ1!", "timeframe": "5m",
   "grid": {"stop_mults": [1.0, 1.5, 2.0], "target_mults": [1.5, 2.0, 2.5], "expiry_bars": [6, 12, 24], "total_combinations": 27},
+  "day_session": { "...": "same shape as the day/session section below, computed once over the input candidates (same for every grid combination)" },
   "sources": ["analysis", "coordinator", "inverse_analysis"],
   "robustness": {
     "analysis": {
@@ -894,6 +923,59 @@ collection, nothing written to any trade table. 400 if `sources` is
 empty or contains an unrecognized value. `COORDINATOR_THRESHOLD` and
 the Coordinator's own scoring are untouched — read-only analysis, same
 as every diagnostic tier before it.
+
+---
+
+## Day/session reporting (Tier 3.18)
+
+The third external review's item 5: "day/session trade counts should
+be a primary reported metric everywhere, not buried." A headline
+`candidates_considered: 100` can look like a decent sample while
+actually spanning very few genuinely independent trading days —
+candidates on a fast timeframe cluster tightly in calendar time, and
+two decisions minutes apart in the same session are far closer to one
+data point than two. `app/backtest.compute_day_session_breakdown()`
+answers this and is now wired into the top level of every backtest-
+lite/paired/grid/champion-challenger response above (champion-
+challenger reports it once per calibration/validation window, since
+out-of-sample validity depends directly on how many independent days
+each window spans) — plus exposed standalone here for a quick check
+before running anything heavier.
+
+### `GET /candidates/history/day-session-report?symbol=MNQ1!&timeframe=5m&limit=300`
+
+```json
+{
+  "symbol": "MNQ1!", "timeframe": "5m",
+  "candidates_considered": 100,
+  "distinct_trading_days": 14,
+  "candidates_per_day": {"min": 2, "median": 6.5, "max": 19},
+  "by_session_name": {"RTH": 71, "OVERNIGHT": 29},
+  "by_timing_session_label": {"new_york": 38, "london": 22, "new_york_pm": 11, "london_ny_overlap": 9, "outside_sessions": 20},
+  "unknown_trading_date_count": 0
+}
+```
+
+`distinct_trading_days` uses each bar's own Pine-computed
+`trading_date` field (the CME/Globex session-rollover-aware value
+already validated at ingestion — Tier 2.9 — not a naive UTC
+calendar-date split), falling back to
+`app.trading_calendar.expected_trading_date()` applied to the
+candidate's own anchor timestamp for the rare candidate with no stored
+bar (very old data, or the manual `/coordinator/decide` path).
+`candidates_per_day` (min/median/max) shows how concentrated
+candidates are within a day — a `max` far above the `median` flags a
+single busy day disproportionately shaping the whole sample.
+`by_session_name` is the bar's own coarse `RTH`/`OVERNIGHT` split;
+`by_timing_session_label` is Timing's finer classification (already
+computed for every decision — `london`, `new_york`, `new_york_pm`,
+`london_ny_overlap`, `outside_sessions`, plus `weekend`/`holiday` on
+the rare candidate anchored then). `unknown_trading_date_count` is how
+many candidates couldn't be dated at all (no stored bar and no
+resolvable anchor timestamp) — flagged, never silently dropped.
+
+Entirely offline and read-only: no LLM calls, no new data collection,
+no effect on `COORDINATOR_THRESHOLD` or any trading logic.
 
 ---
 

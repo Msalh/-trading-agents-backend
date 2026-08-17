@@ -663,6 +663,27 @@ built-in sanity bound (decision_changed can never exceed it). Purely
 a bugfix to Tier 3.16's own diagnostic — no scoring, weights, or
 threshold used by real decisions changed.
 
+Tier 3.18 (day/session reporting): the third external review's item
+5 — day/session trade counts should be a primary reported metric
+everywhere, not buried behind a raw candidate count that can look
+like a decent sample while spanning very few genuinely independent
+trading days. New app/backtest.compute_day_session_breakdown() reports
+distinct trading days (using each bar's own Pine-computed trading_date
+field, the CME/Globex-aware value from Tier 2.9 — not a naive UTC
+split), candidates-per-day min/median/max, and a session breakdown
+(the bar's own coarse RTH/OVERNIGHT session_name plus Timing's finer
+London/NY/NY-PM/overlap/outside-sessions/weekend/holiday
+classification). Wired into every existing backtest-lite/paired/grid/
+champion-challenger report's top level (champion-challenger reports it
+separately per calibration/validation window, since out-of-sample
+validity depends directly on how many independent days each window
+spans) — the "not buried" part of the review's complaint — plus a new
+standalone GET /candidates/history/day-session-report for a quick
+check before running anything heavier. Purely descriptive, read-only
+reporting on candidates already fetched: no new data collection, no
+change to which trades are simulated or how, COORDINATOR_THRESHOLD
+untouched.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -687,6 +708,7 @@ from app.backtest import (
     EXPIRY_BARS,
     compute_backtest_comparison,
     compute_champion_challenger_report,
+    compute_day_session_breakdown,
     run_paired_barrier_backtest,
     run_sensitivity_grid,
 )
@@ -1839,6 +1861,44 @@ def candidates_history_coordinator_divergence(
         "symbol": symbol,
         "timeframe": timeframe,
         **compute_coordinator_divergence_report(candidates),
+    }
+
+
+@app.get("/candidates/history/day-session-report")
+def candidates_history_day_session_report(
+    symbol: str = Query(...),
+    timeframe: str = Query(...),
+    limit: int = Query(default=300, le=1000),
+) -> dict:
+    """Tier 3.18 (day/session reporting): the third external review's
+    item 5 — "day/session trade counts should be a primary reported
+    metric everywhere, not buried." A candidate count alone can look
+    like a decent sample while spanning very few genuinely independent
+    trading days, since candidates on a fast timeframe cluster tightly
+    in calendar time. This is a standalone, quick check of that —
+    same app/backtest.compute_day_session_breakdown() this tier also
+    wired into every backtest-lite/paired/grid/champion-challenger
+    report's top level, exposed here on its own so it can be checked
+    before running anything heavier.
+
+    `distinct_trading_days` uses each bar's own Pine-computed
+    trading_date field (the CME/Globex-aware value already validated
+    at ingestion — Tier 2.9 — not a naive UTC calendar-date split),
+    falling back to app.trading_calendar.expected_trading_date() from
+    the candidate's own anchor timestamp for the rare candidate with
+    no stored bar. `candidates_per_day` (min/median/max) shows how
+    concentrated candidates are within days. `by_session_name` is the
+    bar's own coarse RTH/OVERNIGHT split; `by_timing_session_label` is
+    Timing's finer London/NY/NY-PM/overlap/outside-sessions/weekend/
+    holiday classification, already computed for every decision.
+
+    Entirely offline and read-only: no LLM calls, no new data, no
+    effect on COORDINATOR_THRESHOLD or any trading logic."""
+    candidates = get_candidate_history(symbol=symbol, timeframe=timeframe, limit=limit)
+    return {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        **compute_day_session_breakdown(candidates),
     }
 
 

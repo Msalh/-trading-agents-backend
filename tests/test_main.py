@@ -861,3 +861,47 @@ def test_coordinator_divergence_endpoint_empty_history(client):
     body = r.json()
     assert body["candidates_considered"] == 0
     assert body["named_categories"] == {}
+
+
+# ---------------------------------------------------------------------------
+# Tier 3.18: day/session reporting
+# ---------------------------------------------------------------------------
+
+def test_day_session_report_endpoint_returns_report_shape(client):
+    import app.storage as storage
+
+    anchor = "2026-08-11T14:00:00Z"
+    bar = {
+        "event_id": "evt-ds-1", "symbol": "MNQ1!", "timeframe": "5m", "timestamp": anchor,
+        "trading_date": "2026-08-11", "session_name": "RTH",
+    }
+    decision = {
+        "decision": "enter_long", "timestamp": anchor,
+        "opinions_used": {"analysis": {"direction": "bullish", "timestamp": anchor}},
+        "timing_context": {"session_label": "new_york"},
+    }
+    storage.save_candidate(candidate_id="cand-ds-1", symbol="MNQ1!", timeframe="5m", bar=bar, decision=decision)
+
+    r = client.get(
+        "/candidates/history/day-session-report",
+        params={"symbol": "MNQ1!", "timeframe": "5m"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["symbol"] == "MNQ1!"
+    assert body["timeframe"] == "5m"
+    assert body["candidates_considered"] == 1
+    assert body["distinct_trading_days"] == 1
+    assert body["by_session_name"] == {"RTH": 1}
+    assert body["by_timing_session_label"] == {"new_york": 1}
+
+
+def test_day_session_report_endpoint_empty_history(client):
+    r = client.get(
+        "/candidates/history/day-session-report",
+        params={"symbol": "NOSUCH", "timeframe": "5m"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["candidates_considered"] == 0
+    assert body["distinct_trading_days"] == 0

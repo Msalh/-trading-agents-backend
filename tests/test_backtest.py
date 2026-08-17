@@ -65,19 +65,28 @@ def _save_bar(storage, symbol, timeframe, timestamp_dt, open_, high, low, close,
 
 
 def _candidate(candidate_id, symbol, timeframe, anchor_dt, atr, decision="enter_long",
-                analysis_direction="bullish", vwap_distance=None):
+                analysis_direction="bullish", vwap_distance=None,
+                trading_date=None, session_name=None, timing_session_label=None):
+    bar = {"timestamp": _iso(anchor_dt), "atr": atr, "distance_from_vwap_points": vwap_distance}
+    if trading_date is not None:
+        bar["trading_date"] = trading_date
+    if session_name is not None:
+        bar["session_name"] = session_name
+    decision_dict = {
+        "decision": decision,
+        "timestamp": _iso(anchor_dt),
+        "opinions_used": {
+            "analysis": {"direction": analysis_direction, "timestamp": _iso(anchor_dt)},
+        },
+    }
+    if timing_session_label is not None:
+        decision_dict["timing_context"] = {"session_label": timing_session_label}
     return {
         "candidate_id": candidate_id,
         "symbol": symbol,
         "timeframe": timeframe,
-        "bar": {"timestamp": _iso(anchor_dt), "atr": atr, "distance_from_vwap_points": vwap_distance},
-        "decision": {
-            "decision": decision,
-            "timestamp": _iso(anchor_dt),
-            "opinions_used": {
-                "analysis": {"direction": analysis_direction, "timestamp": _iso(anchor_dt)},
-            },
-        },
+        "bar": bar,
+        "decision": decision_dict,
     }
 
 
@@ -727,3 +736,149 @@ def test_sensitivity_grid_rejects_unknown_source(fresh_env):
     _, backtest = fresh_env
     with pytest.raises(ValueError):
         backtest.run_sensitivity_grid([], sources=["not_a_real_source"])
+
+
+# ---------------------------------------------------------------------------
+# Tier 3.18: compute_day_session_breakdown + wiring into every report
+# ---------------------------------------------------------------------------
+
+def test_day_session_breakdown_counts_distinct_days_and_per_day_distribution(fresh_env):
+    _, backtest = fresh_env
+    day_a_1 = _candidate("c1", "TEST", "5m", datetime(2026, 8, 10, 14, 0, tzinfo=timezone.utc), atr=2.0, trading_date="2026-08-10")
+    day_a_2 = _candidate("c2", "TEST", "5m", datetime(2026, 8, 10, 15, 0, tzinfo=timezone.utc), atr=2.0, trading_date="2026-08-10")
+    day_b_1 = _candidate("c3", "TEST", "5m", datetime(2026, 8, 11, 14, 0, tzinfo=timezone.utc), atr=2.0, trading_date="2026-08-11")
+
+    result = backtest.compute_day_session_breakdown([day_a_1, day_a_2, day_b_1])
+    assert result["candidates_considered"] == 3
+    assert result["distinct_trading_days"] == 2
+    assert result["candidates_per_day"] == {"min": 1, "median": 1.5, "max": 2}
+    assert result["unknown_trading_date_count"] == 0
+
+
+def test_day_session_breakdown_prefers_bar_trading_date_over_recomputing(fresh_env):
+    # Two candidates on genuinely DIFFERENT real calendar days (Aug 11
+    # and Aug 5), but sharing the SAME explicit (deliberately
+    # implausible) bar.trading_date. If the stored field is correctly
+    # preferred over recomputing from the anchor timestamp, they count
+    # as ONE distinct trading day, not two -- proving the stored value
+    # wins rather than being silently ignored/recomputed.
+    _, backtest = fresh_env
+    candidate_a = _candidate(
+        "c1", "TEST", "5m", datetime(2026, 8, 11, 14, 0, tzinfo=timezone.utc), atr=2.0,
+        trading_date="2099-01-01",
+    )
+    candidate_b = _candidate(
+        "c2", "TEST", "5m", datetime(2026, 8, 5, 14, 0, tzinfo=timezone.utc), atr=2.0,
+        trading_date="2099-01-01",
+    )
+    result = backtest.compute_day_session_breakdown([candidate_a, candidate_b])
+    assert result["distinct_trading_days"] == 1
+    assert result["candidates_per_day"] == {"min": 2, "median": 2.0, "max": 2}
+
+
+def test_day_session_breakdown_falls_back_to_expected_trading_date_when_bar_has_none(fresh_env):
+    # No trading_date on the bar -- falls back to
+    # app.trading_calendar.expected_trading_date() from the anchor
+    # timestamp. 14:00Z = 10:00 NY (well before the 18:00 rollover), so
+    # the expected trading day is the same calendar date.
+    _, backtest = fresh_env
+    candidate = _candidate("c1", "TEST", "5m", datetime(2026, 8, 11, 14, 0, tzinfo=timezone.utc), atr=2.0)
+    result = backtest.compute_day_session_breakdown([candidate])
+    assert result["distinct_trading_days"] == 1
+    assert result["unknown_trading_date_count"] == 0
+
+
+def test_day_session_breakdown_counts_unknown_when_no_bar_and_no_resolvable_anchor(fresh_env):
+    _, backtest = fresh_env
+    candidate = {"candidate_id": "c1", "symbol": "TEST", "timeframe": "5m", "bar": None, "decision": {}}
+    result = backtest.compute_day_session_breakdown([candidate])
+    assert result["distinct_trading_days"] == 0
+    assert result["unknown_trading_date_count"] == 1
+
+
+def test_day_session_breakdown_reports_session_name_and_timing_session_label(fresh_env):
+    _, backtest = fresh_env
+    rth = _candidate(
+        "c1", "TEST", "5m", datetime(2026, 8, 11, 14, 0, tzinfo=timezone.utc), atr=2.0,
+        trading_date="2026-08-11", session_name="RTH", timing_session_label="new_york",
+    )
+    overnight = _candidate(
+        "c2", "TEST", "5m", datetime(2026, 8, 11, 2, 0, tzinfo=timezone.utc), atr=2.0,
+        trading_date="2026-08-11", session_name="OVERNIGHT", timing_session_label="london",
+    )
+    result = backtest.compute_day_session_breakdown([rth, overnight])
+    assert result["by_session_name"] == {"RTH": 1, "OVERNIGHT": 1}
+    assert result["by_timing_session_label"] == {"new_york": 1, "london": 1}
+
+
+def test_day_session_breakdown_empty_candidates_returns_zeroed_shape(fresh_env):
+    _, backtest = fresh_env
+    result = backtest.compute_day_session_breakdown([])
+    assert result == {
+        "candidates_considered": 0,
+        "distinct_trading_days": 0,
+        "candidates_per_day": {"min": None, "median": None, "max": None},
+        "by_session_name": {},
+        "by_timing_session_label": {},
+        "unknown_trading_date_count": 0,
+    }
+
+
+def test_compute_backtest_comparison_includes_day_session_breakdown(fresh_env):
+    storage, backtest = fresh_env
+    anchor = datetime(2026, 8, 11, 14, 0, 0, tzinfo=timezone.utc)
+    candidate = _candidate("c1", "TEST", "5m", anchor, atr=2.0, decision="enter_long", trading_date="2026-08-11")
+    _save_bar(storage, "TEST", "5m", anchor + timedelta(minutes=5), open_=100.0, high=106.0, low=99.5, close=105.5)
+
+    result = backtest.compute_backtest_comparison([candidate], sources=["coordinator"])
+    assert result["day_session"]["candidates_considered"] == 1
+    assert result["day_session"]["distinct_trading_days"] == 1
+
+
+def test_paired_backtest_includes_day_session_breakdown(fresh_env):
+    storage, backtest = fresh_env
+    anchor = datetime(2026, 8, 11, 14, 0, 0, tzinfo=timezone.utc)
+    candidate = _candidate("c1", "TEST", "5m", anchor, atr=2.0, decision="enter_long", trading_date="2026-08-11")
+    _save_bar(storage, "TEST", "5m", anchor + timedelta(minutes=5), open_=100.0, high=106.0, low=99.5, close=105.5)
+
+    result = backtest.run_paired_barrier_backtest([candidate], sources=["coordinator"])
+    assert result["day_session"]["candidates_considered"] == 1
+    assert result["day_session"]["distinct_trading_days"] == 1
+
+
+def test_sensitivity_grid_includes_day_session_breakdown(fresh_env):
+    storage, backtest = fresh_env
+    anchor = datetime(2026, 8, 11, 14, 0, 0, tzinfo=timezone.utc)
+    candidate = _candidate("c1", "TEST", "5m", anchor, atr=2.0, decision="enter_long", trading_date="2026-08-11")
+    _save_bar(storage, "TEST", "5m", anchor + timedelta(minutes=5), open_=100.0, high=106.0, low=99.5, close=105.5)
+
+    result = backtest.run_sensitivity_grid(
+        [candidate], sources=["coordinator"], stop_mults=(1.5,), target_mults=(2.5,), expiry_bars_list=(24,),
+    )
+    assert result["day_session"]["candidates_considered"] == 1
+    assert result["day_session"]["distinct_trading_days"] == 1
+
+
+def test_champion_challenger_report_includes_day_session_breakdown_per_window(fresh_env):
+    storage, backtest = fresh_env
+    older = datetime(2026, 8, 5, 14, 0, 0, tzinfo=timezone.utc)
+    newer = datetime(2026, 8, 11, 14, 0, 0, tzinfo=timezone.utc)
+    candidates = [
+        _candidate("c1", "TEST", "5m", older, atr=2.0, decision="enter_long", trading_date="2026-08-05"),
+        _candidate("c2", "TEST", "5m", newer, atr=2.0, decision="enter_long", trading_date="2026-08-11"),
+    ]
+    _save_bar(storage, "TEST", "5m", older + timedelta(minutes=5), open_=100.0, high=106.0, low=99.5, close=105.5)
+    _save_bar(storage, "TEST", "5m", newer + timedelta(minutes=5), open_=100.0, high=106.0, low=99.5, close=105.5)
+
+    # expiry_bars=1 keeps the calibration candidate's forward walk from
+    # reaching all the way to the newer candidate's own saved bar
+    # (get_bars_after has no upper time bound besides `limit`, so a
+    # larger expiry_bars here would pull in the validation candidate's
+    # bar too and trip the boundary embargo -- not what this test is
+    # checking).
+    result = backtest.compute_champion_challenger_report(
+        candidates, champion="coordinator", holdout_fraction=0.5, expiry_bars=1,
+    )
+    assert set(result["day_session"].keys()) == {"calibration", "validation"}
+    assert result["day_session"]["calibration"]["candidates_considered"] == 1
+    assert result["day_session"]["validation"]["candidates_considered"] == 1

@@ -147,6 +147,31 @@ real edge should look decent across MOST reasonable geometries, not
 just the one first tested. Entirely offline, no LLM calls, no new
 trades simulated beyond what backtest-lite already simulates per
 combination — COORDINATOR_THRESHOLD untouched.
+
+Tier 3.18 (day/session reporting): the third external review's item 5
+— "day/session trade counts should be a primary reported metric
+everywhere, not buried." A win_rate/profit_factor headline on N
+candidates can look like a large sample while actually spanning very
+few genuinely independent trading days (candidates on a fast timeframe
+cluster tightly in calendar time; two decisions minutes apart during
+the same session are far closer to one data point than two).
+compute_day_session_breakdown() below reports, for whatever candidate
+set a caller already has, the count of distinct trading days spanned
+(using each bar's own Pine-computed trading_date field — the CME/
+Globex-aware value, not a naive UTC calendar-date split — falling back
+to app.trading_calendar.expected_trading_date() applied to the
+candidate's own anchor timestamp for the rare candidate with no stored
+bar), how candidates are distributed per day (min/median/max), and a
+breakdown by session (the bar's own RTH/OVERNIGHT session_name, plus
+the finer London/NY/NY-PM/overlap/outside-sessions breakdown Timing
+already classifies every decision into). Wired into every existing
+backtest-lite/paired/grid/champion-challenger report's top level (the
+"not buried" part — the reviewer's literal complaint) rather than left
+as a separate, easy-to-skip endpoint only. Also exposed standalone via
+GET /candidates/history/day-session-report for a quick check before
+running anything else. Purely descriptive, read-only reporting on
+candidates already fetched — no new data collection, no change to
+which trades are simulated or how, COORDINATOR_THRESHOLD untouched.
 """
 
 import math
@@ -155,6 +180,7 @@ import os
 from app.outcomes import _candidate_anchor_timestamp, _resolve_anchor_timestamp, compute_baseline_comparison
 from app.paper_trades import COMMISSION_PER_CONTRACT, MNQ_POINT_VALUE, SLIPPAGE_POINTS
 from app.storage import get_bars_after
+from app.trading_calendar import expected_trading_date
 
 # Same "explicit env var, sane default" pattern every other tunable in
 # this project follows (COORDINATOR_THRESHOLD, RISK_FRACTION_PER_TRADE,
@@ -417,6 +443,72 @@ def _max_drawdown(pnl_sequence: list[float]) -> float:
     return round(max_dd, 2)
 
 
+def _candidate_trading_date(candidate: dict) -> str | None:
+    """The CME/Globex trading day a candidate belongs to. Prefers the
+    triggering bar's own `trading_date` field (Pine-Script-computed,
+    already carries the correct session-rollover handling — Tier 2.9)
+    over recomputing it, since that field is the actual wire value the
+    real system ingested; only recomputes (via
+    app.trading_calendar.expected_trading_date) from the candidate's
+    own anchor timestamp when there's no stored bar to read it from
+    (very old data, or the manual /coordinator/decide path)."""
+    bar = candidate.get("bar") or {}
+    trading_date = bar.get("trading_date")
+    if trading_date:
+        return trading_date
+    anchor = _candidate_anchor_timestamp(candidate)
+    if not anchor:
+        return None
+    try:
+        return expected_trading_date(anchor)
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+def compute_day_session_breakdown(candidates: list[dict]) -> dict:
+    """Tier 3.18: how many genuinely independent trading days/sessions
+    a candidate set actually spans — see the module docstring's Tier
+    3.18 paragraph for why this matters. Read-only, offline, no new
+    data — walks fields already stored on each candidate."""
+    trading_dates: list[str] = []
+    per_day: dict[str, int] = {}
+    by_session_name: dict[str, int] = {}
+    by_timing_session_label: dict[str, int] = {}
+    unknown_trading_date_count = 0
+
+    for candidate in candidates:
+        trading_date = _candidate_trading_date(candidate)
+        if trading_date:
+            trading_dates.append(trading_date)
+            per_day[trading_date] = per_day.get(trading_date, 0) + 1
+        else:
+            unknown_trading_date_count += 1
+
+        bar = candidate.get("bar") or {}
+        session_name = bar.get("session_name")
+        if session_name:
+            by_session_name[session_name] = by_session_name.get(session_name, 0) + 1
+
+        timing_context = (candidate.get("decision") or {}).get("timing_context") or {}
+        session_label = timing_context.get("session_label")
+        if session_label:
+            by_timing_session_label[session_label] = by_timing_session_label.get(session_label, 0) + 1
+
+    counts_per_day = list(per_day.values())
+    return {
+        "candidates_considered": len(candidates),
+        "distinct_trading_days": len(per_day),
+        "candidates_per_day": {
+            "min": min(counts_per_day) if counts_per_day else None,
+            "median": _median([float(c) for c in counts_per_day]),
+            "max": max(counts_per_day) if counts_per_day else None,
+        },
+        "by_session_name": by_session_name,
+        "by_timing_session_label": by_timing_session_label,
+        "unknown_trading_date_count": unknown_trading_date_count,
+    }
+
+
 def _empty_summary() -> dict:
     return {
         "trades_taken": 0,
@@ -612,6 +704,7 @@ def compute_backtest_comparison(
             "expiry_bars": expiry_bars, "non_overlapping": non_overlapping,
             "candidates_considered": len(candidates),
         },
+        "day_session": compute_day_session_breakdown(candidates),
         "by_source": {
             source: run_barrier_backtest(
                 candidates, direction_source=source, stop_mult=stop_mult, target_mult=target_mult,
@@ -761,6 +854,7 @@ def run_paired_barrier_backtest(
             "eligible_candidates": eligible_candidates,
             "accepted_candidates": accepted_candidates,
         },
+        "day_session": compute_day_session_breakdown(candidates),
         "sources": sources,
         "by_source": summaries,
     }
@@ -924,6 +1018,10 @@ def compute_champion_challenger_report(
             "calibration": compute_baseline_comparison(calibration),
             "validation": compute_baseline_comparison(validation),
         },
+        "day_session": {
+            "calibration": compute_day_session_breakdown(calibration),
+            "validation": compute_day_session_breakdown(validation),
+        },
         "by_source": {
             source: {
                 "calibration": _run(calibration, source),
@@ -1027,6 +1125,7 @@ def run_sensitivity_grid(
             "expiry_bars": list(expiry_bars_list),
             "total_combinations": len(combinations),
         },
+        "day_session": compute_day_session_breakdown(candidates),
         "sources": sources,
         "robustness": {source: _summarize_robustness(results) for source, results in per_source_results.items()},
         "combinations": combinations,
