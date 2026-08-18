@@ -950,3 +950,149 @@ def test_trading_date_integrity_endpoint_empty_history(client):
     body = r.json()
     assert body["candidates_considered"] == 0
     assert body["mismatch_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Tier 3.20: experiment registry (fourth external review, 2026-08-18)
+# ---------------------------------------------------------------------------
+
+def test_register_experiment_endpoint_requires_secret(client):
+    r = client.post(
+        "/experiments",
+        params={
+            "symbol": "MNQ1!", "timeframe": "5m", "hypothesis": "h",
+            "target_metrics": ["win_rate"], "min_distinct_trading_days": 1,
+        },
+    )
+    assert r.status_code == 401
+
+
+def test_register_experiment_endpoint_returns_locked_config(client):
+    headers = {"X-Webhook-Secret": "test-secret"}
+    r = client.post(
+        "/experiments",
+        params={
+            "symbol": "MNQ1!", "timeframe": "5m", "hypothesis": "Coordinator beats a coin flip",
+            "target_metrics": ["win_rate", "profit_factor"], "min_distinct_trading_days": 2,
+        },
+        headers=headers,
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "active"
+    assert body["hypothesis"] == "Coordinator beats a coin flip"
+    assert body["target_metrics"] == ["win_rate", "profit_factor"]
+    assert body["stopping_rule"] == {"min_distinct_trading_days": 2}
+    assert "coordinator_threshold" in body["locked_config"]
+    assert "weights" in body["locked_config"]
+
+
+def test_register_experiment_endpoint_rejects_missing_stopping_rule(client):
+    headers = {"X-Webhook-Secret": "test-secret"}
+    r = client.post(
+        "/experiments",
+        params={"symbol": "MNQ1!", "timeframe": "5m", "hypothesis": "h", "target_metrics": ["win_rate"]},
+        headers=headers,
+    )
+    assert r.status_code == 400
+
+
+def test_experiments_list_and_detail_endpoints(client):
+    headers = {"X-Webhook-Secret": "test-secret"}
+    registered = client.post(
+        "/experiments",
+        params={
+            "symbol": "MNQ1!", "timeframe": "5m", "hypothesis": "h",
+            "target_metrics": ["win_rate"], "min_distinct_trading_days": 5,
+        },
+        headers=headers,
+    ).json()
+    experiment_id = registered["experiment_id"]
+
+    listed = client.get("/experiments", params={"symbol": "MNQ1!", "timeframe": "5m"})
+    assert listed.status_code == 200
+    assert [e["experiment_id"] for e in listed.json()["experiments"]] == [experiment_id]
+
+    detail = client.get(f"/experiments/{experiment_id}")
+    assert detail.status_code == 200
+    body = detail.json()
+    assert body["experiment_id"] == experiment_id
+    assert "stopping_rule_status" in body
+    assert body["stopping_rule_status"]["stopping_rule_met"] is False
+
+
+def test_experiment_detail_endpoint_404_for_unknown_id(client):
+    r = client.get("/experiments/does-not-exist")
+    assert r.status_code == 404
+
+
+def test_resolve_experiment_endpoint_requires_secret(client):
+    headers = {"X-Webhook-Secret": "test-secret"}
+    registered = client.post(
+        "/experiments",
+        params={
+            "symbol": "MNQ1!", "timeframe": "5m", "hypothesis": "h",
+            "target_metrics": ["win_rate"], "min_distinct_trading_days": 1,
+        },
+        headers=headers,
+    ).json()
+
+    r = client.post(f"/experiments/{registered['experiment_id']}/resolve")
+    assert r.status_code == 401
+
+
+def test_resolve_experiment_endpoint_409_when_stopping_rule_not_met(client):
+    headers = {"X-Webhook-Secret": "test-secret"}
+    registered = client.post(
+        "/experiments",
+        params={
+            "symbol": "MNQ1!", "timeframe": "5m", "hypothesis": "h",
+            "target_metrics": ["win_rate"], "min_distinct_trading_days": 5,
+        },
+        headers=headers,
+    ).json()
+
+    r = client.post(f"/experiments/{registered['experiment_id']}/resolve", headers=headers)
+    assert r.status_code == 409
+
+
+def test_resolve_experiment_endpoint_404_for_unknown_id(client):
+    headers = {"X-Webhook-Secret": "test-secret"}
+    r = client.post("/experiments/does-not-exist/resolve", headers=headers)
+    assert r.status_code == 404
+
+
+def test_resolve_experiment_endpoint_succeeds_once_stopping_rule_met(client):
+    import app.storage as storage
+
+    headers = {"X-Webhook-Secret": "test-secret"}
+    registered = client.post(
+        "/experiments",
+        params={
+            "symbol": "MNQ1!", "timeframe": "5m", "hypothesis": "h",
+            "target_metrics": ["win_rate"], "min_distinct_trading_days": 1,
+        },
+        headers=headers,
+    ).json()
+
+    # A candidate created AFTER registration (registered_at defaults to
+    # "now" via SQLite, and save_candidate's created_at also defaults
+    # to "now" -- close enough in the same test to land at/after it).
+    anchor = "2026-08-11T14:00:00Z"
+    bar = {"event_id": "evt-exp-1", "symbol": "MNQ1!", "timeframe": "5m", "timestamp": anchor, "trading_date": "2026-08-11"}
+    decision = {
+        "decision": "enter_long", "timestamp": anchor,
+        "opinions_used": {"analysis": {"direction": "bullish", "timestamp": anchor}},
+    }
+    storage.save_candidate(candidate_id="cand-exp-1", symbol="MNQ1!", timeframe="5m", bar=bar, decision=decision)
+
+    r = client.post(f"/experiments/{registered['experiment_id']}/resolve", headers=headers)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "resolved"
+    assert body["resolution"]["resolved_from_candidates_considered"] == 1
+
+    # idempotent: resolving again returns the same resolution, 200 not 409
+    r2 = client.post(f"/experiments/{registered['experiment_id']}/resolve", headers=headers)
+    assert r2.status_code == 200
+    assert r2.json()["resolution"] == body["resolution"]

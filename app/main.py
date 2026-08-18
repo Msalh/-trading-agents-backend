@@ -706,6 +706,32 @@ separate from day-session-report since this is a forensic/validation
 tool, not a summary metric. Entirely offline/read-only: no new data,
 no scoring change, COORDINATOR_THRESHOLD untouched.
 
+Tier 3.20 (experiment registry, fourth external review, 2026-08-18):
+every finding this project has produced has been retrospective — run a
+report against whatever candidates already exist. The scheduled weekly
+check watching for a 15-distinct-day threshold (Tier 3.18) is watching
+the SAME growing pool every diagnostic tier keeps mining for ideas —
+by the time that threshold fires, none of its candidates will be a
+clean holdout in any normal sense, even with scoring untouched the
+whole time. New app/experiments.py adds a lightweight, append-only
+pre-registration mechanism: register_experiment() freezes a hypothesis
+statement, target_metrics, a stopping_rule (min_distinct_trading_days
+and/or min_accepted_trades), and a snapshot of the live coordinator_
+threshold/weights/min_available_weight, and marks registered_at as a
+hard boundary — only candidates created AT OR AFTER that moment ever
+count toward the experiment. evaluate_stopping_rule() is read-only and
+callable any number of times to watch progress. resolve_experiment()
+is the one-time action: refuses early, and once resolved returns the
+SAME resolution forever, never recomputed — reuses app.backtest.
+compute_backtest_comparison/compute_day_session_breakdown rather than
+any new scoring logic. New POST /experiments (register, secret-
+protected), GET /experiments (list, append-only history), GET
+/experiments/{id} (detail plus a live, non-consuming stopping-rule
+check), POST /experiments/{id}/resolve (secret-protected, one-time).
+New `experiments` table. Entirely additive: no existing endpoint's
+behavior changes, COORDINATOR_THRESHOLD/WEIGHTS only read and
+snapshotted, never modified, no LLM calls.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -735,6 +761,9 @@ from app.backtest import (
     run_paired_barrier_backtest,
     run_sensitivity_grid,
 )
+from app.experiments import ExperimentError, evaluate_stopping_rule, list_experiments
+from app.experiments import register_experiment as register_new_experiment
+from app.experiments import resolve_experiment as resolve_existing_experiment
 from app.candidates import (
     CandidateError,
     CandidateLockedError,
@@ -782,6 +811,7 @@ from app.storage import (
     get_all_closed_trades_chronological,
     get_by_event_id,
     get_candidate_by_id,
+    get_experiment_by_id,
     get_last_opinion_timestamps,
     get_last_webhook_received,
     get_latest,
@@ -2247,6 +2277,101 @@ def candidates_history_backtest_lite_sensitivity_grid(
         raise HTTPException(status_code=400, detail=str(e))
 
     return {"symbol": symbol, "timeframe": timeframe, **result}
+
+
+@app.post("/experiments")
+def register_experiment_endpoint(
+    symbol: str = Query(...),
+    timeframe: str = Query(...),
+    hypothesis: str = Query(..., description="what this experiment is testing, in plain language"),
+    target_metrics: list[str] = Query(..., description="repeat this param once per metric, e.g. target_metrics=win_rate&target_metrics=profit_factor"),
+    direction_source: str = Query(default="coordinator", description=f"one of {DIRECTION_SOURCES}"),
+    min_distinct_trading_days: int | None = Query(default=None),
+    min_accepted_trades: int | None = Query(default=None),
+    x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret"),
+) -> dict:
+    """Tier 3.20 (experiment registry): pre-registers a hypothesis
+    against the CURRENT live coordinator_threshold/weights/
+    min_available_weight, snapshotted and frozen at this moment —
+    changing the live config later never retroactively edits an
+    already-registered experiment's locked_config. registered_at (set
+    by SQLite's own clock, same as every candidate's created_at) marks
+    the hard boundary: only candidates created from this instant
+    forward are ever eligible to count toward this experiment's
+    stopping rule or resolution — existing candidates are exploratory
+    and permanently ineligible for this experiment, by design.
+
+    At least one of min_distinct_trading_days / min_accepted_trades
+    must be set (the stopping rule) — an experiment with no stopping
+    rule could never legitimately be resolved. target_metrics is
+    recorded, not enforced by this endpoint — it's a commitment device
+    (what you said you'd judge this by), read back at resolution time.
+
+    Secret-protected: this writes to the database and, once resolved,
+    the record is permanent — same guard as /webhook/tradingview and
+    the /agents/*/run endpoints."""
+    _check_secret(x_webhook_secret)
+    stopping_rule = {}
+    if min_distinct_trading_days is not None:
+        stopping_rule["min_distinct_trading_days"] = min_distinct_trading_days
+    if min_accepted_trades is not None:
+        stopping_rule["min_accepted_trades"] = min_accepted_trades
+    try:
+        return register_new_experiment(
+            symbol=symbol, timeframe=timeframe, hypothesis=hypothesis,
+            target_metrics=target_metrics, stopping_rule=stopping_rule,
+            direction_source=direction_source,
+        )
+    except ExperimentError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/experiments")
+def list_experiments_endpoint(
+    symbol: str | None = Query(default=None),
+    timeframe: str | None = Query(default=None),
+) -> dict:
+    """Every registered experiment, newest first — append-only history,
+    not a "latest" view. Filter by symbol/timeframe, or omit both to
+    see every experiment across every symbol/timeframe."""
+    return {"experiments": list_experiments(symbol=symbol, timeframe=timeframe)}
+
+
+@app.get("/experiments/{experiment_id}")
+def experiment_by_id_endpoint(experiment_id: str) -> dict:
+    """Full experiment record (hypothesis, locked_config, target_metrics,
+    stopping_rule, status, resolution once resolved) PLUS a live,
+    read-only, non-consuming stopping_rule_status computed against
+    prospective candidates right now — checking this as many times as
+    you like never resolves the experiment or affects the eventual
+    outcome."""
+    experiment = get_experiment_by_id(experiment_id)
+    if experiment is None:
+        raise HTTPException(status_code=404, detail=f"no experiment found with id={experiment_id}")
+    return {
+        **experiment,
+        "stopping_rule_status": evaluate_stopping_rule(experiment),
+    }
+
+
+@app.post("/experiments/{experiment_id}/resolve")
+def resolve_experiment_endpoint(
+    experiment_id: str,
+    x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret"),
+) -> dict:
+    """The one-time outcome recording. 409 if the stopping rule isn't
+    met yet (check GET /experiments/{id} first — no forcing an early
+    look). If already resolved, returns the SAME resolution recorded
+    the first time this succeeded — calling this again after more data
+    accumulates never recomputes it. Secret-protected, same guard as
+    registration."""
+    _check_secret(x_webhook_secret)
+    try:
+        return resolve_existing_experiment(experiment_id)
+    except ExperimentError as e:
+        message = str(e)
+        status_code = 404 if message.startswith("no experiment with id") else 409
+        raise HTTPException(status_code=status_code, detail=message)
 
 
 @app.get("/candidates/{candidate_id}")

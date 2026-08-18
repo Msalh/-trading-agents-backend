@@ -1060,6 +1060,94 @@ trading logic.
 
 ---
 
+## Experiment registry (Tier 3.20)
+
+The fourth external review (2026-08-18): every finding this project
+has produced has been retrospective, and the weekly scheduled check
+watching for a 15-distinct-day threshold (Tier 3.18) is watching the
+SAME growing candidate pool every diagnostic tier keeps mining for
+ideas — by the time that threshold fires, none of its candidates will
+be a clean holdout in any normal sense, even with scoring untouched
+the whole time. This is a lightweight, append-only pre-registration
+mechanism: freeze a hypothesis, a stopping rule, and a snapshot of the
+live scoring config, then only count candidates created AT OR AFTER
+that moment toward it. Deliberately not the full "shadow trading
+engine" a prior review gestured at — the review's own guidance was
+that a simple registration + one-time resolution log is enough for
+now.
+
+### `POST /experiments?symbol=MNQ1!&timeframe=5m&hypothesis=...&target_metrics=win_rate&target_metrics=profit_factor&min_distinct_trading_days=15` (secret required)
+
+```json
+{
+  "experiment_id": "b0d1...", "symbol": "MNQ1!", "timeframe": "5m",
+  "hypothesis": "Coordinator's blended decision beats Analysis alone on win_rate over the next 15 independent trading days",
+  "locked_config": {"coordinator_threshold": 25.0, "weights": {"analysis": 0.4, "news": 0.25, "timing": 0.2, "macro": 0.15}, "min_available_weight": 0.6},
+  "target_metrics": ["win_rate", "profit_factor"],
+  "stopping_rule": {"min_distinct_trading_days": 15},
+  "direction_source": "coordinator",
+  "registered_at": "2026-08-18 10:15:03", "status": "active",
+  "resolved_at": null, "resolution": null
+}
+```
+
+`locked_config` snapshots the CURRENT live `coordinator_threshold`/
+`weights`/`min_available_weight` at registration — read-only, never
+mutates them, and never changes even if the live config is later
+edited. `registered_at` is stamped by SQLite's own clock, the same
+clock every candidate's `created_at` uses — the hard, exact boundary:
+only candidates created at or after this moment ever count toward
+this experiment. `stopping_rule` accepts `min_distinct_trading_days`
+and/or `min_accepted_trades` (the latter computed via
+`compute_backtest_comparison`'s `trades_taken` for `direction_source`
+— the same non-overlapping-schedule trade count backtest-lite already
+reports); at least one is required. 400 on an empty hypothesis, empty
+`target_metrics`, an empty/unrecognized `stopping_rule`, or an unknown
+`direction_source`.
+
+### `GET /experiments?symbol=MNQ1!&timeframe=5m`
+
+Every registered experiment, newest first — append-only history, not
+a "latest" view. Omit both params to list across every symbol/
+timeframe.
+
+### `GET /experiments/{experiment_id}`
+
+The full record plus a live, read-only `stopping_rule_status` computed
+against prospective (post-registration) candidates right now —
+checking this as often as desired never resolves the experiment or
+consumes anything:
+
+```json
+{
+  "...": "...",
+  "stopping_rule_status": {
+    "prospective_candidates_considered": 40,
+    "checks": {"min_distinct_trading_days": {"required": 15, "actual": 3, "met": false}},
+    "stopping_rule_met": false
+  }
+}
+```
+
+404 if `experiment_id` doesn't exist.
+
+### `POST /experiments/{experiment_id}/resolve` (secret required)
+
+The one-time outcome recording. 409 if the stopping rule isn't met yet
+(check `GET /experiments/{id}` first — this endpoint never forces an
+early look). Once resolved, returns the SAME `resolution` on every
+subsequent call — calling it again after more data accumulates never
+recomputes it; `resolution` embeds a `day_session` breakdown and a
+full `compute_backtest_comparison` result, computed ONLY from
+prospective candidates as of the moment the stopping rule was first
+satisfied. 404 for an unknown `experiment_id`.
+
+Entirely additive: no existing endpoint's behavior changes,
+`COORDINATOR_THRESHOLD`/`WEIGHTS` are only read and snapshotted, never
+modified, and no LLM calls are made anywhere in this flow.
+
+---
+
 ## Auto-execution (Tier 3.9)
 
 Every prior tier's paper trades were opened by a human manually

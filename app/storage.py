@@ -119,6 +119,23 @@ CREATE TABLE IF NOT EXISTS llm_call_log (
 );
 CREATE INDEX IF NOT EXISTS idx_llm_call_log_agent_called_at
     ON llm_call_log (agent, called_at DESC);
+
+CREATE TABLE IF NOT EXISTS experiments (
+    experiment_id TEXT PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    timeframe TEXT NOT NULL,
+    hypothesis TEXT NOT NULL,
+    locked_config_json TEXT NOT NULL,
+    target_metrics_json TEXT NOT NULL,
+    stopping_rule_json TEXT NOT NULL,
+    direction_source TEXT NOT NULL,
+    registered_at TEXT NOT NULL DEFAULT (datetime('now')),
+    status TEXT NOT NULL DEFAULT 'active',
+    resolved_at TEXT,
+    resolution_json TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_experiments_symbol_timeframe
+    ON experiments (symbol, timeframe, registered_at DESC);
 """
 
 
@@ -1136,3 +1153,118 @@ def get_recent_llm_calls(limit: int = 50, agent: str | None = None) -> list[dict
         return [dict(row) for row in rows]
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Experiments (Tier 3.20) -- pre-registered hypotheses with a locked config
+# and a one-time, append-only resolution. See app/experiments.py for the
+# business logic (registration validation, stopping-rule evaluation,
+# resolution) -- these are the raw persistence primitives only.
+# ---------------------------------------------------------------------------
+
+def _row_to_experiment(row: sqlite3.Row) -> dict:
+    return {
+        "experiment_id": row["experiment_id"],
+        "symbol": row["symbol"],
+        "timeframe": row["timeframe"],
+        "hypothesis": row["hypothesis"],
+        "locked_config": json.loads(row["locked_config_json"]),
+        "target_metrics": json.loads(row["target_metrics_json"]),
+        "stopping_rule": json.loads(row["stopping_rule_json"]),
+        "direction_source": row["direction_source"],
+        "registered_at": row["registered_at"],
+        "status": row["status"],
+        "resolved_at": row["resolved_at"],
+        "resolution": json.loads(row["resolution_json"]) if row["resolution_json"] else None,
+    }
+
+
+def save_experiment(
+    experiment_id: str,
+    symbol: str,
+    timeframe: str,
+    hypothesis: str,
+    locked_config: dict,
+    target_metrics: list,
+    stopping_rule: dict,
+    direction_source: str,
+) -> dict:
+    """Inserts one new experiment row, status='active'. registered_at
+    is stamped by SQLite's own datetime('now') -- the SAME clock
+    trade_candidates.created_at is stamped with -- so a later
+    `candidate.created_at >= experiment.registered_at` comparison
+    (app.experiments._prospective_candidates) compares two timestamps
+    from the same clock, never the app server's local clock against
+    SQLite's."""
+    conn = get_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO experiments
+                (experiment_id, symbol, timeframe, hypothesis, locked_config_json,
+                 target_metrics_json, stopping_rule_json, direction_source)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                experiment_id, symbol, timeframe, hypothesis,
+                json.dumps(locked_config), json.dumps(target_metrics),
+                json.dumps(stopping_rule), direction_source,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return get_experiment_by_id(experiment_id)
+
+
+def get_experiment_by_id(experiment_id: str) -> Optional[dict]:
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM experiments WHERE experiment_id = ?", (experiment_id,)
+        ).fetchone()
+        return _row_to_experiment(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_experiments(symbol: str | None = None, timeframe: str | None = None) -> list[dict]:
+    """Every registered experiment, newest first -- append-only, so
+    this is the complete history, not a "latest" view. Optionally
+    filtered by symbol/timeframe."""
+    conn = get_connection()
+    try:
+        if symbol and timeframe:
+            rows = conn.execute(
+                "SELECT * FROM experiments WHERE symbol = ? AND timeframe = ? ORDER BY registered_at DESC, rowid DESC",
+                (symbol, timeframe),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM experiments ORDER BY registered_at DESC, rowid DESC"
+            ).fetchall()
+        return [_row_to_experiment(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def resolve_experiment(experiment_id: str, resolution: dict) -> Optional[dict]:
+    """Write-once: the UPDATE only matches a row that's still
+    status='active', so calling this twice (e.g. a retried request)
+    never overwrites an existing resolution_json -- the second call is
+    a no-op and the original resolution is returned untouched. Returns
+    None if experiment_id doesn't exist at all."""
+    conn = get_connection()
+    try:
+        conn.execute(
+            """
+            UPDATE experiments
+            SET status = 'resolved', resolved_at = datetime('now'), resolution_json = ?
+            WHERE experiment_id = ? AND status = 'active'
+            """,
+            (json.dumps(resolution), experiment_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return get_experiment_by_id(experiment_id)
