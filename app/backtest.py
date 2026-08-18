@@ -172,6 +172,42 @@ GET /candidates/history/day-session-report for a quick check before
 running anything else. Purely descriptive, read-only reporting on
 candidates already fetched — no new data collection, no change to
 which trades are simulated or how, COORDINATOR_THRESHOLD untouched.
+
+Tier 3.19 (trading-date integrity, fourth external review, 2026-08-18):
+after Tier 3.18 shipped, real production data showed distinct_trading_
+days stuck at 4 even as candidates_considered grew by 43 over a window
+that included a genuine trading weekday (a Monday). The review flagged
+a specific, previously-unverified assumption in compute_day_session_
+breakdown() (and _candidate_trading_date() below): it trusts a bar's
+payload trading_date field at face value the moment it's present, and
+unknown_trading_date_count==0 only means "a trading_date string was
+present" — NOT that the string is correct. Tier 2.9's check_trading_
+date() already computes a mismatch warning (calendar_warning) at
+webhook ingestion time, but only returns/logs it per-event — it was
+never persisted on the candidate or aggregated anywhere, so a
+systematic mismatch (a stale Pine Script value, a DST edge case, clock
+skew) would have been invisible in every report built since.
+
+compute_trading_date_integrity_report() below is the direct fix: for
+every candidate with a stored bar, it cross-checks the LITERAL payload
+trading_date against a freshly recomputed one (the same app.trading_
+calendar.expected_trading_date() call check_trading_date() already
+makes, just re-run here so the result is visible/aggregable instead of
+living only in a per-event log line), plus a third, fully independent
+view — the anchor timestamp's own plain UTC calendar date, with no NY-
+timezone/session-rollover adjustment at all. Three independent date
+views (not two) means a maintainer isn't relying on the same rollover
+math on both sides of any single comparison. Reports per-view distinct-
+date counts, a UTC-calendar-date sanity breakdown, the total mismatch
+count (never capped) plus a capped list of concrete mismatch examples
+(candidate_id/event_id/anchor_timestamp/payload date/computed date),
+and the candidate set's earliest/latest anchor timestamp. Entirely
+offline/read-only — no new data, no scoring change, COORDINATOR_
+THRESHOLD untouched. Exposed via GET /candidates/history/trading-date-
+integrity, deliberately kept separate from day-session-report rather
+than merged into it: this is a forensic/validation tool (its mismatch_
+examples payload can be large) with a different purpose than the day/
+session summary it's meant to double-check.
 """
 
 import math
@@ -506,6 +542,97 @@ def compute_day_session_breakdown(candidates: list[dict]) -> dict:
         "by_session_name": by_session_name,
         "by_timing_session_label": by_timing_session_label,
         "unknown_trading_date_count": unknown_trading_date_count,
+    }
+
+
+# Tier 3.19: capped so a large candidate history doesn't return an
+# unbounded mismatch_examples payload. mismatch_count itself is never
+# capped -- only the illustrative example list.
+TRADING_DATE_MISMATCH_EXAMPLE_LIMIT = 20
+
+
+def compute_trading_date_integrity_report(candidates: list[dict]) -> dict:
+    """Tier 3.19: cross-checks every candidate's bar's own payload
+    trading_date against a freshly recomputed one (same convention
+    app.trading_calendar.check_trading_date() already applies at
+    webhook ingestion, just re-run here so the result is aggregable
+    instead of living only in a per-event log line/response field),
+    plus a third, fully independent plain-UTC-calendar-date view with
+    no NY-timezone/session-rollover adjustment at all. See the module
+    docstring's Tier 3.19 paragraph for the full rationale. Read-only,
+    offline -- no new data, no scoring change."""
+    payload_trading_dates: dict[str, int] = {}
+    computed_trading_dates: dict[str, int] = {}
+    utc_calendar_dates: dict[str, int] = {}
+    mismatch_examples: list[dict] = []
+    mismatch_count = 0
+    candidates_missing_bar = 0
+    candidates_bar_missing_trading_date = 0
+    anchor_timestamps: list[str] = []
+
+    for candidate in candidates:
+        has_bar = bool(candidate.get("bar"))
+        bar = candidate.get("bar") or {}
+        anchor = _candidate_anchor_timestamp(candidate)
+        if anchor:
+            anchor_timestamps.append(anchor)
+
+        if not has_bar:
+            candidates_missing_bar += 1
+
+        payload_date = bar.get("trading_date") if has_bar else None
+        if payload_date:
+            payload_trading_dates[payload_date] = payload_trading_dates.get(payload_date, 0) + 1
+        elif has_bar:
+            candidates_bar_missing_trading_date += 1
+
+        computed_date = None
+        if anchor:
+            try:
+                computed_date = expected_trading_date(anchor)
+            except (ValueError, AttributeError, TypeError):
+                computed_date = None
+        if computed_date:
+            computed_trading_dates[computed_date] = computed_trading_dates.get(computed_date, 0) + 1
+
+        # Deliberately NOT run through expected_trading_date()'s NY-
+        # timezone/rollover logic -- this is meant to be a fully
+        # independent third view, not a second computation of the
+        # same thing under a different name. Timestamps are already
+        # ISO-8601 UTC ("...T...Z"), so the date portion is a plain
+        # slice, no timezone conversion needed.
+        utc_date = anchor[:10] if anchor else None
+        if utc_date:
+            utc_calendar_dates[utc_date] = utc_calendar_dates.get(utc_date, 0) + 1
+
+        if payload_date and computed_date and payload_date != computed_date:
+            mismatch_count += 1
+            if len(mismatch_examples) < TRADING_DATE_MISMATCH_EXAMPLE_LIMIT:
+                mismatch_examples.append(
+                    {
+                        "candidate_id": candidate.get("candidate_id"),
+                        "event_id": bar.get("event_id"),
+                        "anchor_timestamp": anchor,
+                        "payload_trading_date": payload_date,
+                        "computed_trading_date": computed_date,
+                    }
+                )
+
+    return {
+        "candidates_considered": len(candidates),
+        "candidates_missing_bar": candidates_missing_bar,
+        "candidates_bar_missing_trading_date": candidates_bar_missing_trading_date,
+        "payload_trading_dates": payload_trading_dates,
+        "computed_trading_dates": computed_trading_dates,
+        "utc_calendar_dates": utc_calendar_dates,
+        "distinct_payload_trading_days": len(payload_trading_dates),
+        "distinct_computed_trading_days": len(computed_trading_dates),
+        "distinct_utc_calendar_dates": len(utc_calendar_dates),
+        "mismatch_count": mismatch_count,
+        "mismatch_examples": mismatch_examples,
+        "mismatch_examples_truncated": mismatch_count > len(mismatch_examples),
+        "earliest_anchor_timestamp": min(anchor_timestamps) if anchor_timestamps else None,
+        "latest_anchor_timestamp": max(anchor_timestamps) if anchor_timestamps else None,
     }
 
 

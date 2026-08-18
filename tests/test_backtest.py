@@ -66,12 +66,15 @@ def _save_bar(storage, symbol, timeframe, timestamp_dt, open_, high, low, close,
 
 def _candidate(candidate_id, symbol, timeframe, anchor_dt, atr, decision="enter_long",
                 analysis_direction="bullish", vwap_distance=None,
-                trading_date=None, session_name=None, timing_session_label=None):
+                trading_date=None, session_name=None, timing_session_label=None,
+                event_id=None):
     bar = {"timestamp": _iso(anchor_dt), "atr": atr, "distance_from_vwap_points": vwap_distance}
     if trading_date is not None:
         bar["trading_date"] = trading_date
     if session_name is not None:
         bar["session_name"] = session_name
+    if event_id is not None:
+        bar["event_id"] = event_id
     decision_dict = {
         "decision": decision,
         "timestamp": _iso(anchor_dt),
@@ -882,3 +885,132 @@ def test_champion_challenger_report_includes_day_session_breakdown_per_window(fr
     assert set(result["day_session"].keys()) == {"calibration", "validation"}
     assert result["day_session"]["calibration"]["candidates_considered"] == 1
     assert result["day_session"]["validation"]["candidates_considered"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Tier 3.19: compute_trading_date_integrity_report (fourth external review,
+# 2026-08-18) -- cross-checks payload trading_date against a recomputed one
+# and a third, fully independent plain-UTC-calendar-date view.
+# ---------------------------------------------------------------------------
+
+def test_trading_date_integrity_reports_no_mismatch_when_payload_matches_computed(fresh_env):
+    _, backtest = fresh_env
+    # 14:00Z = 10:00 NY (well before the 18:00 rollover hour), so the
+    # expected trading day is the same calendar date as the payload's.
+    candidate = _candidate(
+        "c1", "TEST", "5m", datetime(2026, 8, 11, 14, 0, tzinfo=timezone.utc), atr=2.0,
+        trading_date="2026-08-11", event_id="evt-1",
+    )
+    result = backtest.compute_trading_date_integrity_report([candidate])
+    assert result["candidates_considered"] == 1
+    assert result["mismatch_count"] == 0
+    assert result["mismatch_examples"] == []
+    assert result["payload_trading_dates"] == {"2026-08-11": 1}
+    assert result["computed_trading_dates"] == {"2026-08-11": 1}
+    assert result["utc_calendar_dates"] == {"2026-08-11": 1}
+    assert result["distinct_payload_trading_days"] == 1
+    assert result["distinct_computed_trading_days"] == 1
+    assert result["distinct_utc_calendar_dates"] == 1
+
+
+def test_trading_date_integrity_detects_mismatch_and_reports_example(fresh_env):
+    _, backtest = fresh_env
+    # Deliberately implausible payload trading_date -- the anchor
+    # timestamp implies 2026-08-11, but the payload claims 2099-01-01.
+    candidate = _candidate(
+        "c1", "TEST", "5m", datetime(2026, 8, 11, 14, 0, tzinfo=timezone.utc), atr=2.0,
+        trading_date="2099-01-01", event_id="evt-mismatch",
+    )
+    result = backtest.compute_trading_date_integrity_report([candidate])
+    assert result["mismatch_count"] == 1
+    assert result["mismatch_examples"] == [
+        {
+            "candidate_id": "c1",
+            "event_id": "evt-mismatch",
+            "anchor_timestamp": "2026-08-11T14:00:00Z",
+            "payload_trading_date": "2099-01-01",
+            "computed_trading_date": "2026-08-11",
+        }
+    ]
+    assert result["mismatch_examples_truncated"] is False
+    assert result["payload_trading_dates"] == {"2099-01-01": 1}
+    assert result["computed_trading_dates"] == {"2026-08-11": 1}
+
+
+def test_trading_date_integrity_utc_calendar_view_is_independent_of_rollover(fresh_env):
+    # 23:00Z = 19:00 EDT (Aug is daylight time, UTC-4) -- at/after the
+    # 18:00 NY rollover hour, so expected_trading_date() rolls this to
+    # the NEXT calendar day, while the plain UTC-calendar-date view
+    # (no rollover logic at all) stays on the timestamp's own date.
+    # This is the exact "third independent view" the report exists to
+    # provide -- these two are EXPECTED to differ here, that's not a
+    # bug in the report.
+    _, backtest = fresh_env
+    candidate = _candidate(
+        "c1", "TEST", "5m", datetime(2026, 8, 11, 23, 0, tzinfo=timezone.utc), atr=2.0,
+        trading_date="2026-08-12",  # matches the rollover-aware computed date, not UTC date
+    )
+    result = backtest.compute_trading_date_integrity_report([candidate])
+    assert result["payload_trading_dates"] == {"2026-08-12": 1}
+    assert result["computed_trading_dates"] == {"2026-08-12": 1}
+    assert result["utc_calendar_dates"] == {"2026-08-11": 1}
+    assert result["mismatch_count"] == 0  # payload agrees with the rollover-aware computed date
+
+
+def test_trading_date_integrity_counts_missing_bar_and_missing_trading_date_field(fresh_env):
+    _, backtest = fresh_env
+    no_bar = {"candidate_id": "c1", "symbol": "TEST", "timeframe": "5m", "bar": None, "decision": {}}
+    bar_no_date = _candidate("c2", "TEST", "5m", datetime(2026, 8, 11, 14, 0, tzinfo=timezone.utc), atr=2.0)
+    result = backtest.compute_trading_date_integrity_report([no_bar, bar_no_date])
+    assert result["candidates_missing_bar"] == 1
+    assert result["candidates_bar_missing_trading_date"] == 1
+    assert result["payload_trading_dates"] == {}
+    # bar_no_date still has a resolvable anchor timestamp, so it still
+    # contributes to the recomputed/UTC views even with no payload value.
+    assert result["computed_trading_dates"] == {"2026-08-11": 1}
+    assert result["utc_calendar_dates"] == {"2026-08-11": 1}
+
+
+def test_trading_date_integrity_reports_earliest_and_latest_anchor_timestamp(fresh_env):
+    _, backtest = fresh_env
+    older = _candidate("c1", "TEST", "5m", datetime(2026, 8, 5, 14, 0, tzinfo=timezone.utc), atr=2.0, trading_date="2026-08-05")
+    newer = _candidate("c2", "TEST", "5m", datetime(2026, 8, 11, 9, 0, tzinfo=timezone.utc), atr=2.0, trading_date="2026-08-11")
+    result = backtest.compute_trading_date_integrity_report([older, newer])
+    assert result["earliest_anchor_timestamp"] == "2026-08-05T14:00:00Z"
+    assert result["latest_anchor_timestamp"] == "2026-08-11T09:00:00Z"
+
+
+def test_trading_date_integrity_caps_mismatch_examples_but_not_mismatch_count(fresh_env):
+    _, backtest = fresh_env
+    candidates = [
+        _candidate(
+            f"c{i}", "TEST", "5m", datetime(2026, 8, 11, 14, 0, tzinfo=timezone.utc), atr=2.0,
+            trading_date="2099-01-01", event_id=f"evt-{i}",
+        )
+        for i in range(25)
+    ]
+    result = backtest.compute_trading_date_integrity_report(candidates)
+    assert result["mismatch_count"] == 25
+    assert len(result["mismatch_examples"]) == backtest.TRADING_DATE_MISMATCH_EXAMPLE_LIMIT
+    assert result["mismatch_examples_truncated"] is True
+
+
+def test_trading_date_integrity_empty_candidates_returns_zeroed_shape(fresh_env):
+    _, backtest = fresh_env
+    result = backtest.compute_trading_date_integrity_report([])
+    assert result == {
+        "candidates_considered": 0,
+        "candidates_missing_bar": 0,
+        "candidates_bar_missing_trading_date": 0,
+        "payload_trading_dates": {},
+        "computed_trading_dates": {},
+        "utc_calendar_dates": {},
+        "distinct_payload_trading_days": 0,
+        "distinct_computed_trading_days": 0,
+        "distinct_utc_calendar_dates": 0,
+        "mismatch_count": 0,
+        "mismatch_examples": [],
+        "mismatch_examples_truncated": False,
+        "earliest_anchor_timestamp": None,
+        "latest_anchor_timestamp": None,
+    }

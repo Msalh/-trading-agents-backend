@@ -905,3 +905,48 @@ def test_day_session_report_endpoint_empty_history(client):
     body = r.json()
     assert body["candidates_considered"] == 0
     assert body["distinct_trading_days"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Tier 3.19: trading-date integrity (fourth external review, 2026-08-18)
+# ---------------------------------------------------------------------------
+
+def test_trading_date_integrity_endpoint_returns_report_shape(client):
+    import app.storage as storage
+
+    anchor = "2026-08-11T14:00:00Z"
+    bar = {
+        "event_id": "evt-tdi-1", "symbol": "MNQ1!", "timeframe": "5m", "timestamp": anchor,
+        "trading_date": "2099-01-01",  # deliberately mismatched vs. the anchor timestamp
+    }
+    decision = {
+        "decision": "enter_long", "timestamp": anchor,
+        "opinions_used": {"analysis": {"direction": "bullish", "timestamp": anchor}},
+    }
+    storage.save_candidate(candidate_id="cand-tdi-1", symbol="MNQ1!", timeframe="5m", bar=bar, decision=decision)
+
+    r = client.get(
+        "/candidates/history/trading-date-integrity",
+        params={"symbol": "MNQ1!", "timeframe": "5m"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["symbol"] == "MNQ1!"
+    assert body["timeframe"] == "5m"
+    assert body["candidates_considered"] == 1
+    assert body["mismatch_count"] == 1
+    assert body["mismatch_examples"][0]["candidate_id"] == "cand-tdi-1"
+    assert body["mismatch_examples"][0]["event_id"] == "evt-tdi-1"
+    assert body["mismatch_examples"][0]["payload_trading_date"] == "2099-01-01"
+    assert body["mismatch_examples"][0]["computed_trading_date"] == "2026-08-11"
+
+
+def test_trading_date_integrity_endpoint_empty_history(client):
+    r = client.get(
+        "/candidates/history/trading-date-integrity",
+        params={"symbol": "NOSUCH", "timeframe": "5m"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["candidates_considered"] == 0
+    assert body["mismatch_count"] == 0

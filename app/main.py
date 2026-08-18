@@ -684,6 +684,28 @@ reporting on candidates already fetched: no new data collection, no
 change to which trades are simulated or how, COORDINATOR_THRESHOLD
 untouched.
 
+Tier 3.19 (trading-date integrity, fourth external review, 2026-08-18):
+Tier 3.18's distinct_trading_days stayed at 4 in production even after
+candidates_considered grew by 43 over a window spanning a genuine
+trading weekday. The review pointed out that compute_day_session_
+breakdown() trusts a bar's payload trading_date field at face value —
+unknown_trading_date_count==0 only means a value was PRESENT, not that
+it's correct, and Tier 2.9's own mismatch check (check_trading_date(),
+run at webhook ingestion) was never persisted or aggregated anywhere,
+only returned/logged per-event as calendar_warning. New app/backtest.
+compute_trading_date_integrity_report() cross-checks, per candidate,
+three independent views of its trading day: the literal payload value,
+a freshly recomputed one (same convention check_trading_date() already
+applies), and a third, fully independent plain-UTC-calendar-date split
+with no NY-timezone/rollover logic at all. Reports per-view distinct-
+date counts, the total mismatch count (uncapped) plus a capped list of
+concrete mismatch examples (candidate_id/event_id/timestamp/both
+dates), and the candidate set's earliest/latest anchor timestamp. New
+standalone GET /candidates/history/trading-date-integrity — kept
+separate from day-session-report since this is a forensic/validation
+tool, not a summary metric. Entirely offline/read-only: no new data,
+no scoring change, COORDINATOR_THRESHOLD untouched.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -709,6 +731,7 @@ from app.backtest import (
     compute_backtest_comparison,
     compute_champion_challenger_report,
     compute_day_session_breakdown,
+    compute_trading_date_integrity_report,
     run_paired_barrier_backtest,
     run_sensitivity_grid,
 )
@@ -1899,6 +1922,62 @@ def candidates_history_day_session_report(
         "symbol": symbol,
         "timeframe": timeframe,
         **compute_day_session_breakdown(candidates),
+    }
+
+
+@app.get("/candidates/history/trading-date-integrity")
+def candidates_history_trading_date_integrity(
+    symbol: str = Query(...),
+    timeframe: str = Query(...),
+    limit: int = Query(default=300, le=1000),
+) -> dict:
+    """Tier 3.19 (trading-date integrity, fourth external review,
+    2026-08-18): day-session-report's distinct_trading_days trusts each
+    bar's own payload trading_date field the moment it's present —
+    unknown_trading_date_count==0 there only means a trading_date
+    string existed, NOT that it was correct. This is the direct check
+    of that assumption: for every candidate with a stored bar, it
+    reports three independent views of what trading day it belongs to
+    and flags where they disagree.
+
+    `payload_trading_dates` / `distinct_payload_trading_days`: the
+    literal wire value from each bar, unmodified — this is what day-
+    session-report currently trusts.
+    `computed_trading_dates` / `distinct_computed_trading_days`: each
+    bar's own timestamp re-run through app.trading_calendar.
+    expected_trading_date() (the same CME/Globex session-rollover
+    convention Tier 2.9's check_trading_date() already applies at
+    webhook ingestion — this just makes the comparison visible and
+    aggregable instead of living only in a per-event log line /
+    calendar_warning response field nobody may ever revisit).
+    `utc_calendar_dates` / `distinct_utc_calendar_dates`: a THIRD,
+    fully independent view — the anchor timestamp's own plain UTC
+    calendar date, no NY-timezone/rollover adjustment at all. If this
+    view shows more distinct dates than the other two, the rollover
+    convention itself (not the underlying payload data) is what's
+    collapsing days together; if all three agree, the stagnant day
+    count is a real data/ingestion fact, not a reporting artifact.
+
+    `mismatch_count` (never truncated) and `mismatch_examples` (capped
+    at TRADING_DATE_MISMATCH_EXAMPLE_LIMIT, with `mismatch_examples_
+    truncated` flagging when more exist) show concrete candidate_id/
+    event_id/timestamp/payload-date/computed-date rows wherever the
+    payload and recomputed views disagree — the previously-invisible
+    calendar_warning case, now surfaced and countable instead of only
+    ever appearing once in a log line at ingestion time.
+
+    Deliberately a separate endpoint from day-session-report rather
+    than merged into it: this is a forensic/validation tool (its
+    mismatch_examples payload can be large on a long history), not a
+    routine summary metric.
+
+    Entirely offline and read-only: no new data, no LLM calls, no
+    effect on COORDINATOR_THRESHOLD or any trading logic."""
+    candidates = get_candidate_history(symbol=symbol, timeframe=timeframe, limit=limit)
+    return {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        **compute_trading_date_integrity_report(candidates),
     }
 
 

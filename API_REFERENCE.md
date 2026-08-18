@@ -979,6 +979,87 @@ no effect on `COORDINATOR_THRESHOLD` or any trading logic.
 
 ---
 
+## Trading-date integrity (Tier 3.19)
+
+The fourth external review (2026-08-18): after Tier 3.18 shipped,
+production showed `distinct_trading_days` stuck at 4 even as
+`candidates_considered` grew by 43 over a window that included a
+genuine trading weekday. The review pointed out a previously-
+unverified assumption in `compute_day_session_breakdown()`: it trusts
+each bar's payload `trading_date` field at face value the moment it's
+present, and `unknown_trading_date_count == 0` only proves a value
+existed — never that it was *correct*. Tier 2.9's `check_trading_date()`
+already computes a mismatch warning (`calendar_warning`) at webhook
+ingestion, but it was only ever returned/logged per event, never
+persisted on the candidate or aggregated — a systematic mismatch (a
+stale Pine Script value, a DST edge case, clock skew) would have been
+completely invisible in every report built since.
+
+`app/backtest.compute_trading_date_integrity_report()` is the direct
+check: for every candidate with a stored bar it cross-checks THREE
+independent views of what trading day it belongs to.
+
+### `GET /candidates/history/trading-date-integrity?symbol=MNQ1!&timeframe=5m&limit=300`
+
+```json
+{
+  "symbol": "MNQ1!", "timeframe": "5m",
+  "candidates_considered": 275,
+  "candidates_missing_bar": 0,
+  "candidates_bar_missing_trading_date": 0,
+  "payload_trading_dates": {"2026-08-13": 78, "2026-08-14": 76, "2026-08-17": 77, "2026-08-18": 44},
+  "computed_trading_dates": {"2026-08-13": 78, "2026-08-14": 76, "2026-08-17": 77, "2026-08-18": 44},
+  "utc_calendar_dates": {"2026-08-13": 78, "2026-08-14": 76, "2026-08-17": 77, "2026-08-18": 44},
+  "distinct_payload_trading_days": 4,
+  "distinct_computed_trading_days": 4,
+  "distinct_utc_calendar_dates": 4,
+  "mismatch_count": 0,
+  "mismatch_examples": [],
+  "mismatch_examples_truncated": false,
+  "earliest_anchor_timestamp": "2026-08-13T09:05:00Z",
+  "latest_anchor_timestamp": "2026-08-18T04:45:00Z"
+}
+```
+
+(The numbers above are a placeholder shape, not yet a confirmed
+production pull — see the fourth realignment package for status.)
+
+- `payload_trading_dates` / `distinct_payload_trading_days`: the
+  literal wire value from each bar, unmodified — what
+  `day-session-report` currently trusts.
+- `computed_trading_dates` / `distinct_computed_trading_days`: each
+  bar's timestamp re-run through `app.trading_calendar.
+  expected_trading_date()` (the same CME/Globex rollover convention
+  `check_trading_date()` already applies at ingestion — just re-run
+  here so the result is visible/aggregable instead of living only in a
+  per-event log line).
+- `utc_calendar_dates` / `distinct_utc_calendar_dates`: a THIRD, fully
+  independent view — the anchor timestamp's own plain UTC calendar
+  date, no NY-timezone/session-rollover adjustment at all. If this
+  view shows MORE distinct dates than the other two, the rollover
+  convention itself is collapsing days together, not the underlying
+  data; if all three agree, a stagnant day count reflects a real
+  data/ingestion fact rather than a reporting artifact.
+- `mismatch_count` (never truncated) and `mismatch_examples` (capped
+  at `TRADING_DATE_MISMATCH_EXAMPLE_LIMIT = 20`, with
+  `mismatch_examples_truncated` flagging when more exist beyond the
+  cap) — each example carries `candidate_id`, `event_id`,
+  `anchor_timestamp`, `payload_trading_date`, `computed_trading_date`,
+  so a genuine mismatch can be traced back to the exact webhook event
+  that produced it.
+- `earliest_anchor_timestamp` / `latest_anchor_timestamp`: the
+  candidate set's real time span, for a quick sanity check that a
+  `limit` parameter reached as far back as expected.
+
+Deliberately a separate endpoint from `day-session-report` rather than
+merged into it — this is a forensic/validation tool (its
+`mismatch_examples` payload can be sizable on a long history), not a
+routine summary metric. Entirely offline and read-only: no LLM calls,
+no new data collection, no effect on `COORDINATOR_THRESHOLD` or any
+trading logic.
+
+---
+
 ## Auto-execution (Tier 3.9)
 
 Every prior tier's paper trades were opened by a human manually
