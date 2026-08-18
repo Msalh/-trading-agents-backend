@@ -12,7 +12,7 @@ Run with: pytest tests/test_coordinator_diagnostics.py -v
 import itertools
 
 from app.coordinator import MIN_AVAILABLE_WEIGHT, WEIGHTS, _score_opinions
-from app.coordinator_diagnostics import compute_coordinator_divergence_report
+from app.coordinator_diagnostics import _classify_ablation_change, compute_coordinator_divergence_report
 
 _candidate_ids = itertools.count(1)
 
@@ -171,6 +171,11 @@ def test_ablation_reports_a_changed_decision_when_removing_the_deciding_agent():
     assert ablation["candidates_considered"] == 1
     assert ablation["agent_present_count"] == 1
     assert ablation["decision_changed"] == 1
+    # Tier 3.21: enter_long -> no_trade crosses one threshold boundary
+    # without reversing sign and both sides stayed data-sufficient --
+    # neither to_insufficient_data nor direction_flipped applies.
+    assert ablation["decision_changed_by_category"] == {"threshold_crossing": 1}
+    assert ablation["transitions"] == {"enter_long -> no_trade": 1}
 
 
 def test_ablation_reports_unchanged_when_agent_was_never_pivotal():
@@ -190,6 +195,9 @@ def test_ablation_reports_unchanged_when_agent_was_never_pivotal():
     assert ablation["agent_present_count"] == 1
     assert ablation["decision_changed"] == 0
     assert ablation["decision_unchanged"] == 1
+    assert ablation["decision_changed_by_category"] == {}
+    assert ablation["avg_abs_score_delta_when_changed"] is None
+    assert ablation["avg_abs_score_delta_when_unchanged"] is not None
 
 
 def test_ablation_never_flips_a_candidate_where_the_agent_was_absent():
@@ -210,6 +218,97 @@ def test_ablation_never_flips_a_candidate_where_the_agent_was_absent():
         ablation = report["ablation"][key]
         assert ablation["agent_present_count"] == 0
         assert ablation["decision_changed"] == 0
+        assert ablation["decision_changed_by_category"] == {}
+
+
+def test_ablation_categorizes_a_change_to_insufficient_data():
+    # Analysis+News present (no Macro): 0.65/0.80 = 0.8125, safely above
+    # the 0.6 gate -- a real directional decision. Ablating News alone
+    # drops available directional weight to just Analysis (0.40/0.80 =
+    # 0.5 < 0.6) -- a clean, natural "to_insufficient_data" case (the
+    # quorum effect the fourth review specifically wanted separated out
+    # from a genuine directional-influence change).
+    candidate = _candidate(
+        analysis=_opinion("bullish", 95),
+        news=_opinion("bullish", 10),
+        min_available_weight=MIN_AVAILABLE_WEIGHT,
+    )
+    assert candidate["decision"]["decision"] in ("enter_long", "enter_short", "no_trade")
+    report = compute_coordinator_divergence_report([candidate])
+    ablation = report["ablation"]["news_removed"]
+    assert ablation["decision_changed"] == 1
+    assert ablation["decision_changed_by_category"] == {"to_insufficient_data": 1}
+
+
+# ---------------------------------------------------------------------------
+# Tier 3.21: _classify_ablation_change -- direct unit tests. Exercised
+# against hand-built replay_candidate()-shaped dicts rather than the
+# full pipeline: under the LIVE weights/threshold, a "direction_flipped"
+# outcome turns out to be mathematically unreachable for any single
+# agent's ablation (removing one agent's raw contribution, even at full
+# confidence, is never enough to both let the original cross +threshold
+# AND flip the post-ablation score past -threshold once you work through
+# the renormalized-denominator algebra for each agent) -- so this
+# category is tested directly against the classifier function, not
+# coaxed out of real confidence values that cannot actually produce it
+# under the current config. That asymmetry (analysis/news/macro's
+# weights relative to COORDINATOR_THRESHOLD=25 and MIN_AVAILABLE_WEIGHT
+# =0.6 structurally forbid a full reversal from ablating just one
+# agent) is itself a notable finding, not a testing inconvenience.
+# ---------------------------------------------------------------------------
+
+def _replay_result(original_decision, original_direction, original_score,
+                    replayed_decision, replayed_direction, replayed_score,
+                    replayed_conflict_flags=None):
+    return {
+        "changed": original_decision != replayed_decision,
+        "original": {
+            "decision": original_decision, "direction": original_direction,
+            "score": original_score, "threshold": 25.0, "config_version": {},
+        },
+        "replayed": {
+            "decision": replayed_decision, "direction": replayed_direction,
+            "score": replayed_score, "conflict_flags": replayed_conflict_flags or [],
+        },
+    }
+
+
+def test_classify_ablation_change_unchanged_has_no_category():
+    result = _replay_result("enter_long", "bullish", 30.0, "enter_long", "bullish", 28.0)
+    classified = _classify_ablation_change([], result)
+    assert classified["changed"] is False
+    assert classified["category"] is None
+    assert classified["score_delta"] == -2.0
+
+
+def test_classify_ablation_change_to_insufficient_data():
+    result = _replay_result("enter_long", "bullish", 30.0, "insufficient_data", "neutral", 0.0)
+    classified = _classify_ablation_change([], result)
+    assert classified["category"] == "to_insufficient_data"
+
+
+def test_classify_ablation_change_direction_flipped():
+    result = _replay_result("enter_long", "bullish", 30.0, "enter_short", "bearish", -30.0)
+    classified = _classify_ablation_change([], result)
+    assert classified["category"] == "direction_flipped"
+
+
+def test_classify_ablation_change_threshold_crossing():
+    result = _replay_result("enter_long", "bullish", 30.0, "no_trade", "neutral", 10.0)
+    classified = _classify_ablation_change([], result)
+    assert classified["category"] == "threshold_crossing"
+
+
+def test_classify_ablation_change_detects_conflict_flags_changed():
+    result = _replay_result(
+        "enter_long", "bullish", 30.0, "no_trade", "neutral", 10.0,
+        replayed_conflict_flags=["timing_low_liquidity_dampened"],
+    )
+    unchanged_flags = _classify_ablation_change(["timing_low_liquidity_dampened"], result)
+    assert unchanged_flags["conflict_flags_changed"] is False
+
+    changed_flags = _classify_ablation_change(["analysis_news_conflict"], result)
+    assert changed_flags["conflict_flags_changed"] is True
 
 
 def test_timing_blocked_count(monkeypatch):

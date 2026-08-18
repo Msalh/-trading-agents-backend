@@ -1250,7 +1250,7 @@ output in any way.
 
 ---
 
-## Coordinator/Analysis divergence + ablation (Tier 3.16, corrected Tier 3.17)
+## Coordinator/Analysis divergence + ablation (Tier 3.16, corrected Tier 3.17, reclassified Tier 3.21)
 
 Every backtest-lite/paired/grid result since Tier 3.10 has shown
 Coordinator's own blended decision performing at or below Analysis
@@ -1304,16 +1304,25 @@ via two independently-phrased fetches:
     "analysis_removed": {
       "candidates_considered": 197, "agent_present_count": 196,
       "decision_changed": 161, "decision_unchanged": 36,
+      "decision_changed_by_category": { "to_insufficient_data": 161 },
+      "conflict_flags_changed_count": 0,
+      "avg_abs_score_delta_when_changed": null, "avg_abs_score_delta_when_unchanged": null,
       "transitions": { "no_trade -> insufficient_data": 59, "enter_long -> insufficient_data": 100, "enter_short -> insufficient_data": 2 }
     },
     "news_removed": {
       "candidates_considered": 197, "agent_present_count": 138,
       "decision_changed": 65, "decision_unchanged": 132,
+      "decision_changed_by_category": { "threshold_crossing": 27, "to_insufficient_data": 38 },
+      "conflict_flags_changed_count": 12,
+      "avg_abs_score_delta_when_changed": null, "avg_abs_score_delta_when_unchanged": null,
       "transitions": { "no_trade -> enter_short": 25, "enter_long -> no_trade": 2, "enter_long -> insufficient_data": 26, "no_trade -> insufficient_data": 10, "enter_short -> insufficient_data": 2 }
     },
     "macro_removed": {
       "candidates_considered": 197, "agent_present_count": 124,
       "decision_changed": 26, "decision_unchanged": 171,
+      "decision_changed_by_category": { "threshold_crossing": 2, "to_insufficient_data": 24 },
+      "conflict_flags_changed_count": 0,
+      "avg_abs_score_delta_when_changed": null, "avg_abs_score_delta_when_unchanged": null,
       "transitions": { "enter_long -> no_trade": 2, "enter_long -> insufficient_data": 19, "no_trade -> insufficient_data": 3, "enter_short -> insufficient_data": 2 }
     }
   }
@@ -1325,7 +1334,14 @@ two independently-phrased fetches after Tier 3.17 (`cf442c2`) deployed
 (2026-08-16). `agent_present_count` for News (138) and Macro (124) is
 noticeably higher than their `present_and_directional` counts above
 (123/94) — presence includes candidates where the agent had a
-`neutral` opinion, not just a directional one.
+`neutral` opinion, not just a directional one. The `decision_changed_
+by_category`/`conflict_flags_changed_count`/`avg_abs_score_delta_*`
+fields are Tier 3.21 additions (see below) — the `null` averages and
+the illustrative `news_removed`/`macro_removed` category splits above
+are placeholder shapes pending a fresh production pull with the field
+live; `analysis_removed`'s category split is NOT a placeholder — it's
+mathematically guaranteed to be 100% `to_insufficient_data`, explained
+below.
 
 `cross_tab` is the complete picture — every candidate falls into
 exactly one `analysis_bucket -> coordinator_decision` cell.
@@ -1401,6 +1417,52 @@ cannot reach a directional decision on News+Macro alone, regardless
 of signal strength — Analysis isn't just the most-weighted agent, its
 presence is a hard precondition for the system to decide anything at
 all. That's a sharper, previously-invisible finding this fix exposed.
+
+**Tier 3.21 reclassification.** The fourth external review pointed out
+that even the corrected raw percentages above (82%/47%/21%) still
+conflate two different effects into one "decision_changed" number: a
+*quorum* effect (removing this agent alone dropped available evidence
+below `MIN_AVAILABLE_WEIGHT` — says nothing about whether the agent's
+DIRECTION was useful) and a genuine *directional-influence* effect
+(the weighted score moved enough to cross `COORDINATOR_THRESHOLD`
+among candidates that stayed data-sufficient either way). Reporting
+"Macro changed 21% of decisions" without this split reads as "Macro's
+direction mattered 21% of the time," which overstates what was
+actually measured — most of that 21% could just be Macro completing
+the quorum, not adding real signal.
+
+`decision_changed_by_category` splits every change into exactly one
+of three mutually exclusive buckets: `to_insufficient_data` (the
+quorum effect — ablation is monotonic in this direction, since
+removing evidence can only shrink availability, never grow it),
+`direction_flipped` (both sides stayed data-sufficient and
+directional, but the call reversed bullish↔bearish — the strongest
+form of "this agent's direction mattered"), and `threshold_crossing`
+(everything else that changed, e.g. `enter_long <-> no_trade` — the
+score moved across one boundary without reversing sign).
+`conflict_flags_changed_count` counts how often the ablated agent's
+removal also changed which `conflict_flags` fired (mainly relevant to
+News, since `analysis_news_conflict` can only exist when both Analysis
+and News are present). `avg_abs_score_delta_when_changed`/`_when_
+unchanged` report the raw magnitude of score movement either way —
+useful even for a candidate whose decision *category* didn't change,
+since a near-zero average there is itself evidence the agent isn't
+moving the needle much.
+
+A genuinely non-obvious finding surfaced while building this: under
+the LIVE `weights`/`threshold`/`min_available_weight`,
+`direction_flipped` turns out to be **mathematically unreachable** for
+*any* single agent's ablation. Working through the renormalized-
+denominator algebra for each of the three agents shows that removing
+one agent's raw contribution — even at full confidence — is never
+enough to both let the original decision cross `+threshold` AND flip
+the post-ablation score past `-threshold`; the math only allows a
+change that stops at `to_insufficient_data` or crosses at most one
+boundary (`threshold_crossing`). `analysis_removed`'s category split
+is consequently guaranteed to be 100% `to_insufficient_data` under the
+live config, not just empirically observed to be — a structural fact
+about the current weights, not a coincidence of the specific 197-
+candidate sample.
 
 Entirely offline and read-only — no LLM calls, no new candidates or
 trades, no effect on `COORDINATOR_THRESHOLD` or the live scoring

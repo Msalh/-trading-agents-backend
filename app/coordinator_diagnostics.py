@@ -66,6 +66,49 @@ do. COORDINATOR_THRESHOLD and Coordinator scoring are untouched; the
 per-candidate opinion removal here is a throwaway copy used only for
 one offline replay, never persisted and never touching the live
 WEIGHTS config or a stored candidate.
+
+Tier 3.21 (ablation reclassification, fourth external review,
+2026-08-18): Tier 3.17 fixed the false-positive renormalization
+artifact, but the review pointed out the surviving raw decision_changed
+percentages (82%/47%/21% for analysis/news/macro) still conflate two
+genuinely different effects: an agent's removal dropping available
+evidence below MIN_AVAILABLE_WEIGHT (a "quorum" effect — the decision
+becomes insufficient_data because there wasn't ENOUGH data left, which
+says nothing about whether that agent's own DIRECTION was useful) vs
+an agent's removal shifting the weighted score enough to cross the
+±threshold boundary among candidates that stayed data-sufficient on
+both sides (a real directional-influence effect). Analysis's 82% is
+almost entirely the former (removing 40% of the directional weight
+pool from an 80%-wide total very often crosses the 0.6 availability
+floor by itself) — reporting it as one "changed" number reads as "82%
+of the time Analysis's DIRECTION mattered," which overstates what was
+actually measured.
+
+_classify_ablation_change() below splits every changed decision into
+exactly one of three mutually exclusive categories: "to_insufficient_
+data" (the ablated agent's removal alone dropped the candidate below
+the availability gate — ablation is monotonic in this one direction,
+since removing evidence can only shrink availability, never grow it,
+so this category can never appear on the ORIGINAL side), "direction_
+flipped" (both sides stayed data-sufficient and directional, but the
+call reversed — bullish became bearish or vice versa, the strongest
+form of "this agent's direction mattered"), and "threshold_crossing"
+(everything else that changed — e.g. enter_long <-> no_trade — the
+weighted score moved across just one boundary without reversing sign).
+Each ablation entry also reports conflict_flags_changed_count (how
+often removing the agent also changed which conflict/timing flags
+fired — relevant mainly for news, since analysis_news_conflict can
+only exist when both are present) and avg_abs_score_delta_when_changed/
+_when_unchanged (the raw magnitude of score movement either way, since
+even a decision that didn't change categories can still show the
+agent moved the score by a meaningful amount, or an agent that "never
+changed anything" by category can still be shown to have near-zero
+score influence, closing the loop the fourth review specifically named
+open: "Macro غيّر 21% من القرارات قد يعني فقط Macro كان مطلوبًا
+لإكمال النصاب"). transitions (the raw {original}->{replayed} decision
+pair counts, unchanged since Tier 3.16) is kept alongside the new
+category breakdown, not replaced by it — this is additive detail, not
+a redefinition of any existing field.
 """
 
 from app.coordinator import DIRECTIONAL_AGENTS, WEIGHTS
@@ -139,17 +182,72 @@ def _ablate_agent(candidate: dict, agent: str) -> dict:
     }
 
 
-def _ablation_summary(replay_results: list[dict], agent_present_count: int) -> dict:
-    changed = [r for r in replay_results if r["changed"]]
-    transitions: dict[str, int] = {}
-    for r in changed:
-        key = f"{r['original']['decision']} -> {r['replayed']['decision']}"
-        transitions[key] = transitions.get(key, 0) + 1
+def _classify_ablation_change(original_conflict_flags: list[str], replay_result: dict) -> dict:
+    """Tier 3.21: turns one replay_candidate() result into a single
+    classified row — see the module docstring's Tier 3.21 paragraph
+    for the full category definitions. original_conflict_flags is
+    passed in separately (not read off replay_result["original"])
+    because replay_candidate()'s "original" sub-dict is a deliberately
+    trimmed subset (decision/direction/score/threshold/config_version
+    only) — the real original conflict_flags live on the candidate's
+    own persisted decision."""
+    original = replay_result["original"]
+    replayed = replay_result["replayed"]
+    changed = replay_result["changed"]
+    original_decision = original.get("decision")
+    replayed_decision = replayed.get("decision")
+
+    category = None
+    if changed:
+        if replayed_decision == "insufficient_data":
+            category = "to_insufficient_data"
+        elif (
+            original_decision in _DIRECTIONAL_DECISIONS
+            and replayed_decision in _DIRECTIONAL_DECISIONS
+            and original.get("direction") != replayed.get("direction")
+        ):
+            category = "direction_flipped"
+        else:
+            category = "threshold_crossing"
+
+    original_score = original.get("score") or 0.0
+    replayed_score = replayed.get("score") or 0.0
+
     return {
-        "candidates_considered": len(replay_results),
+        "changed": changed,
+        "category": category,
+        "original_decision": original_decision,
+        "replayed_decision": replayed_decision,
+        "score_delta": round(replayed_score - original_score, 2),
+        "conflict_flags_changed": sorted(original_conflict_flags or []) != sorted(replayed.get("conflict_flags") or []),
+    }
+
+
+def _ablation_summary(classified: list[dict], agent_present_count: int) -> dict:
+    changed = [c for c in classified if c["changed"]]
+    unchanged = [c for c in classified if not c["changed"]]
+
+    transitions: dict[str, int] = {}
+    categories: dict[str, int] = {}
+    for c in changed:
+        key = f"{c['original_decision']} -> {c['replayed_decision']}"
+        transitions[key] = transitions.get(key, 0) + 1
+        categories[c["category"]] = categories.get(c["category"], 0) + 1
+
+    def _avg_abs_score_delta(rows: list[dict]) -> float | None:
+        if not rows:
+            return None
+        return round(sum(abs(r["score_delta"]) for r in rows) / len(rows), 2)
+
+    return {
+        "candidates_considered": len(classified),
         "agent_present_count": agent_present_count,
         "decision_changed": len(changed),
-        "decision_unchanged": len(replay_results) - len(changed),
+        "decision_unchanged": len(unchanged),
+        "decision_changed_by_category": categories,
+        "conflict_flags_changed_count": sum(1 for c in classified if c["conflict_flags_changed"]),
+        "avg_abs_score_delta_when_changed": _avg_abs_score_delta(changed),
+        "avg_abs_score_delta_when_unchanged": _avg_abs_score_delta(unchanged),
         "transitions": transitions,
     }
 
@@ -176,7 +274,18 @@ def compute_coordinator_divergence_report(candidates: list[dict]) -> dict:
       measure of whether that agent's presence changes outcomes, not
       just how often it agrees with Analysis. agent_present_count says
       how many candidates actually had that agent's opinion to remove;
-      decision_changed can never exceed it."""
+      decision_changed can never exceed it. Tier 3.21:
+      decision_changed_by_category splits every change into
+      to_insufficient_data (a quorum/availability effect — removing
+      this agent alone dropped available evidence below the gate) vs
+      direction_flipped (the call reversed bullish<->bearish) vs
+      threshold_crossing (the score moved across one boundary without
+      reversing) — see module docstring for why this separation
+      matters. conflict_flags_changed_count and avg_abs_score_delta_
+      when_changed/_when_unchanged give the raw magnitude of an
+      agent's influence even on candidates whose decision category
+      didn't change. transitions (the raw {original}->{replayed}
+      decision pairs) is unchanged since Tier 3.16."""
     cross_tab: dict[str, dict[str, int]] = {}
     named_categories: dict[str, int] = {}
 
@@ -239,15 +348,18 @@ def compute_coordinator_divergence_report(candidates: list[dict]) -> dict:
 
     ablation = {}
     for agent in sorted(DIRECTIONAL_AGENTS):
-        replay_results = [
-            replay_candidate(_ablate_agent(candidate, agent), weights=WEIGHTS)
+        classified = [
+            _classify_ablation_change(
+                (candidate.get("decision") or {}).get("conflict_flags") or [],
+                replay_candidate(_ablate_agent(candidate, agent), weights=WEIGHTS),
+            )
             for candidate in candidates
         ]
         agent_present_count = sum(
             1 for c in candidates
             if agent in ((c.get("decision") or {}).get("opinions_used") or {})
         )
-        ablation[f"{agent}_removed"] = _ablation_summary(replay_results, agent_present_count)
+        ablation[f"{agent}_removed"] = _ablation_summary(classified, agent_present_count)
 
     return {
         "candidates_considered": len(candidates),

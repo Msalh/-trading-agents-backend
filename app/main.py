@@ -732,6 +732,27 @@ New `experiments` table. Entirely additive: no existing endpoint's
 behavior changes, COORDINATOR_THRESHOLD/WEIGHTS only read and
 snapshotted, never modified, no LLM calls.
 
+Tier 3.21 (ablation reclassification, fourth external review,
+2026-08-18): Tier 3.17's fixed raw ablation percentages (82%/47%/21%
+for analysis/news/macro) still conflate a "quorum" effect — removing
+an agent alone dropping available evidence below MIN_AVAILABLE_WEIGHT,
+which says nothing about whether that agent's DIRECTION mattered —
+with a genuine directional-influence effect. app/coordinator_
+diagnostics._classify_ablation_change() now splits every ablation-
+caused change into to_insufficient_data / direction_flipped /
+threshold_crossing, and each ablation entry additionally reports
+conflict_flags_changed_count and avg_abs_score_delta_when_changed/
+_when_unchanged. transitions (raw {original}->{replayed} pairs) is
+unchanged since Tier 3.16 — this is additive detail, not a
+redefinition. Notable finding surfaced while building this: under the
+LIVE weights/threshold/min_available_weight, direction_flipped turns
+out to be mathematically unreachable for any single agent's ablation
+— removing one agent's raw contribution alone is never enough to both
+let the original cross +threshold and flip the post-ablation score
+past -threshold, worked through the renormalized-denominator algebra
+for each of the three agents. Read-only, offline, no LLM calls,
+COORDINATOR_THRESHOLD/WEIGHTS untouched.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -1902,6 +1923,22 @@ def candidates_history_coordinator_divergence(
     zeroing its weight keeps directional_weight_total at its normal
     live value, so a candidate where the agent was never present is
     now correctly a no-op.
+
+    Tier 3.21 (ablation reclassification): the surviving raw
+    decision_changed percentages still conflate a "quorum" effect
+    (removing this agent alone dropped available evidence below
+    MIN_AVAILABLE_WEIGHT — says nothing about whether the agent's
+    DIRECTION mattered) with a real directional-influence effect
+    (the weighted score moved enough to cross the threshold among
+    candidates that stayed data-sufficient either way). Each entry's
+    `decision_changed_by_category` splits every change into exactly
+    one of `to_insufficient_data`, `direction_flipped` (the call
+    reversed bullish<->bearish), or `threshold_crossing` (moved across
+    one boundary without reversing). `conflict_flags_changed_count`
+    and `avg_abs_score_delta_when_changed`/`_when_unchanged` add the
+    raw magnitude of an agent's influence even where the category
+    didn't change. `transitions` (raw {original}->{replayed} decision
+    pairs) is unchanged since Tier 3.16.
 
     Entirely offline: no LLM calls, no new candidates, no trades.
     COORDINATOR_THRESHOLD and the live WEIGHTS config are untouched —
