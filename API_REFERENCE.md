@@ -580,18 +580,38 @@ produced," unchanged in shape from before this tier.
 
 ---
 
-## Replay / versioning (Tier 2.5) — read-only, no secret needed
+## Replay / versioning (Tier 2.5, extended Tier 3.24) — read-only, no secret needed
 
-`COORDINATOR_THRESHOLD`, the four agent weights, and
-`MIN_AVAILABLE_WEIGHT` have all changed via env vars over the
-project's life; every `CoordinatorDecision` now carries a
-`config_version` field (`{"weights": {...}, "threshold": ...,
-"min_available_weight": ...}`) recording exactly which config
-produced it. Replay re-scores a trade candidate's already-frozen
-`opinions_used`/`missing_agents`/`stale_agents` (Tier 2.1) against
-either the current live config or an explicit hypothetical override —
-entirely offline, no new market data, no LLM calls, and it never
-mutates the original candidate or opens a trade.
+`COORDINATOR_THRESHOLD`, the four agent weights, `MIN_AVAILABLE_WEIGHT`,
+and (Tier 3.24) `ANALYSIS_REQUIRED` have all changed or been added via
+env vars over the project's life; every `CoordinatorDecision` now
+carries a `config_version` field (`{"weights": {...}, "threshold": ...,
+"min_available_weight": ..., "analysis_required": ...}`) recording
+exactly which config produced it. Replay re-scores a trade candidate's
+already-frozen `opinions_used`/`missing_agents`/`stale_agents`
+(Tier 2.1) against either the current live config or an explicit
+hypothetical override — entirely offline, no new market data, no LLM
+calls, and it never mutates the original candidate or opens a trade.
+
+**Tier 3.24 (`analysis_required`, project-owner design decision, not
+data-driven).** Tier 3.21 proved algebraically that under the live
+weights, Analysis being unavailable *always* fails the
+`MIN_AVAILABLE_WEIGHT` quorum check on its own — Analysis was already
+"load-bearing" as an emergent side-effect of the weights/threshold
+math, not a named rule. The fifth external review flagged this as an
+open question data alone couldn't resolve: is that intentional, or an
+accident of tunable weights? The project owner's answer: make it
+explicit. `ANALYSIS_REQUIRED` (default `true`) is a new gate in
+`_score_opinions()`, checked *before* the quorum math and independent
+of it — "no directional decision without a current (non-missing,
+non-stale) Analysis opinion." Scoped narrowly, by the owner's explicit
+choice: it checks Analysis's mere presence, not its direction — a
+present-but-neutral Analysis opinion still passes, exactly as it did
+before this tier. Changes no decision computed today, live or
+replayed; it hardens an already-true guarantee against being silently
+broken by a future weights/`min_available_weight` retune that might
+otherwise let News+Macro clear quorum without Analysis ever being
+consulted.
 
 Since Tier 2.8, replaying a candidate uses the *current* scoring
 engine (Timing excluded from `MIN_AVAILABLE_WEIGHT`/the weighted
@@ -607,12 +627,13 @@ you'd audit how many historical decisions the fix would have changed.
 `{"analysis":0.5,"news":0.2,"timing":0.2,"macro":0.1}` — an agent
 omitted from it is scored as weight 0, a valid way to ask "what if
 this agent didn't count at all." `threshold` / `min_available_weight`
-are plain numbers. Any of the three left out falls back to the
-CURRENT live value (not the candidate's original config) — asking
-"what would this decide under today's threshold but the original
-weights" is a valid, distinct question from either extreme.
+are plain numbers, `analysis_required` (Tier 3.24) is a plain boolean.
+Any of the four left out falls back to the CURRENT live value (not the
+candidate's original config) — asking "what would this decide under
+today's threshold but the original weights" is a valid, distinct
+question from either extreme.
 
-### `GET /candidates/{candidate_id}/replay?weights=...&threshold=...&min_available_weight=...&include_outcome=false&horizons=15,30,60`
+### `GET /candidates/{candidate_id}/replay?weights=...&threshold=...&min_available_weight=...&analysis_required=...&include_outcome=false&horizons=15,30,60`
 Single-candidate replay. Returns:
 ```json
 {
@@ -633,14 +654,14 @@ directional (nothing to evaluate for `no_trade`/`insufficient_data`)
 — it's the Sprint 14 horizon price-direction estimate, never a real
 trade; replay never opens one. 404 if `candidate_id` doesn't exist.
 
-### `GET /candidates/history/replay?symbol=MNQ1!&timeframe=5m&limit=50&only_changed=false&weights=...&threshold=...&min_available_weight=...`
+### `GET /candidates/history/replay?symbol=MNQ1!&timeframe=5m&limit=50&only_changed=false&weights=...&threshold=...&min_available_weight=...&analysis_required=...`
 Bulk version over recent candidate history (same ordering as
 `/candidates/history`, newest first) — a list of the objects above.
 `only_changed=true` filters to candidates whose replayed decision
 differs from what actually happened, the ones worth reading when
 tuning a config change.
 
-### `GET /candidates/history/replay/summary?symbol=MNQ1!&timeframe=5m&limit=100&weights=...&threshold=...&min_available_weight=...`
+### `GET /candidates/history/replay/summary?symbol=MNQ1!&timeframe=5m&limit=100&weights=...&threshold=...&min_available_weight=...&analysis_required=...`
 Aggregated transition counts:
 ```json
 {"total_candidates": 100, "changed": 7, "unchanged": 93,
@@ -650,7 +671,7 @@ The at-a-glance answer to "if `COORDINATOR_THRESHOLD` had been 35
 this whole time, how many of the last 100 decisions would have
 flipped?" before reading individual replayed candidates.
 
-### `GET /candidates/history/replay/threshold-sweep?symbol=MNQ1!&timeframe=5m&thresholds=15,20,25,30,35,40&limit=100&horizons=15,30,60&weights=...&min_available_weight=...`
+### `GET /candidates/history/replay/threshold-sweep?symbol=MNQ1!&timeframe=5m&thresholds=15,20,25,30,35,40&limit=100&horizons=15,30,60&weights=...&min_available_weight=...&analysis_required=...`
 Tier 3.4 (`COORDINATOR_THRESHOLD` tuning) — the actual tuning tool:
 sweeps `thresholds` (required, comma-separated) across every recent
 candidate's frozen opinions (offline re-score, no LLM calls, same
@@ -662,15 +683,16 @@ accuracy into a compact per-threshold summary:
   "symbol": "MNQ1!", "timeframe": "5m", "candidates_considered": 54,
   "weights_held_fixed": {"analysis": 0.4, "news": 0.25, "timing": 0.2, "macro": 0.15},
   "min_available_weight_held_fixed": 0.6,
+  "analysis_required_held_fixed": true,
   "sweep": {
     "15": {"directional_candidates": 40, "by_horizon_minutes": {"15": {"correct": 12, "incorrect": 28, "flat": 0, "pending": 0, "no_data": 0, "accuracy": 0.3}}},
     "35": {"directional_candidates": 9,  "by_horizon_minutes": {"15": {"correct": 6,  "incorrect": 3,  "flat": 0, "pending": 0, "no_data": 0, "accuracy": 0.667}}}
   }
 }
 ```
-`weights`/`min_available_weight` are held FIXED across the whole
-sweep — only `threshold` varies, so any accuracy shift is
-attributable to threshold alone. Same caveat as `include_outcome`
+`weights`/`min_available_weight`/`analysis_required` are held FIXED
+across the whole sweep — only `threshold` varies, so any accuracy
+shift is attributable to threshold alone. Same caveat as `include_outcome`
 above: this is the hypothetical horizon price-direction estimate, not
 a real backtest — a replayed decision under a hypothetical threshold
 was never actually filled/sized/executed, so there's no real P&L to
@@ -1164,6 +1186,7 @@ praised the pre-registration IDEA but found the EXECUTION incomplete —
     "coordinator_threshold": 25.0,
     "weights": {"analysis": 0.4, "news": 0.25, "timing": 0.2, "macro": 0.15},
     "min_available_weight": 0.6,
+    "analysis_required": true,
     "backtest_geometry": {
       "atr_stop_mult": 1.5, "atr_target_mult": 2.5, "expiry_bars": 24,
       "non_overlapping": true, "slippage_points": 0.25,
@@ -1185,6 +1208,13 @@ praised the pre-registration IDEA but found the EXECUTION incomplete —
 `locked_config` snapshots the CURRENT live scoring config AND backtest
 geometry at registration — read-only, never mutates them, and never
 changes even if the live values are later edited.
+`analysis_required` (Tier 3.24) is a fifth locked, ENFORCED scoring
+knob alongside `coordinator_threshold`/`weights`/`min_available_weight`
+— see the Coordinator/replay sections above for what it gates.
+Experiments registered before Tier 3.24 have no `analysis_required` key
+in their stored `locked_config`; re-scoring defaults a missing key to
+`true` (the only value it has ever actually had live), never to
+`false`.
 `registered_watermark_rowid` is the real no-peeking boundary (see
 point 4 above); `registered_at` is kept for display/audit only.
 `stopping_rule` accepts `min_distinct_trading_days` and/or
@@ -1657,6 +1687,7 @@ agent in this larger sample.
 | `MACRO_SYMBOL` | no | (= `NEWS_SYMBOL`) | |
 | `MACRO_INTERVAL_MINUTES` | no | `20` | |
 | `COORDINATOR_THRESHOLD` | no | `25` | placeholder — needs tuning against real history |
+| `ANALYSIS_REQUIRED` | no | `true` | Tier 3.24: explicit "no directional decision without a current Analysis opinion" gate — a project-owner design decision, not data-driven; see the Replay/versioning section above |
 | `ACCOUNT_BALANCE` | no | `50000` | static/manual, Sprint 7 |
 | `MAX_DRAWDOWN` | no | `2000` | |
 | `CURRENT_DRAWDOWN_USED` | no | `0` | Tier 2.10: fallback only — normally superseded by the live peak-to-trough figure computed from real closed paper trades |

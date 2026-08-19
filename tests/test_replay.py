@@ -123,6 +123,80 @@ def test_replay_with_hypothetical_weights_can_flip_decision(fresh_env):
     assert result["replayed"]["config_version"]["weights"] == {"analysis": 1.0}
 
 
+# --- Tier 3.24 (analysis_required threaded through replay) --------------
+
+
+def test_replay_analysis_required_blocks_news_macro_only_hypothetical(fresh_env):
+    """The same guarantee replay's other three axes already get: a
+    hypothetical weights/min_available_weight config that would
+    otherwise let News+Macro clear quorum without Analysis is still
+    blocked by analysis_required=True (the live default) — proven by
+    first showing analysis_required=False DOES flip it, then showing
+    the live default doesn't."""
+    storage, coordinator, candidates, outcomes, replay = fresh_env
+    storage.save_opinion("news", "TEST", "global", "t1", _opinion("bullish", 90))
+    storage.save_opinion("macro", "TEST", "global", "t1", _opinion("bullish", 90))
+    candidate = candidates.create_candidate(symbol="TEST", timeframe="5m")
+    assert candidate["decision"]["decision"] == "insufficient_data"
+
+    hypothetical_weights = {"news": 0.25, "macro": 0.15}
+
+    without_gate = replay.replay_candidate(
+        candidate, weights=hypothetical_weights, threshold=10.0,
+        min_available_weight=0.3, analysis_required=False,
+    )
+    assert without_gate["replayed"]["decision"] == "enter_long"
+
+    with_gate = replay.replay_candidate(
+        candidate, weights=hypothetical_weights, threshold=10.0,
+        min_available_weight=0.3, analysis_required=True,
+    )
+    assert with_gate["replayed"]["decision"] == "insufficient_data"
+    assert with_gate["replayed"]["config_version"]["analysis_required"] is True
+
+
+def test_replay_analysis_required_omitted_falls_back_to_live_default(fresh_env):
+    """analysis_required=None (the default, matching every other
+    replay override) means "use live ANALYSIS_REQUIRED" — proven by
+    the field appearing in the replayed config_version even when the
+    caller never mentioned it."""
+    storage, coordinator, candidates, outcomes, replay = fresh_env
+    storage.save_opinion("analysis", "TEST", "5m", "t1", _opinion("bullish", 80))
+    candidate = candidates.create_candidate(symbol="TEST", timeframe="5m")
+
+    result = replay.replay_candidate(candidate)
+    assert result["replayed"]["config_version"]["analysis_required"] == coordinator.ANALYSIS_REQUIRED
+
+
+def test_replay_candidates_for_symbol_threads_analysis_required(fresh_env):
+    storage, coordinator, candidates, outcomes, replay = fresh_env
+    storage.save_opinion("news", "TEST", "global", "t1", _opinion("bullish", 90))
+    storage.save_opinion("macro", "TEST", "global", "t1", _opinion("bullish", 90))
+    candidates.create_candidate(symbol="TEST", timeframe="5m")
+
+    results = replay.replay_candidates_for_symbol(
+        symbol="TEST", timeframe="5m", limit=10,
+        weights={"news": 0.25, "macro": 0.15}, threshold=10.0,
+        min_available_weight=0.3, analysis_required=False,
+    )
+    assert results[0]["replayed"]["decision"] == "enter_long"
+
+
+def test_sweep_thresholds_reports_analysis_required_held_fixed(fresh_env):
+    storage, coordinator, candidates, outcomes, replay = fresh_env
+    decision_time = datetime.now(timezone.utc) - timedelta(minutes=30)
+    decision, candidate_id = _directional_candidate("c1", decision_time)
+    storage.save_candidate(candidate_id=candidate_id, symbol="TEST", timeframe="5m", bar=None, decision=decision)
+
+    result = replay.sweep_thresholds("TEST", "5m", thresholds=[25.0], limit=10, horizons=[15])
+    assert result["analysis_required_held_fixed"] == coordinator.ANALYSIS_REQUIRED
+
+    result_override = replay.sweep_thresholds(
+        "TEST", "5m", thresholds=[25.0], limit=10, horizons=[15], analysis_required=False,
+    )
+    assert result_override["analysis_required_held_fixed"] is False
+
+
 def test_replay_does_not_mutate_original_candidate(fresh_env):
     storage, coordinator, candidates, outcomes, replay = fresh_env
     storage.save_opinion("analysis", "TEST", "5m", "t1", _opinion("bullish", 90))

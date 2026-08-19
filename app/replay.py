@@ -38,10 +38,22 @@ Candidates created before this tier has no config_version recorded
 surfaced as None to the caller rather than an empty dict pretending
 to be a real answer, so it's never confused with a config that was
 deliberately empty.
+
+Tier 3.24 added analysis_required as a fourth hypothetical-override
+axis alongside weights/threshold/min_available_weight, everywhere
+those three already appear (replay_candidate, replay_candidates_for_
+symbol, sweep_thresholds) — same "None means use the live value"
+convention. See coordinator.ANALYSIS_REQUIRED for what it gates.
 """
 
 from app.candidates import get_candidate_history
-from app.coordinator import DECISION_THRESHOLD, MIN_AVAILABLE_WEIGHT, WEIGHTS, _score_opinions
+from app.coordinator import (
+    ANALYSIS_REQUIRED,
+    DECISION_THRESHOLD,
+    MIN_AVAILABLE_WEIGHT,
+    WEIGHTS,
+    _score_opinions,
+)
 from app.outcomes import HORIZON_MINUTES_DEFAULT, compute_outcomes_for_decision
 
 _DIRECTIONAL_DECISIONS = ("enter_long", "enter_short")
@@ -52,15 +64,17 @@ def replay_candidate(
     weights: dict = None,
     threshold: float = None,
     min_available_weight: float = None,
+    analysis_required: bool = None,
     include_outcome: bool = False,
     outcome_horizons: list[int] = None,
 ) -> dict:
     """Re-scores one candidate's frozen opinions_used under a config —
     live config by default, or an explicit hypothetical override for
-    any of weights/threshold/min_available_weight (omitted fields fall
-    back to the current live value, not the original candidate's
-    config, since "what would this decide under today's threshold but
-    the original weights" is also a valid question to ask).
+    any of weights/threshold/min_available_weight/analysis_required
+    (omitted fields fall back to the current live value, not the
+    original candidate's config, since "what would this decide under
+    today's threshold but the original weights" is also a valid
+    question to ask).
 
     include_outcome=True additionally computes the ORIGINAL Sprint 14
     hypothetical horizon estimate (price-direction only, not a real
@@ -79,6 +93,7 @@ def replay_candidate(
     use_weights = weights if weights is not None else WEIGHTS
     use_threshold = threshold if threshold is not None else DECISION_THRESHOLD
     use_min_weight = min_available_weight if min_available_weight is not None else MIN_AVAILABLE_WEIGHT
+    use_analysis_required = analysis_required if analysis_required is not None else ANALYSIS_REQUIRED
 
     replayed = _score_opinions(
         symbol=candidate["symbol"],
@@ -89,6 +104,7 @@ def replay_candidate(
         weights=use_weights,
         threshold=use_threshold,
         min_available_weight=use_min_weight,
+        analysis_required=use_analysis_required,
     ).to_dict()
 
     result = {
@@ -124,6 +140,7 @@ def replay_candidates_for_symbol(
     weights: dict = None,
     threshold: float = None,
     min_available_weight: float = None,
+    analysis_required: bool = None,
     limit: int = 50,
     only_changed: bool = False,
     include_outcome: bool = False,
@@ -141,6 +158,7 @@ def replay_candidates_for_symbol(
             weights=weights,
             threshold=threshold,
             min_available_weight=min_available_weight,
+            analysis_required=analysis_required,
             include_outcome=include_outcome,
             outcome_horizons=outcome_horizons,
         )
@@ -206,6 +224,7 @@ def sweep_thresholds(
     limit: int = 100,
     weights: dict = None,
     min_available_weight: float = None,
+    analysis_required: bool = None,
     horizons: list[int] = None,
 ) -> dict:
     """Tier 3.4 (COORDINATOR_THRESHOLD tuning) — the actual tool for
@@ -247,6 +266,7 @@ def sweep_thresholds(
                 weights=weights,
                 threshold=threshold,
                 min_available_weight=min_available_weight,
+                analysis_required=analysis_required,
                 include_outcome=True,
                 outcome_horizons=horizons,
             )
@@ -261,6 +281,9 @@ def sweep_thresholds(
         "weights_held_fixed": weights if weights is not None else WEIGHTS,
         "min_available_weight_held_fixed": (
             min_available_weight if min_available_weight is not None else MIN_AVAILABLE_WEIGHT
+        ),
+        "analysis_required_held_fixed": (
+            analysis_required if analysis_required is not None else ANALYSIS_REQUIRED
         ),
         "sweep": sweep,
     }

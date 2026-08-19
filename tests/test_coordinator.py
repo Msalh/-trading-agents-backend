@@ -197,9 +197,16 @@ def test_stale_opinion_excluded_like_missing(fresh_storage, monkeypatch):
     agent never ran — not used in the score, and reported separately
     from a genuinely-missing agent. Min-weight lowered here so this
     test isolates the staleness behavior specifically, independent of
-    the separate min-available-weight safeguard tested above."""
+    the separate min-available-weight safeguard tested above.
+    ANALYSIS_REQUIRED also disabled here (Tier 3.24) — analysis being
+    stale means it's excluded from opinions exactly like missing, which
+    the analysis_required gate would otherwise force to
+    insufficient_data before this test ever reaches the quorum math it
+    means to isolate; that gate's own behavior is covered separately in
+    test_analysis_required_gate_* below."""
     storage, coordinator = fresh_storage
     monkeypatch.setenv("MIN_AVAILABLE_WEIGHT", "0.2")
+    monkeypatch.setenv("ANALYSIS_REQUIRED", "false")
     importlib.reload(coordinator)
 
     stale_ts = _minutes_ago_iso(999)  # far older than ANALYSIS_MAX_AGE_MINUTES (15)
@@ -609,3 +616,134 @@ def test_compute_decision_without_anchors_falls_back_to_latest(fresh_storage):
     decision = coordinator.compute_decision(symbol="TEST", timeframe="5m")
     assert decision.decision == "enter_long"
     assert "timing" not in decision.opinions_used  # no bar in storage, as before
+
+
+# --- Tier 3.24 (analysis_required explicit gate, project-owner design
+# decision — fifth external review's open question, resolved by the
+# owner, not by data) -----------------------------------------------------
+
+
+def test_analysis_required_defaults_true_and_is_recorded_in_config_version(fresh_storage):
+    """ANALYSIS_REQUIRED defaults to True (no env var set), and every
+    decision now records it in config_version alongside
+    weights/threshold/min_available_weight, live or not."""
+    storage, coordinator = fresh_storage
+    assert coordinator.ANALYSIS_REQUIRED is True
+    storage.save_opinion("analysis", "TEST", "5m", "t1", _opinion("bullish", 80))
+    decision = coordinator.compute_decision(symbol="TEST", timeframe="5m")
+    assert decision.config_version["analysis_required"] is True
+
+
+def test_analysis_required_blocks_news_macro_only_decision_even_under_hypothetical_quorum(fresh_storage):
+    """THE regression test for the exact scenario Tier 3.24 exists to
+    prevent: under a hypothetical weights/min_available_weight config
+    where News+Macro alone could clear quorum WITHOUT Analysis (not
+    true under the live weights today, per Tier 3.21's proof, but
+    could become true after a future retune), analysis_required=True
+    must still force insufficient_data — independent of, and checked
+    before, the quorum math."""
+    storage, coordinator = fresh_storage
+    storage.save_opinion("news", "TEST", "global", "t1", _opinion("bullish", 90))
+    storage.save_opinion("macro", "TEST", "global", "t1", _opinion("bullish", 90))
+    # deliberately no analysis opinion saved at all -- missing, not stale
+    opinions, missing, stale = coordinator._gather_opinions(symbol="TEST", timeframe="5m")
+    assert "analysis" in missing
+    assert "analysis" not in opinions
+
+    # Hypothetical config: news+macro alone (40% combined) easily clears
+    # a lowered 30% minimum -- would be "enter_long" if analysis_required
+    # weren't checked first.
+    hypothetical_weights = {"news": 0.25, "macro": 0.15}
+    without_gate = coordinator._score_opinions(
+        symbol="TEST", timeframe="5m",
+        opinions=opinions, missing_agents=missing, stale_agents=stale,
+        weights=hypothetical_weights, threshold=10.0, min_available_weight=0.3,
+        analysis_required=False,
+    )
+    assert without_gate.decision == "enter_long"  # proves the hypothetical quorum really would pass
+
+    with_gate = coordinator._score_opinions(
+        symbol="TEST", timeframe="5m",
+        opinions=opinions, missing_agents=missing, stale_agents=stale,
+        weights=hypothetical_weights, threshold=10.0, min_available_weight=0.3,
+        analysis_required=True,
+    )
+    assert with_gate.decision == "insufficient_data"
+    assert with_gate.score == 0.0
+    assert "analysis_required=True" in with_gate.summary
+    assert with_gate.config_version["analysis_required"] is True
+
+
+def test_analysis_required_is_a_no_op_under_the_live_config(fresh_storage):
+    """Confirms the claim made when this was proposed: under the REAL
+    live weights/threshold/min_available_weight, adding the explicit
+    gate changes no decision that the quorum math didn't already
+    produce on its own -- analysis-missing already meant
+    insufficient_data before Tier 3.24, and still does, for the same
+    end result (though now via an explicit, documented rule instead of
+    an accident of the weights)."""
+    storage, coordinator = fresh_storage
+    storage.save_opinion("news", "TEST", "global", "t1", _opinion("bullish", 90))
+    storage.save_opinion("macro", "TEST", "global", "t1", _opinion("bullish", 90))
+    # no analysis opinion -- live MIN_AVAILABLE_WEIGHT=0.6 already fails
+    # quorum for news+macro alone (40% of the 80%-wide directional pool)
+
+    with_gate = coordinator.compute_decision(symbol="TEST", timeframe="5m")
+    assert with_gate.decision == "insufficient_data"
+
+    opinions, missing, stale = coordinator._gather_opinions(symbol="TEST", timeframe="5m")
+    without_gate = coordinator._score_opinions(
+        symbol="TEST", timeframe="5m",
+        opinions=opinions, missing_agents=missing, stale_agents=stale,
+        weights=coordinator.WEIGHTS, threshold=coordinator.DECISION_THRESHOLD,
+        min_available_weight=coordinator.MIN_AVAILABLE_WEIGHT, analysis_required=False,
+    )
+    assert without_gate.decision == "insufficient_data"  # same outcome either way, live config
+
+
+def test_analysis_required_does_not_block_present_but_neutral_analysis(fresh_storage):
+    """Scoped narrowly on purpose (the project owner's explicit choice):
+    the gate checks Analysis's mere PRESENCE, not its direction. A
+    present-but-neutral Analysis opinion still satisfies it -- News
+    alone can still swing the decision, exactly as it could before
+    Tier 3.24, since this isn't a "must be directional" gate."""
+    storage, coordinator = fresh_storage
+    storage.save_opinion("analysis", "TEST", "5m", "t1", _opinion("neutral", 50))
+    storage.save_opinion("news", "TEST", "global", "t1", _opinion("bullish", 90))
+    storage.save_opinion("macro", "TEST", "global", "t1", _opinion("bullish", 90))
+
+    decision = coordinator.compute_decision(symbol="TEST", timeframe="5m")
+
+    assert "analysis" in decision.opinions_used  # present, just neutral
+    assert decision.decision != "insufficient_data"  # gate did not block it
+
+
+def test_analysis_required_false_via_env_falls_back_to_quorum_only(fresh_storage, monkeypatch):
+    """ANALYSIS_REQUIRED=false (env override) restores the pre-Tier-3.24
+    quorum-only behavior for compute_decision(), not just for direct
+    _score_opinions() callers.
+
+    Explicitly reloads coordinator back to a clean-env state before
+    returning (rather than relying on monkeypatch's automatic env-var
+    teardown, which does NOT re-run importlib.reload) -- other test
+    modules (e.g. test_experiments.py, which imports several names
+    directly out of app.coordinator at its own reload time) would
+    otherwise silently inherit this test's mutated MIN_AVAILABLE_WEIGHT/
+    ANALYSIS_REQUIRED if this happened to be the last test in this file
+    to touch coordinator's module state."""
+    storage, coordinator = fresh_storage
+    monkeypatch.setenv("ANALYSIS_REQUIRED", "false")
+    monkeypatch.setenv("MIN_AVAILABLE_WEIGHT", "0.3")
+    importlib.reload(coordinator)
+    assert coordinator.ANALYSIS_REQUIRED is False
+
+    storage.save_opinion("news", "TEST", "global", "t1", _opinion("bullish", 90))
+    storage.save_opinion("macro", "TEST", "global", "t1", _opinion("bullish", 90))
+    decision = coordinator.compute_decision(symbol="TEST", timeframe="5m")
+
+    assert decision.decision == "enter_long"  # news+macro (40%) clears the lowered 30% minimum
+    assert decision.config_version["analysis_required"] is False
+
+    monkeypatch.delenv("ANALYSIS_REQUIRED", raising=False)
+    monkeypatch.delenv("MIN_AVAILABLE_WEIGHT", raising=False)
+    importlib.reload(coordinator)

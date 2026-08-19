@@ -1,6 +1,7 @@
 """
 Experiment Registry — Tier 3.20 (fourth external review, 2026-08-18),
-hardened in Tier 3.23 (fifth external review, 2026-08-19).
+hardened in Tier 3.23 (fifth external review, 2026-08-19), extended in
+Tier 3.24 (analysis_required, project-owner design decision, 2026-08-19).
 
 Every finding this project has produced so far (Tiers 3.10-3.19) has
 been RETROSPECTIVE: run a report against whatever candidates already
@@ -102,6 +103,15 @@ Lifecycle, unchanged in shape from Tier 3.20:
      stopping rule isn't met. If already resolved, returns the
      existing resolution untouched.
 
+Tier 3.24: coordinator.ANALYSIS_REQUIRED (explicit "no trade without a
+current Analysis opinion" gate, a project-owner design decision, not
+data-driven) is now a fifth locked scoring knob in locked_config,
+enforced at re-scoring time exactly like coordinator_threshold/weights/
+min_available_weight — see coordinator.py's Tier 3.24 docstring section
+for the full reasoning. Experiments registered before this tier default
+to analysis_required=True on read (the only value it has ever actually
+had live), not silently to False.
+
 Entirely additive: no existing endpoint's behavior changes for anyone
 not using experiments, no COORDINATOR_THRESHOLD/WEIGHTS touched (only
 read and snapshotted), no LLM calls. Table: app.storage `experiments`.
@@ -120,7 +130,7 @@ from app.backtest import (
     EXPIRY_BARS,
     compute_backtest_comparison,
 )
-from app.coordinator import DECISION_THRESHOLD, MIN_AVAILABLE_WEIGHT, WEIGHTS
+from app.coordinator import ANALYSIS_REQUIRED, DECISION_THRESHOLD, MIN_AVAILABLE_WEIGHT, WEIGHTS
 from app.paper_trades import COMMISSION_PER_CONTRACT, SLIPPAGE_POINTS
 from app.replay import replay_candidate
 from app.storage import (
@@ -168,11 +178,22 @@ def _current_locked_config() -> dict:
     underlying module-level values themselves. See the module
     docstring's point (b) for which of these are actually enforced at
     evaluation/resolution time (scoring + pure-geometry knobs) versus
-    only drift-checked (slippage/commission/logic version)."""
+    only drift-checked (slippage/commission/logic version).
+
+    Tier 3.24: analysis_required joins coordinator_threshold/weights/
+    min_available_weight as a fourth locked, ENFORCED scoring knob
+    (threaded into _rescore_under_locked_config's replay_candidate call
+    below) -- see coordinator.ANALYSIS_REQUIRED for what it gates.
+    Experiments registered before Tier 3.24 have no this key in their
+    stored locked_config; _rescore_under_locked_config below defaults
+    that case to True, which is the only value ANALYSIS_REQUIRED has
+    ever actually had in production, so this is a safe backfill, not a
+    guess."""
     return {
         "coordinator_threshold": DECISION_THRESHOLD,
         "weights": dict(WEIGHTS),
         "min_available_weight": MIN_AVAILABLE_WEIGHT,
+        "analysis_required": ANALYSIS_REQUIRED,
         "backtest_geometry": {
             "atr_stop_mult": ATR_STOP_MULT,
             "atr_target_mult": ATR_TARGET_MULT,
@@ -308,6 +329,10 @@ def _rescore_under_locked_config(candidates: list, experiment: dict) -> list:
             weights=locked["weights"],
             threshold=locked["coordinator_threshold"],
             min_available_weight=locked["min_available_weight"],
+            # Tier 3.24: pre-3.24 experiments' locked_config has no
+            # this key -- True is a backfill, not a guess (see
+            # _current_locked_config's docstring).
+            analysis_required=locked.get("analysis_required", True),
         )
         rescored.append({**candidate, "decision": replayed["replayed"]})
     return rescored

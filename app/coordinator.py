@@ -72,6 +72,21 @@ audit trail, even though Timing isn't part of the weighted score. This
 is what makes a "trade candidate" (see app/candidates.py) an atomic
 snapshot instead of downstream stages re-querying "latest"
 independently and risking a mismatched combination.
+
+Tier 3.24 (fifth external review — explicit project-owner decision):
+Tier 3.21 proved algebraically that, under the live weights, Analysis
+being unavailable ALWAYS fails the MIN_AVAILABLE_WEIGHT quorum check
+on its own — Analysis was already "load-bearing" in practice, just as
+an emergent side-effect of the weights/threshold math rather than a
+named rule. The project owner's explicit, stated design intent is "no
+trade without a current Analysis opinion" — see ANALYSIS_REQUIRED
+below: a separate, explicit gate checked before the quorum math,
+scoped to Analysis's mere PRESENCE (not its direction — a
+present-but-neutral Analysis opinion still passes), so it changes no
+decision computed today but keeps this specific guarantee stable
+against future weight/min_available_weight retuning that might
+otherwise let News+Macro clear quorum without Analysis ever being
+consulted.
 """
 
 import os
@@ -115,6 +130,30 @@ DECISION_THRESHOLD = float(os.environ.get("COORDINATOR_THRESHOLD", "25"))
 # directional call at all. Below this, it's "insufficient_data"
 # regardless of how confident the available agents are.
 MIN_AVAILABLE_WEIGHT = float(os.environ.get("MIN_AVAILABLE_WEIGHT", "0.6"))
+
+# Tier 3.24 (fifth external review — explicit design decision, made by
+# the project owner, not inferred from data): under the live weights,
+# Analysis's absence has always structurally forced insufficient_data
+# on its own (Tier 3.21 PROVED this algebraically — Analysis 40% alone
+# never clears an 80%-wide directional pool at MIN_AVAILABLE_WEIGHT=0.6).
+# That made Analysis "load-bearing" purely as a side-effect of the
+# quorum math, not because any rule said so. The owner's stated
+# philosophy is "no trade without a current Analysis opinion" —
+# ANALYSIS_REQUIRED makes that an explicit, independent gate instead of
+# an accident of tunable weights, so it survives future weight/
+# min_available_weight retuning that might otherwise let News+Macro
+# clear quorum without Analysis ever being consulted. Scoped narrowly
+# on purpose: this checks only that a current (non-missing, non-stale)
+# Analysis opinion exists — NOT that it's directional. A present-but-
+# neutral Analysis opinion still satisfies this gate, exactly as it
+# already does today, since a broader "must be directional" gate would
+# be a real behavior change on live data that hasn't been evaluated,
+# not a hardening of already-proven-true behavior. Default "true"
+# matches current live behavior exactly — registering this constant
+# does not change any decision computed today, live or replayed.
+ANALYSIS_REQUIRED = os.environ.get("ANALYSIS_REQUIRED", "true").strip().lower() not in (
+    "false", "0", "no",
+)
 
 # How old an opinion can be before it's treated as if the agent never
 # ran — separate thresholds since Analysis is bar-driven (every 5min
@@ -277,6 +316,7 @@ def _score_opinions(
     weights: dict,
     threshold: float,
     min_available_weight: float,
+    analysis_required: bool = True,
 ) -> CoordinatorDecision:
     """The actual scoring math — pulled out of compute_decision so it
     can run against ANY opinions/missing/stale snapshot under ANY
@@ -300,12 +340,22 @@ def _score_opinions(
     weight as "available evidence" is exactly the bug this tier fixes.
     Timing's opinion (if present) is still read out separately into
     timing_context and applied as a score dampener/veto — see the
-    module docstring for the full reasoning."""
+    module docstring for the full reasoning.
+
+    Tier 3.24: analysis_required (default True, matching ANALYSIS_REQUIRED)
+    is a SEPARATE, explicit gate checked before the quorum math below —
+    see the ANALYSIS_REQUIRED module constant for the full reasoning.
+    Defaults to True here too (not just at the ANALYSIS_REQUIRED
+    constant) so any direct caller — including every pre-Tier-3.24 test
+    and replay call that doesn't pass this kwarg at all — keeps today's
+    real behavior rather than silently opting into the old
+    quorum-only-with-no-explicit-gate semantics."""
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     config_version = {
         "weights": dict(weights),
         "threshold": threshold,
         "min_available_weight": min_available_weight,
+        "analysis_required": analysis_required,
     }
 
     timing_opinion = opinions.get("timing")
@@ -318,6 +368,40 @@ def _score_opinions(
             "session_label": (timing_opinion.get("key_data") or {}).get("session_label"),
             "flags": timing_flags,
         }
+
+    # Tier 3.24: explicit analysis_required gate, checked BEFORE the
+    # quorum math below and independent of it — deliberately not just
+    # relying on Analysis's absence happening to fail the quorum check
+    # on its own (true today under the live weights, per Tier 3.21's
+    # proof, but that's an accident of tunable weights, not a rule).
+    # Scoped to presence only (opinions["analysis"] exists — i.e. not
+    # missing/stale), not direction: a present-but-neutral Analysis
+    # opinion still satisfies this gate, matching today's real
+    # behavior exactly (see ANALYSIS_REQUIRED's module comment).
+    if analysis_required and "analysis" not in opinions:
+        reason = (
+            "analysis_required=True — no directional decision without a "
+            "current Analysis opinion (missing or stale), checked as its own "
+            "explicit rule rather than relying on the quorum/min_available_weight "
+            "math to happen to enforce it."
+        )
+        return CoordinatorDecision(
+            symbol=symbol,
+            timeframe=timeframe,
+            timestamp=now_iso,
+            score=0.0,
+            threshold=threshold,
+            decision="insufficient_data",
+            direction="neutral",
+            contributions={},
+            missing_agents=missing_agents,
+            stale_agents=stale_agents,
+            conflict_flags=[],
+            summary=reason,
+            opinions_used=opinions,
+            config_version=config_version,
+            timing_context=timing_context,
+        )
 
     directional_weight_total = sum(weights.get(a, 0) for a in DIRECTIONAL_AGENTS)
     directional_available_weight = sum(
@@ -490,4 +574,5 @@ def compute_decision(
         weights=WEIGHTS,
         threshold=DECISION_THRESHOLD,
         min_available_weight=MIN_AVAILABLE_WEIGHT,
+        analysis_required=ANALYSIS_REQUIRED,
     )

@@ -112,6 +112,8 @@ def test_register_experiment_freezes_current_live_config_and_geometry(fresh_env)
     from app.backtest import ATR_STOP_MULT, ATR_TARGET_MULT, BACKTEST_LOGIC_VERSION, EXPIRY_BARS
     from app.paper_trades import COMMISSION_PER_CONTRACT, SLIPPAGE_POINTS
 
+    from app.coordinator import ANALYSIS_REQUIRED
+
     result = experiments.register_experiment(
         symbol="TEST", timeframe="5m", hypothesis="Coordinator beats a coin flip",
         target_metrics=_WIN_RATE_METRICS, stopping_rule={"min_distinct_trading_days": 2},
@@ -124,6 +126,7 @@ def test_register_experiment_freezes_current_live_config_and_geometry(fresh_env)
         "coordinator_threshold": DECISION_THRESHOLD,
         "weights": dict(WEIGHTS),
         "min_available_weight": MIN_AVAILABLE_WEIGHT,
+        "analysis_required": ANALYSIS_REQUIRED,
         "backtest_geometry": {
             "atr_stop_mult": ATR_STOP_MULT,
             "atr_target_mult": ATR_TARGET_MULT,
@@ -299,6 +302,81 @@ def test_rescore_is_a_noop_for_non_coordinator_direction_source(fresh_env):
     candidates = experiments._prospective_candidates(experiment)
     rescored = experiments._rescore_under_locked_config(candidates, experiment)
     assert rescored == candidates
+
+
+# ---------------------------------------------------------------------------
+# analysis_required locked and enforced (Tier 3.24)
+# ---------------------------------------------------------------------------
+
+def _news_macro_only_candidate_setup(storage, experiments):
+    """Shared setup for the two tests below: an experiment plus one
+    prospective candidate whose only opinions are News+Macro (no
+    Analysis at all), returning (experiment, candidates) so each test
+    just needs to hand-edit locked_config and re-score."""
+    experiment = experiments.register_experiment(
+        symbol="TEST", timeframe="5m", hypothesis="h",
+        target_metrics=dict(_WIN_RATE_METRICS), stopping_rule={"min_accepted_trades": 1},
+    )
+    anchor = datetime(2026, 8, 11, 14, 0, 0, tzinfo=timezone.utc)
+    _save_candidate(
+        storage, "c1", "TEST", "5m", anchor, decision="no_trade",
+        opinions_used={
+            "news": {"direction": "bullish", "confidence": 90, "timestamp": _iso(anchor)},
+            "macro": {"direction": "bullish", "confidence": 90, "timestamp": _iso(anchor)},
+        },
+    )
+    candidates = experiments._prospective_candidates(experiment)
+    return experiment, candidates
+
+
+def test_rescore_locks_analysis_required_not_just_quorum(fresh_env):
+    """analysis_required (Tier 3.24) is part of locked_config and is
+    actually ENFORCED at rescoring time, exactly like weights/threshold/
+    min_available_weight -- proven by hand-relaxing a registered
+    experiment's locked_config (weights/min_available_weight loosened
+    just enough that a News+Macro-only candidate, no Analysis opinion
+    at all, WOULD clear quorum) and showing analysis_required=True
+    still blocks it while analysis_required=False lets it through."""
+    storage, _, experiments = fresh_env
+    experiment, candidates = _news_macro_only_candidate_setup(storage, experiments)
+
+    relaxed_quorum = {
+        **experiment["locked_config"],
+        "weights": {"news": 0.25, "macro": 0.15},
+        "min_available_weight": 0.3,
+    }
+
+    still_gated = experiments._rescore_under_locked_config(
+        candidates, {**experiment, "locked_config": {**relaxed_quorum, "analysis_required": True}},
+    )
+    assert still_gated[0]["decision"]["decision"] == "insufficient_data"
+
+    ungated = experiments._rescore_under_locked_config(
+        candidates, {**experiment, "locked_config": {**relaxed_quorum, "analysis_required": False}},
+    )
+    assert ungated[0]["decision"]["decision"] == "enter_long"
+
+
+def test_rescore_backfills_missing_analysis_required_as_true(fresh_env):
+    """Experiments registered before Tier 3.24 have NO analysis_required
+    key in their stored locked_config at all -- _rescore_under_locked_config
+    must default a missing key to True (the only value ANALYSIS_REQUIRED
+    has ever actually had live), not silently treat "key absent" as
+    False and let something through that never should have been."""
+    storage, _, experiments = fresh_env
+    experiment, candidates = _news_macro_only_candidate_setup(storage, experiments)
+
+    pre_tier_3_24_locked = {
+        **experiment["locked_config"],
+        "weights": {"news": 0.25, "macro": 0.15},
+        "min_available_weight": 0.3,
+    }
+    del pre_tier_3_24_locked["analysis_required"]  # simulate a pre-Tier-3.24 row
+
+    rescored = experiments._rescore_under_locked_config(
+        candidates, {**experiment, "locked_config": pre_tier_3_24_locked},
+    )
+    assert rescored[0]["decision"]["decision"] == "insufficient_data"
 
 
 # ---------------------------------------------------------------------------

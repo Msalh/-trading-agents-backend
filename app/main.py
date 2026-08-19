@@ -807,6 +807,31 @@ not yet a full append-only shadow evaluation engine (no per-candidate
 outcome ledger) — a real step toward that, not the same thing under a
 bigger name. See app/experiments.py's module docstring for full detail.
 
+Tier 3.24 (analysis_required explicit gate, project-owner design
+decision, 2026-08-19): the fifth review's own open question — is
+Analysis being "load-bearing" (Tier 3.21 proved algebraically that its
+absence always fails the live quorum check on its own) an intentional
+design choice or just an accident of tunable weights? — was explicitly
+NOT something data could answer, and was left to the project owner.
+The decision: make it explicit. coordinator.ANALYSIS_REQUIRED (default
+True) is a new gate in _score_opinions(), checked BEFORE the quorum
+math and independent of it — "no directional decision without a
+current (non-missing, non-stale) Analysis opinion," scoped to
+Analysis's mere presence, not its direction (a present-but-neutral
+Analysis opinion still passes, matching today's behavior exactly, and
+matching the project owner's own explicit choice of this narrower
+scope over a broader "must be directional" gate). Changes NO decision
+computed today, live or replayed — it hardens an already-true
+guarantee against being silently broken by a future weights/
+min_available_weight retune, rather than changing anything now.
+Threaded everywhere weights/threshold/min_available_weight already are:
+CoordinatorDecision.config_version, app.replay's replay_candidate()/
+replay_candidates_for_symbol()/sweep_thresholds() (a fourth optional
+override, "None means use the live value"), the /candidates/*/replay*
+endpoints below, and app.experiments._current_locked_config() (a fifth
+locked, ENFORCED scoring knob — pre-Tier-3.24 experiments default to
+True on read, the only value it has ever actually had live).
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -1842,6 +1867,7 @@ def candidates_history_replay(
     weights: str = Query(default=None),
     threshold: float = Query(default=None),
     min_available_weight: float = Query(default=None),
+    analysis_required: bool = Query(default=None, description="Tier 3.24 — omit to use the current live ANALYSIS_REQUIRED"),
     only_changed: bool = Query(default=False, description="only return candidates whose replayed decision differs from what actually happened"),
     include_outcome: bool = Query(default=False),
     horizons: str = Query(default="15,30,60"),
@@ -1856,6 +1882,7 @@ def candidates_history_replay(
         weights=_parse_replay_weights(weights),
         threshold=threshold,
         min_available_weight=min_available_weight,
+        analysis_required=analysis_required,
         limit=limit,
         only_changed=only_changed,
         include_outcome=include_outcome,
@@ -1871,6 +1898,7 @@ def candidates_history_replay_summary(
     weights: str = Query(default=None),
     threshold: float = Query(default=None),
     min_available_weight: float = Query(default=None),
+    analysis_required: bool = Query(default=None, description="Tier 3.24 — omit to use the current live ANALYSIS_REQUIRED"),
 ) -> dict:
     """Aggregated transition counts (changed/unchanged, and
     original-decision -> replayed-decision breakdown) — the at-a-
@@ -1881,6 +1909,7 @@ def candidates_history_replay_summary(
         weights=_parse_replay_weights(weights),
         threshold=threshold,
         min_available_weight=min_available_weight,
+        analysis_required=analysis_required,
         limit=limit,
     )
     return summarize_replay(results)
@@ -1894,6 +1923,7 @@ def candidates_history_replay_threshold_sweep(
     limit: int = Query(default=100, le=500),
     weights: str = Query(default=None, description="held fixed across the whole sweep — omit to use the current live weights"),
     min_available_weight: float = Query(default=None, description="held fixed across the whole sweep — omit to use the current live value"),
+    analysis_required: bool = Query(default=None, description="Tier 3.24 — held fixed across the whole sweep, omit to use the current live ANALYSIS_REQUIRED"),
     horizons: str = Query(default="15,30,60"),
 ) -> dict:
     """Tier 3.4 (COORDINATOR_THRESHOLD tuning): the tool this whole
@@ -1922,6 +1952,7 @@ def candidates_history_replay_threshold_sweep(
         limit=limit,
         weights=_parse_replay_weights(weights),
         min_available_weight=min_available_weight,
+        analysis_required=analysis_required,
         horizons=_parse_replay_horizons(horizons),
     )
 
@@ -2525,15 +2556,16 @@ def candidate_replay(
     weights: str = Query(default=None, description='JSON object, e.g. {"analysis":0.4,"news":0.25,"timing":0.2,"macro":0.15} — omit to use the current live weights'),
     threshold: float = Query(default=None, description="omit to use the current live COORDINATOR_THRESHOLD"),
     min_available_weight: float = Query(default=None, description="omit to use the current live MIN_AVAILABLE_WEIGHT"),
+    analysis_required: bool = Query(default=None, description="Tier 3.24 — omit to use the current live ANALYSIS_REQUIRED"),
     include_outcome: bool = Query(default=False, description="also compute the hypothetical horizon outcome for the replayed decision"),
     horizons: str = Query(default="15,30,60"),
 ) -> dict:
     """Tier 2.5: re-scores ONE candidate's frozen opinions_used under a
     config — the live config by default, or an explicit hypothetical
-    override for weights/threshold/min_available_weight. Never mutates
-    the original candidate or opens a trade; purely a read-only
-    recompute for answering "what would the Coordinator have decided
-    here under a different config?"."""
+    override for weights/threshold/min_available_weight/analysis_required
+    (Tier 3.24). Never mutates the original candidate or opens a trade;
+    purely a read-only recompute for answering "what would the
+    Coordinator have decided here under a different config?"."""
     candidate = get_candidate_by_id(candidate_id)
     if candidate is None:
         raise HTTPException(status_code=404, detail=f"no candidate found with id={candidate_id}")
@@ -2543,6 +2575,7 @@ def candidate_replay(
         weights=_parse_replay_weights(weights),
         threshold=threshold,
         min_available_weight=min_available_weight,
+        analysis_required=analysis_required,
         include_outcome=include_outcome,
         outcome_horizons=_parse_replay_horizons(horizons) if include_outcome else None,
     )
