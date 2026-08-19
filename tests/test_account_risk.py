@@ -190,7 +190,7 @@ def test_paper_trade_close_feeds_daily_loss_by_event_time_not_server_time(fresh_
             "stop_loss": 19990.0, "targets": [20050.0],
         },
     }
-    trade = paper_trades.open_trade_from_candidate(candidate)
+    trade = paper_trades.open_trade_from_candidate(candidate, provenance=paper_trades.PROVENANCE_AUTO_POLICY)
     assert trade["status"] == "pending_fill"
 
     # Next bar fills the market order; a later bar hits the stop -- both

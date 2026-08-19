@@ -138,6 +138,12 @@ MNQ_POINT_VALUE = 2.0  # USD per index point per contract (Micro E-mini Nasdaq-1
 
 MAX_OPEN_POSITIONS = int(os.environ.get("MAX_OPEN_POSITIONS", "1"))
 
+# Tier 3.22 provenance values — see open_trade_from_candidate()'s
+# docstring. Named constants so main.py's two call sites can't typo a
+# label that silently fails to match anything a report filters on.
+PROVENANCE_AUTO_POLICY = "auto_policy"
+PROVENANCE_MANUAL_DASHBOARD = "manual_dashboard"
+
 # Tier 3.2 additions. Defaults are deliberately conservative
 # approximations, not calibrated to a real broker's actual schedule —
 # tunable via env var like everything else in this project.
@@ -184,7 +190,7 @@ def get_account_open_trade_count() -> int:
     return get_open_or_pending_trade_count()
 
 
-def open_trade_from_candidate(candidate: dict) -> dict | None:
+def open_trade_from_candidate(candidate: dict, provenance: str) -> dict | None:
     """Opens a new PENDING order from a candidate whose Risk result is
     approve/modify and whose Execution result is a validated
     status="planned" order. Returns the existing trade (not a new
@@ -205,7 +211,20 @@ def open_trade_from_candidate(candidate: dict) -> dict | None:
     check are no longer two separate operations racing each other —
     both, plus the insert, happen inside storage.open_trade_if_room()'s
     single atomic transaction. This function just builds the candidate
-    trade dict and asks that function to commit it if there's room."""
+    trade dict and asks that function to commit it if there's room.
+
+    Tier 3.22 (fifth external review — a manual dashboard pipeline test
+    on 2026-08-18 produced a real closed trade that was indistinguishable
+    from autonomous execution in any report): `provenance` is now a
+    REQUIRED argument, not inferred or defaulted, so every call site
+    must say explicitly which of the two ways a trade can be opened it
+    is — "auto_policy" for the AUTO_EXECUTE_ENABLED-gated background
+    task, "manual_dashboard" for the manual /agents/risk/evaluate
+    endpoint the dashboard's per-agent "Run" buttons hit. This is a
+    code-verifiable split only — it cannot distinguish a deliberate
+    manual pipeline TEST from a deliberate manual DISCRETIONARY trade
+    decision, since that's a human-intent question the backend has no
+    way to observe; both land under "manual_dashboard"."""
     candidate_id = candidate["candidate_id"]
     symbol, timeframe = candidate["symbol"], candidate["timeframe"]
     execution = candidate["execution"]
@@ -233,6 +252,7 @@ def open_trade_from_candidate(candidate: dict) -> dict | None:
         "order_submitted_at": anchor_bar.get("timestamp"),
         "opened_at": None,
         "fill_price": None,
+        "provenance": provenance,
     }
     status, result = open_trade_if_room(trade, MAX_OPEN_POSITIONS)
     if status == "at_capacity":

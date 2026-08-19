@@ -241,12 +241,37 @@ trade on a stop or nearest-target hit.
   data only, never used in fill/expiry/P&L logic.
 - `GET /trades/open?symbol=MNQ1!&timeframe=5m` — trades still live
   (`pending_fill` or `open`).
-- `GET /trades/history?symbol=MNQ1!&timeframe=5m&limit=20` — closed
-  trades, newest first, with `exit_price` / `exit_reason`
+- `GET /trades/history?symbol=MNQ1!&timeframe=5m&limit=20&exclude_provenance=manual_dashboard`
+  — closed trades, newest first, with `exit_price` / `exit_reason`
   (`stop_hit` | `target_hit`) / `pnl_usd`. Cancelled/expired orders are
   not included here (nothing was ever filled) — fetch a specific one
-  via `GET /trades/{trade_id}` if needed.
+  via `GET /trades/{trade_id}` if needed. `exclude_provenance` (Tier
+  3.22) is an opt-in, comma-separated filter on the new `provenance`
+  field below — omit it for the full, unfiltered history (default,
+  unchanged behavior). Filtering happens AFTER `limit` is applied to
+  the underlying query, so a caller who needs an exact post-filter
+  count should pass a generously large `limit`.
 - `GET /trades/{trade_id}` — a single trade by id, any status.
+
+**Tier 3.22 (fifth external review — trade provenance).** A manual
+dashboard pipeline test on 2026-08-18 (via `/agents/risk/evaluate`'s
+"Run" buttons) produced a real closed paper trade that was
+indistinguishable, in every report, from genuine autonomous execution
+— flagged by the review as data contamination needing an immediate
+fix. Every trade object now carries a `provenance` field:
+`"auto_policy"` (opened by the `AUTO_EXECUTE_ENABLED`-gated background
+task) or `"manual_dashboard"` (opened via the manual
+`/agents/risk/evaluate` endpoint). `app/paper_trades.
+open_trade_from_candidate()` takes `provenance` as a REQUIRED
+argument — no default, so a future call site can't silently omit it.
+Rows that predate this migration were backfilled to
+`"manual_dashboard"`: `AUTO_EXECUTE_ENABLED` has been `false` for this
+project's entire history to date (repeatedly reconfirmed live), so no
+pre-migration row could possibly have come from the auto-policy path.
+This is a code-verifiable split only — it cannot distinguish a
+deliberate manual pipeline TEST from a deliberate manual DISCRETIONARY
+trade decision, since that's a human-intent question the backend has
+no way to observe; both land under `"manual_dashboard"`.
 
 `CURRENT_OPEN_POSITIONS` is now a fallback only — Risk's gate stage
 uses the LIVE count from this table by default, so `MAX_OPEN_POSITIONS`
@@ -277,7 +302,8 @@ regardless of how many symbols end up trading against it.
   "daily_loss_limit": 1000.0,
   "daily_loss_used": 120.0,
   "remaining_daily_loss_room": 880.0,
-  "closed_trades_considered": 14
+  "closed_trades_considered": 14,
+  "closed_trades_by_provenance": { "auto_policy": 13, "manual_dashboard": 1 }
 }
 ```
 `current_drawdown_used` is the standard peak-to-trough figure over the
@@ -287,6 +313,17 @@ drawdown, even though the account is still net positive overall).
 `daily_loss_used` sums realized P&L for trades closed on the current
 NY/CME trading day only (same session-rollover convention as
 `app/trading_calendar.py`, Tier 2.9), floored at zero on a winning day.
+
+`closed_trades_by_provenance` (Tier 3.22) is a visibility-only
+breakdown of `closed_trades_considered` by the new `provenance` field
+(see the Trades section above). Deliberately NOT used to filter
+`current_drawdown_used`/`daily_loss_used` — both still count every
+closed trade regardless of provenance. Whether a manual dashboard
+trade should consume real paper-account risk-budget capacity is an
+open design question the fifth review raised but explicitly left to
+the user's own judgment (same status as the still-open
+Analysis-load-bearing design question) — not decided or silently
+changed here.
 
 ### Outcomes (Tier 2.4 rebuild) — read-only, no secret needed
 Prefers a real closed paper trade's actual P&L over the original

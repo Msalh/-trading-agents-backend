@@ -94,7 +94,8 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     closed_at_processed TEXT,
     exit_price REAL,
     exit_reason TEXT,
-    pnl_usd REAL
+    pnl_usd REAL,
+    provenance TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_trades_symbol_timeframe_status
     ON paper_trades (symbol, timeframe, status);
@@ -171,6 +172,27 @@ def init_db() -> None:
             except sqlite3.OperationalError as e:
                 if "duplicate column name" not in str(e):
                     raise
+        # Tier 3.22 (fifth external review — "the manual test trade must
+        # be tagged and excluded from system performance immediately"):
+        # provenance distinguishes trades opened by the AUTO_EXECUTE_
+        # ENABLED-gated background task ("auto_policy") from trades
+        # opened via the manual /agents/risk/evaluate endpoint the
+        # dashboard's per-agent "Run" buttons hit ("manual_dashboard") —
+        # see app/paper_trades.open_trade_from_candidate()'s new
+        # required `provenance` parameter, which both call sites in
+        # main.py now pass explicitly.
+        try:
+            conn.execute("ALTER TABLE paper_trades ADD COLUMN provenance TEXT")
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e):
+                raise
+        # Backfill: any row that predates this migration (provenance
+        # IS NULL) can ONLY have come from the manual endpoint — the
+        # auto-execute background task is gated by AUTO_EXECUTE_ENABLED,
+        # which has been false for this project's entire history to
+        # date (repeatedly reconfirmed live via /system/status), so no
+        # pre-migration row could possibly have come from that path.
+        conn.execute("UPDATE paper_trades SET provenance = 'manual_dashboard' WHERE provenance IS NULL")
         conn.commit()
     finally:
         conn.close()
@@ -714,6 +736,12 @@ def _row_to_trade(row: sqlite3.Row) -> dict:
         "exit_price": row["exit_price"],
         "exit_reason": row["exit_reason"],
         "pnl_usd": row["pnl_usd"],
+        # Tier 3.22: "auto_policy" (AUTO_EXECUTE_ENABLED-gated background
+        # task) or "manual_dashboard" (the dashboard's per-agent "Run"
+        # buttons, via /agents/risk/evaluate) — see init_db()'s migration
+        # for how pre-Tier-3.22 rows were backfilled. row_keys guard for
+        # the same reason as the other guarded fields above.
+        "provenance": row["provenance"] if "provenance" in row_keys else None,
     }
 
 
@@ -726,8 +754,8 @@ def _insert_paper_trade_row(conn: sqlite3.Connection, trade: dict) -> None:
         INSERT INTO paper_trades
             (trade_id, candidate_id, symbol, timeframe, direction, size,
              order_type, entry_price, stop_loss, targets_json, status,
-             order_submitted_at, opened_at, fill_price)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             order_submitted_at, opened_at, fill_price, provenance)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             trade["trade_id"],
@@ -744,6 +772,13 @@ def _insert_paper_trade_row(conn: sqlite3.Connection, trade: dict) -> None:
             trade.get("order_submitted_at"),
             trade.get("opened_at"),
             trade.get("fill_price"),
+            # Tier 3.22: no silent default here on purpose — every
+            # caller (app/paper_trades.open_trade_from_candidate(), and
+            # any test building a trade dict directly) must state its
+            # provenance explicitly. A missing value stores NULL rather
+            # than guessing, so a bug that forgets to set it is visible
+            # in the data, not silently mislabeled as one or the other.
+            trade.get("provenance"),
         ),
     )
 

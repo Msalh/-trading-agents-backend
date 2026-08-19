@@ -82,7 +82,7 @@ def test_market_order_starts_pending_not_open(fresh_paper_trades):
     subsequent bar."""
     storage, pt, _ = fresh_paper_trades()
     c = _candidate("c1", "TEST", "5m", "bullish", 1, "market", 20020.0, 20000.0, [20100.0])
-    trade = pt.open_trade_from_candidate(c)
+    trade = pt.open_trade_from_candidate(c, provenance=pt.PROVENANCE_AUTO_POLICY)
     assert trade["status"] == "pending_fill"
     assert trade["fill_price"] is None
     assert trade["opened_at"] is None
@@ -97,14 +97,14 @@ def test_ready_now_no_longer_causes_immediate_fill(fresh_paper_trades):
     pending_fill exactly like ready_now=False."""
     storage, pt, _ = fresh_paper_trades()
     c = _candidate("c1", "TEST", "5m", "bullish", 1, "limit", 20020.0, 20000.0, [20100.0], ready_now=True)
-    trade = pt.open_trade_from_candidate(c)
+    trade = pt.open_trade_from_candidate(c, provenance=pt.PROVENANCE_AUTO_POLICY)
     assert trade["status"] == "pending_fill"
 
 
 def test_limit_order_starts_pending(fresh_paper_trades):
     storage, pt, _ = fresh_paper_trades()
     c = _candidate("c1", "TEST", "5m", "bullish", 1, "limit", 19950.0, 19930.0, [20050.0], ready_now=False)
-    trade = pt.open_trade_from_candidate(c)
+    trade = pt.open_trade_from_candidate(c, provenance=pt.PROVENANCE_AUTO_POLICY)
     assert trade["status"] == "pending_fill"
     assert trade["fill_price"] is None
     assert trade["opened_at"] is None
@@ -113,8 +113,8 @@ def test_limit_order_starts_pending(fresh_paper_trades):
 def test_idempotent_on_same_candidate_id(fresh_paper_trades):
     storage, pt, _ = fresh_paper_trades()
     c = _candidate("c1", "TEST", "5m", "bullish", 1, "market", 20020.0, 20000.0, [20100.0])
-    first = pt.open_trade_from_candidate(c)
-    second = pt.open_trade_from_candidate(c)
+    first = pt.open_trade_from_candidate(c, provenance=pt.PROVENANCE_AUTO_POLICY)
+    second = pt.open_trade_from_candidate(c, provenance=pt.PROVENANCE_AUTO_POLICY)
     assert first["trade_id"] == second["trade_id"]
     assert pt.get_open_trade_count("TEST", "5m") == 1
 
@@ -123,8 +123,8 @@ def test_refuses_when_at_capacity(fresh_paper_trades):
     storage, pt, _ = fresh_paper_trades(MAX_OPEN_POSITIONS="1")
     c1 = _candidate("c1", "TEST", "5m", "bullish", 1, "market", 20020.0, 20000.0, [20100.0])
     c2 = _candidate("c2", "TEST", "5m", "bullish", 1, "market", 20030.0, 20010.0, [20110.0])
-    pt.open_trade_from_candidate(c1)
-    result = pt.open_trade_from_candidate(c2)
+    pt.open_trade_from_candidate(c1, provenance=pt.PROVENANCE_AUTO_POLICY)
+    result = pt.open_trade_from_candidate(c2, provenance=pt.PROVENANCE_AUTO_POLICY)
     assert result is None
     assert pt.get_open_trade_count("TEST", "5m") == 1
 
@@ -138,8 +138,8 @@ def test_capacity_is_account_wide_blocks_a_different_symbol_too(fresh_paper_trad
     storage, pt, _ = fresh_paper_trades(MAX_OPEN_POSITIONS="1")
     c1 = _candidate("c1", "TEST", "5m", "bullish", 1, "market", 20020.0, 20000.0, [20100.0])
     c2 = _candidate("c2", "OTHER", "5m", "bullish", 1, "market", 30.0, 28.0, [36.0])
-    pt.open_trade_from_candidate(c1)
-    result = pt.open_trade_from_candidate(c2)
+    pt.open_trade_from_candidate(c1, provenance=pt.PROVENANCE_AUTO_POLICY)
+    result = pt.open_trade_from_candidate(c2, provenance=pt.PROVENANCE_AUTO_POLICY)
     assert result is None
     assert pt.get_account_open_trade_count() == 1
 
@@ -148,8 +148,8 @@ def test_capacity_allows_a_different_symbol_once_the_account_wide_limit_is_raise
     storage, pt, _ = fresh_paper_trades(MAX_OPEN_POSITIONS="2")
     c1 = _candidate("c1", "TEST", "5m", "bullish", 1, "market", 20020.0, 20000.0, [20100.0])
     c2 = _candidate("c2", "OTHER", "5m", "bullish", 1, "market", 30.0, 28.0, [36.0])
-    pt.open_trade_from_candidate(c1)
-    result = pt.open_trade_from_candidate(c2)
+    pt.open_trade_from_candidate(c1, provenance=pt.PROVENANCE_AUTO_POLICY)
+    result = pt.open_trade_from_candidate(c2, provenance=pt.PROVENANCE_AUTO_POLICY)
     assert result is not None
     assert result["status"] == "pending_fill"  # Tier 3.2: not "open" anymore, even for a market order
     assert pt.get_account_open_trade_count() == 2
@@ -157,8 +157,8 @@ def test_capacity_allows_a_different_symbol_once_the_account_wide_limit_is_raise
 
 def test_get_account_open_trade_count_spans_all_symbols(fresh_paper_trades):
     storage, pt, _ = fresh_paper_trades(MAX_OPEN_POSITIONS="5")
-    pt.open_trade_from_candidate(_candidate("c1", "TEST", "5m", "bullish", 1, "market", 20020.0, 20000.0, [20100.0]))
-    pt.open_trade_from_candidate(_candidate("c2", "OTHER", "1h", "bearish", 1, "market", 30.0, 32.0, [24.0]))
+    pt.open_trade_from_candidate(_candidate("c1", "TEST", "5m", "bullish", 1, "market", 20020.0, 20000.0, [20100.0]), provenance=pt.PROVENANCE_AUTO_POLICY)
+    pt.open_trade_from_candidate(_candidate("c2", "OTHER", "1h", "bearish", 1, "market", 30.0, 32.0, [24.0]), provenance=pt.PROVENANCE_AUTO_POLICY)
     assert pt.get_account_open_trade_count() == 2
     # the per-symbol view stays scoped, unlike the account-wide one
     assert pt.get_open_trade_count("TEST", "5m") == 1
@@ -173,8 +173,8 @@ def test_idempotent_returns_original_trade_even_when_account_is_at_capacity(fres
     full."""
     storage, pt, _ = fresh_paper_trades(MAX_OPEN_POSITIONS="1")
     c1 = _candidate("c1", "TEST", "5m", "bullish", 1, "market", 20020.0, 20000.0, [20100.0])
-    first = pt.open_trade_from_candidate(c1)
-    second = pt.open_trade_from_candidate(c1)  # same candidate, account now "at capacity" from its own trade
+    first = pt.open_trade_from_candidate(c1, provenance=pt.PROVENANCE_AUTO_POLICY)
+    second = pt.open_trade_from_candidate(c1, provenance=pt.PROVENANCE_AUTO_POLICY)  # same candidate, account now "at capacity" from its own trade
     assert second["trade_id"] == first["trade_id"]
 
 
@@ -186,7 +186,7 @@ def test_market_order_fills_on_next_bar_at_its_open_plus_slippage(fresh_paper_tr
     storage, pt, _ = fresh_paper_trades()
     c = _candidate("c1", "TEST", "5m", "bullish", 1, "market", 20020.0, 20000.0, [20100.0],
                     bar_timestamp="2026-08-13T10:00:00Z")
-    pt.open_trade_from_candidate(c)
+    pt.open_trade_from_candidate(c, provenance=pt.PROVENANCE_AUTO_POLICY)
 
     changed = pt.process_new_bar("TEST", "5m", _bar("2026-08-13T10:05:00Z", open_=20022.0, high=20030.0, low=20018.0))
     assert len(changed) == 1
@@ -198,7 +198,7 @@ def test_market_order_fills_on_next_bar_at_its_open_plus_slippage(fresh_paper_tr
 def test_short_market_order_fill_slippage_is_against_the_seller(fresh_paper_trades):
     storage, pt, _ = fresh_paper_trades()
     c = _candidate("c1", "TEST", "5m", "bearish", 1, "market", 20050.0, 20070.0, [19950.0])
-    pt.open_trade_from_candidate(c)
+    pt.open_trade_from_candidate(c, provenance=pt.PROVENANCE_AUTO_POLICY)
 
     changed = pt.process_new_bar("TEST", "5m", _bar("2026-08-13T10:05:00Z", open_=20050.0, high=20060.0, low=20040.0))
     assert changed[0]["fill_price"] == 20049.75  # bar open - 0.25, worse for a short seller
@@ -209,7 +209,7 @@ def test_limit_fill_has_no_slippage_fills_exactly_at_the_limit(fresh_paper_trade
     definition -- no slippage modeled, unlike a market fill."""
     storage, pt, _ = fresh_paper_trades()
     c = _candidate("c1", "TEST", "5m", "bullish", 1, "limit", 19950.0, 19930.0, [20050.0], ready_now=False)
-    pt.open_trade_from_candidate(c)
+    pt.open_trade_from_candidate(c, provenance=pt.PROVENANCE_AUTO_POLICY)
 
     # Bar doesn't reach the limit yet -- stays pending
     pt.process_new_bar("TEST", "5m", _bar("2026-08-13T10:05:00Z", open_=19990.0, high=20000.0, low=19980.0))
@@ -225,7 +225,7 @@ def test_limit_fill_has_no_slippage_fills_exactly_at_the_limit(fresh_paper_trade
 def test_pending_short_fills_when_price_rallies_to_limit(fresh_paper_trades):
     storage, pt, _ = fresh_paper_trades()
     c = _candidate("c1", "TEST", "5m", "bearish", 1, "limit", 20050.0, 20070.0, [19950.0], ready_now=False)
-    pt.open_trade_from_candidate(c)
+    pt.open_trade_from_candidate(c, provenance=pt.PROVENANCE_AUTO_POLICY)
     changed = pt.process_new_bar("TEST", "5m", _bar("2026-08-13T10:05:00Z", open_=20030.0, high=20055.0, low=20010.0))
     assert changed[0]["status"] == "open"
     assert changed[0]["fill_price"] == 20050.0
@@ -239,7 +239,7 @@ def test_pending_short_fills_when_price_rallies_to_limit(fresh_paper_trades):
 def test_long_closes_on_stop_hit_no_gap(fresh_paper_trades):
     storage, pt, _ = fresh_paper_trades()
     c = _candidate("c1", "TEST", "5m", "bullish", 2, "market", 20020.0, 20000.0, [20100.0])
-    pt.open_trade_from_candidate(c)
+    pt.open_trade_from_candidate(c, provenance=pt.PROVENANCE_AUTO_POLICY)
     pt.process_new_bar("TEST", "5m", _bar("2026-08-13T10:05:00Z", open_=20020.0, high=20025.0, low=20015.0))  # fills at 20020.25
 
     changed = pt.process_new_bar("TEST", "5m", _bar("2026-08-13T10:10:00Z", open_=20005.0, high=20010.0, low=19995.0))  # no gap: open(20005) > stop(20000)
@@ -259,7 +259,7 @@ def test_long_stop_gap_uses_bar_open_not_the_stop_price(fresh_paper_trades):
     through a gap), not the stop level itself."""
     storage, pt, _ = fresh_paper_trades()
     c = _candidate("c1", "TEST", "5m", "bullish", 1, "market", 20020.0, 20000.0, [20100.0])
-    pt.open_trade_from_candidate(c)
+    pt.open_trade_from_candidate(c, provenance=pt.PROVENANCE_AUTO_POLICY)
     pt.process_new_bar("TEST", "5m", _bar("2026-08-13T10:05:00Z", open_=20020.0, high=20025.0, low=20015.0))  # fills at 20020.25
 
     changed = pt.process_new_bar("TEST", "5m", _bar("2026-08-13T10:10:00Z", open_=19990.0, high=20010.0, low=19985.0))  # gapped below stop
@@ -272,7 +272,7 @@ def test_long_stop_gap_uses_bar_open_not_the_stop_price(fresh_paper_trades):
 def test_long_closes_on_target_hit_no_slippage_at_target(fresh_paper_trades):
     storage, pt, _ = fresh_paper_trades()
     c = _candidate("c1", "TEST", "5m", "bullish", 1, "market", 20020.0, 20000.0, [20100.0])
-    pt.open_trade_from_candidate(c)
+    pt.open_trade_from_candidate(c, provenance=pt.PROVENANCE_AUTO_POLICY)
     pt.process_new_bar("TEST", "5m", _bar("2026-08-13T10:05:00Z", open_=20020.0, high=20025.0, low=20015.0))  # fills at 20020.25
 
     changed = pt.process_new_bar("TEST", "5m", _bar("2026-08-13T10:10:00Z", open_=20095.0, high=20105.0, low=20090.0))
@@ -285,7 +285,7 @@ def test_long_closes_on_target_hit_no_slippage_at_target(fresh_paper_trades):
 def test_short_closes_on_target_hit(fresh_paper_trades):
     storage, pt, _ = fresh_paper_trades()
     c = _candidate("c1", "TEST", "5m", "bearish", 1, "market", 20050.0, 20070.0, [19950.0])
-    pt.open_trade_from_candidate(c)
+    pt.open_trade_from_candidate(c, provenance=pt.PROVENANCE_AUTO_POLICY)
     pt.process_new_bar("TEST", "5m", _bar("2026-08-13T10:05:00Z", open_=20050.0, high=20060.0, low=20040.0))  # fills at 20049.75
 
     changed = pt.process_new_bar("TEST", "5m", _bar("2026-08-13T10:10:00Z", open_=19955.0, high=19960.0, low=19945.0))
@@ -298,7 +298,7 @@ def test_short_closes_on_target_hit(fresh_paper_trades):
 def test_short_closes_on_stop_hit_no_gap(fresh_paper_trades):
     storage, pt, _ = fresh_paper_trades()
     c = _candidate("c1", "TEST", "5m", "bearish", 1, "market", 20050.0, 20070.0, [19950.0])
-    pt.open_trade_from_candidate(c)
+    pt.open_trade_from_candidate(c, provenance=pt.PROVENANCE_AUTO_POLICY)
     pt.process_new_bar("TEST", "5m", _bar("2026-08-13T10:05:00Z", open_=20050.0, high=20060.0, low=20040.0))  # fills at 20049.75
 
     changed = pt.process_new_bar("TEST", "5m", _bar("2026-08-13T10:10:00Z", open_=20055.0, high=20075.0, low=20050.0))  # no gap
@@ -315,7 +315,7 @@ def test_gap_bar_hitting_both_stop_and_target_assumes_stop_first(fresh_paper_tra
     target is treated as the stop having been hit first."""
     storage, pt, _ = fresh_paper_trades()
     c = _candidate("c1", "TEST", "5m", "bullish", 1, "market", 20020.0, 20000.0, [20100.0])
-    pt.open_trade_from_candidate(c)
+    pt.open_trade_from_candidate(c, provenance=pt.PROVENANCE_AUTO_POLICY)
     pt.process_new_bar("TEST", "5m", _bar("2026-08-13T10:05:00Z", open_=20020.0, high=20025.0, low=20015.0))
 
     changed = pt.process_new_bar("TEST", "5m", _bar("2026-08-13T10:10:00Z", open_=20005.0, high=20150.0, low=19990.0))
@@ -327,7 +327,7 @@ def test_fill_and_immediate_stop_in_the_same_bar(fresh_paper_trades):
     both transitions should be reflected in one process_new_bar call."""
     storage, pt, _ = fresh_paper_trades()
     c = _candidate("c1", "TEST", "5m", "bullish", 1, "limit", 19950.0, 19930.0, [20050.0], ready_now=False)
-    pt.open_trade_from_candidate(c)
+    pt.open_trade_from_candidate(c, provenance=pt.PROVENANCE_AUTO_POLICY)
 
     changed = pt.process_new_bar("TEST", "5m", _bar("2026-08-13T10:05:00Z", open_=19955.0, high=19960.0, low=19925.0))
     assert len(changed) == 2
@@ -342,7 +342,7 @@ def test_fill_and_immediate_stop_in_the_same_bar(fresh_paper_trades):
 def test_untouched_open_trade_stays_open(fresh_paper_trades):
     storage, pt, _ = fresh_paper_trades()
     c = _candidate("c1", "TEST", "5m", "bullish", 1, "market", 20020.0, 20000.0, [20100.0])
-    pt.open_trade_from_candidate(c)
+    pt.open_trade_from_candidate(c, provenance=pt.PROVENANCE_AUTO_POLICY)
     pt.process_new_bar("TEST", "5m", _bar("2026-08-13T10:05:00Z", open_=20020.0, high=20025.0, low=20015.0))  # fills
 
     changed = pt.process_new_bar("TEST", "5m", _bar("2026-08-13T10:10:00Z", open_=20022.0, high=20030.0, low=20017.0))
@@ -355,7 +355,7 @@ def test_closed_trade_untouched_by_further_bars(fresh_paper_trades):
     double-count P&L for) a trade that's already closed."""
     storage, pt, _ = fresh_paper_trades()
     c = _candidate("c1", "TEST", "5m", "bullish", 1, "market", 20020.0, 20000.0, [20100.0])
-    pt.open_trade_from_candidate(c)
+    pt.open_trade_from_candidate(c, provenance=pt.PROVENANCE_AUTO_POLICY)
     pt.process_new_bar("TEST", "5m", _bar("2026-08-13T10:05:00Z", open_=20020.0, high=20025.0, low=20015.0))
     pt.process_new_bar("TEST", "5m", _bar("2026-08-13T10:10:00Z", open_=20005.0, high=20010.0, low=19995.0))  # stop hit, closes
 
@@ -371,7 +371,7 @@ def test_pending_limit_expires_after_order_expiry_minutes(fresh_paper_trades):
     storage, pt, _ = fresh_paper_trades(ORDER_EXPIRY_MINUTES="30")
     c = _candidate("c1", "TEST", "5m", "bullish", 1, "limit", 19950.0, 19930.0, [20050.0],
                     bar_timestamp="2026-08-13T10:00:00Z")
-    pt.open_trade_from_candidate(c)
+    pt.open_trade_from_candidate(c, provenance=pt.PROVENANCE_AUTO_POLICY)
 
     # 45 minutes of EVENT time later, price never reached the limit
     changed = pt.process_new_bar("TEST", "5m", _bar("2026-08-13T10:45:00Z", open_=20000.0, high=20010.0, low=19990.0))
@@ -389,7 +389,7 @@ def test_pending_limit_not_yet_expired_stays_pending(fresh_paper_trades):
     storage, pt, _ = fresh_paper_trades(ORDER_EXPIRY_MINUTES="30")
     c = _candidate("c1", "TEST", "5m", "bullish", 1, "limit", 19950.0, 19930.0, [20050.0],
                     bar_timestamp="2026-08-13T10:00:00Z")
-    pt.open_trade_from_candidate(c)
+    pt.open_trade_from_candidate(c, provenance=pt.PROVENANCE_AUTO_POLICY)
 
     changed = pt.process_new_bar("TEST", "5m", _bar("2026-08-13T10:15:00Z", open_=20000.0, high=20010.0, low=19990.0))
     assert changed == []
@@ -407,7 +407,7 @@ def test_expiry_uses_event_time_not_real_wall_clock(fresh_paper_trades):
     storage, pt, _ = fresh_paper_trades(ORDER_EXPIRY_MINUTES="30")
     c = _candidate("c1", "TEST", "5m", "bullish", 1, "limit", 19950.0, 19930.0, [20050.0],
                     bar_timestamp="2020-01-01T10:00:00Z")  # long "ago" in real wall-clock terms
-    pt.open_trade_from_candidate(c)
+    pt.open_trade_from_candidate(c, provenance=pt.PROVENANCE_AUTO_POLICY)
 
     # Only 10 EVENT minutes later -- must NOT be expired, despite being
     # years in the past relative to when this test actually runs.
@@ -423,7 +423,7 @@ def test_market_order_with_no_anchor_bar_timestamp_never_expires(fresh_paper_tra
     storage, pt, _ = fresh_paper_trades(ORDER_EXPIRY_MINUTES="1")
     c = _candidate("c1", "TEST", "5m", "bullish", 1, "limit", 19950.0, 19930.0, [20050.0])
     c["bar"] = None
-    pt.open_trade_from_candidate(c)
+    pt.open_trade_from_candidate(c, provenance=pt.PROVENANCE_AUTO_POLICY)
     assert storage.get_trade_by_candidate_id("c1")["order_submitted_at"] is None
 
     changed = pt.process_new_bar("TEST", "5m", _bar("2026-08-13T12:00:00Z", open_=20000.0, high=20010.0, low=19990.0))
@@ -438,9 +438,75 @@ def test_market_order_with_no_anchor_bar_timestamp_never_expires(fresh_paper_tra
 def test_commission_deducted_from_pnl(fresh_paper_trades):
     storage, pt, _ = fresh_paper_trades(SLIPPAGE_POINTS="0", COMMISSION_PER_CONTRACT="3.5")
     c = _candidate("c1", "TEST", "5m", "bullish", 2, "market", 20020.0, 20000.0, [20100.0])
-    pt.open_trade_from_candidate(c)
+    pt.open_trade_from_candidate(c, provenance=pt.PROVENANCE_AUTO_POLICY)
     pt.process_new_bar("TEST", "5m", _bar("2026-08-13T10:05:00Z", open_=20020.0, high=20025.0, low=20015.0))  # fills at 20020.0 (no slippage)
 
     changed = pt.process_new_bar("TEST", "5m", _bar("2026-08-13T10:10:00Z", open_=20095.0, high=20105.0, low=20090.0))
     # pnl before commission: (20100 - 20020) * 2 * 2 = 320.0; commission = 3.5 * 2 = 7.0
     assert changed[0]["pnl_usd"] == 313.0
+
+
+# ---------------------------------------------------------------------------
+# Tier 3.22 (fifth external review): trade provenance
+# ---------------------------------------------------------------------------
+
+def test_provenance_is_a_required_argument(fresh_paper_trades):
+    """The whole point of this tier: a call site can't silently forget
+    to say how a trade was opened. No default value exists."""
+    storage, pt, _ = fresh_paper_trades()
+    c = _candidate("c1", "TEST", "5m", "bullish", 1, "market", 20020.0, 20000.0, [20100.0])
+    with pytest.raises(TypeError):
+        pt.open_trade_from_candidate(c)
+
+
+def test_auto_policy_provenance_is_recorded(fresh_paper_trades):
+    storage, pt, _ = fresh_paper_trades()
+    c = _candidate("c1", "TEST", "5m", "bullish", 1, "market", 20020.0, 20000.0, [20100.0])
+    trade = pt.open_trade_from_candidate(c, provenance=pt.PROVENANCE_AUTO_POLICY)
+    assert trade["provenance"] == "auto_policy"
+    assert storage.get_trade_by_candidate_id("c1")["provenance"] == "auto_policy"
+
+
+def test_manual_dashboard_provenance_is_recorded(fresh_paper_trades):
+    storage, pt, _ = fresh_paper_trades()
+    c = _candidate("c1", "TEST", "5m", "bullish", 1, "market", 20020.0, 20000.0, [20100.0])
+    trade = pt.open_trade_from_candidate(c, provenance=pt.PROVENANCE_MANUAL_DASHBOARD)
+    assert trade["provenance"] == "manual_dashboard"
+
+
+def test_idempotent_replay_keeps_original_provenance(fresh_paper_trades):
+    """Re-running Risk's size stage on an already-committed candidate
+    (a dashboard double-click, a retry from the OTHER call site) must
+    return the ORIGINAL trade unchanged -- including its original
+    provenance, even if the second call passes a different one."""
+    storage, pt, _ = fresh_paper_trades()
+    c = _candidate("c1", "TEST", "5m", "bullish", 1, "market", 20020.0, 20000.0, [20100.0])
+    first = pt.open_trade_from_candidate(c, provenance=pt.PROVENANCE_AUTO_POLICY)
+    second = pt.open_trade_from_candidate(c, provenance=pt.PROVENANCE_MANUAL_DASHBOARD)
+    assert first["trade_id"] == second["trade_id"]
+    assert second["provenance"] == "auto_policy"
+
+
+def test_pre_migration_rows_backfill_to_manual_dashboard(fresh_paper_trades):
+    """init_db()'s migration: any row inserted before the provenance
+    column existed can only have come from the manual endpoint, since
+    AUTO_EXECUTE_ENABLED has been false for the project's entire
+    history -- simulated here by inserting a row with provenance
+    explicitly NULL (as a pre-Tier-3.22 row would have been) and
+    re-running init_db()."""
+    storage, pt, db_path = fresh_paper_trades()
+    conn = storage.get_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO paper_trades
+                (trade_id, candidate_id, symbol, timeframe, direction, size,
+                 order_type, entry_price, stop_loss, targets_json, status)
+            VALUES ('t1', 'c1', 'TEST', '5m', 'bullish', 1, 'market', 100.0, 90.0, '[110.0]', 'open')
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    storage.init_db()  # re-run the migration against the same DB
+    assert storage.get_trade_by_id("t1")["provenance"] == "manual_dashboard"

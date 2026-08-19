@@ -143,6 +143,64 @@ def test_account_risk_reflects_a_closed_losing_trade(client):
 
 
 # ---------------------------------------------------------------------------
+# Tier 3.22 (fifth external review): trade provenance
+# ---------------------------------------------------------------------------
+
+def _closed_trade(trade_id, candidate_id, pnl_usd, provenance):
+    return {
+        "trade_id": trade_id, "candidate_id": candidate_id, "symbol": "MNQ1!", "timeframe": "5m",
+        "direction": "bullish", "size": 1, "order_type": "market",
+        "entry_price": 20000.0, "stop_loss": 19980.0, "targets": [20050.0],
+        "status": "open", "opened_at": "2026-08-11T14:00:00Z", "fill_price": 20000.0,
+        "provenance": provenance,
+    }
+
+
+def test_account_risk_reports_closed_trades_by_provenance(client):
+    import app.storage as storage
+    storage.save_paper_trade(_closed_trade("t1", "c1", -40.0, "manual_dashboard"))
+    storage.close_trade("t1", exit_price=19980.0, exit_reason="stop_hit", pnl_usd=-40.0, closed_at="2026-08-11T14:30:00Z")
+    storage.save_paper_trade(_closed_trade("t2", "c2", 20.0, "auto_policy"))
+    storage.close_trade("t2", exit_price=20010.0, exit_reason="target_hit", pnl_usd=20.0, closed_at="2026-08-11T15:00:00Z")
+
+    r = client.get("/account/risk")
+    body = r.json()
+    assert body["closed_trades_considered"] == 2
+    assert body["closed_trades_by_provenance"] == {"manual_dashboard": 1, "auto_policy": 1}
+    # Deliberately unfiltered: both trades still fed the real
+    # current_drawdown_used/daily_loss_used computation above (not
+    # re-asserted here since the exact drawdown formula isn't this
+    # test's concern) -- this tier only reports provenance, it doesn't
+    # change risk-gating behavior.
+
+
+def test_trades_history_default_includes_every_provenance(client):
+    import app.storage as storage
+    storage.save_paper_trade(_closed_trade("t1", "c1", -40.0, "manual_dashboard"))
+    storage.close_trade("t1", exit_price=19980.0, exit_reason="stop_hit", pnl_usd=-40.0, closed_at="2026-08-11T14:30:00Z")
+    storage.save_paper_trade(_closed_trade("t2", "c2", 20.0, "auto_policy"))
+    storage.close_trade("t2", exit_price=20010.0, exit_reason="target_hit", pnl_usd=20.0, closed_at="2026-08-11T15:00:00Z")
+
+    r = client.get("/trades/history", params={"symbol": "MNQ1!", "timeframe": "5m"})
+    assert r.status_code == 200
+    assert len(r.json()) == 2
+
+
+def test_trades_history_exclude_provenance_filters_manual(client):
+    import app.storage as storage
+    storage.save_paper_trade(_closed_trade("t1", "c1", -40.0, "manual_dashboard"))
+    storage.close_trade("t1", exit_price=19980.0, exit_reason="stop_hit", pnl_usd=-40.0, closed_at="2026-08-11T14:30:00Z")
+    storage.save_paper_trade(_closed_trade("t2", "c2", 20.0, "auto_policy"))
+    storage.close_trade("t2", exit_price=20010.0, exit_reason="target_hit", pnl_usd=20.0, closed_at="2026-08-11T15:00:00Z")
+
+    r = client.get("/trades/history", params={"symbol": "MNQ1!", "timeframe": "5m", "exclude_provenance": "manual_dashboard"})
+    body = r.json()
+    assert len(body) == 1
+    assert body[0]["trade_id"] == "t2"
+    assert body[0]["provenance"] == "auto_policy"
+
+
+# ---------------------------------------------------------------------------
 # Tier 3.1: causal integrity
 # ---------------------------------------------------------------------------
 

@@ -753,6 +753,27 @@ past -threshold, worked through the renormalized-denominator algebra
 for each of the three agents. Read-only, offline, no LLM calls,
 COORDINATOR_THRESHOLD/WEIGHTS untouched.
 
+Tier 3.22 (trade provenance, fifth external review, 2026-08-19): the
+2026-08-18 manual dashboard pipeline test (opened via /agents/risk/
+evaluate's "Run" buttons) produced a real closed paper trade that was
+indistinguishable, in every report, from genuine autonomous execution
+— the review flagged this as data contamination requiring an
+immediate fix, not something to defer. app/paper_trades.
+open_trade_from_candidate() now takes a REQUIRED `provenance` argument
+("auto_policy" for the AUTO_EXECUTE_ENABLED-gated background task,
+"manual_dashboard" for this manual endpoint) — no default, so a future
+call site can't silently omit it. New `provenance` column on
+paper_trades (migrated + backfilled: any pre-Tier-3.22 row can only
+have come from the manual endpoint, since AUTO_EXECUTE_ENABLED has
+been false for this project's entire history to date). GET
+/trades/history gained an opt-in `exclude_provenance` filter (default
+unchanged — full history). GET /account/risk gained
+`closed_trades_by_provenance` for visibility. Deliberately NOT
+changed: `current_drawdown_used`/`daily_loss_used` still count every
+closed trade regardless of provenance — whether a manual paper trade
+should consume real risk-budget capacity is an open design question,
+flagged to the user rather than decided here.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -811,7 +832,13 @@ from app.outcomes import (
     summarize_outcomes,
 )
 from app.coordinator_diagnostics import compute_coordinator_divergence_report
-from app.paper_trades import get_account_open_trade_count, open_trade_from_candidate, process_new_bar
+from app.paper_trades import (
+    PROVENANCE_AUTO_POLICY,
+    PROVENANCE_MANUAL_DASHBOARD,
+    get_account_open_trade_count,
+    open_trade_from_candidate,
+    process_new_bar,
+)
 from app.replay import replay_candidate, replay_candidates_for_symbol, summarize_replay, sweep_thresholds
 from app.risk_agent import (
     ACCOUNT_BALANCE,
@@ -1257,7 +1284,7 @@ def _auto_execute_candidate(candidate: dict) -> None:
         if size_opinion.decision in ("approve", "modify"):
             refreshed = get_candidate_by_id(candidate_id)
             if refreshed is not None:
-                open_trade_from_candidate(refreshed)
+                open_trade_from_candidate(refreshed, provenance=PROVENANCE_AUTO_POLICY)
     except Exception as e:  # noqa: BLE001 - background task, log and move on
         logging.getLogger("webhook").error("auto-execute failed for candidate_id=%s: %s", candidate_id, e)
 
@@ -2464,10 +2491,37 @@ def trades_history(
     symbol: str = Query(...),
     timeframe: str = Query(...),
     limit: int = Query(default=20, le=200),
+    exclude_provenance: str | None = Query(
+        default=None,
+        description=(
+            "Tier 3.22: comma-separated provenance values to drop from the "
+            "response, e.g. exclude_provenance=manual_dashboard to see only "
+            "trades the AUTO_EXECUTE_ENABLED-gated policy itself opened. "
+            "Omit for the full stored history (default, backward compatible "
+            "— every trade ever opened, manual or automatic)."
+        ),
+    ),
 ) -> list[dict]:
     """Closed trades, newest first, with realized pnl_usd and
-    exit_reason ("stop_hit" | "target_hit")."""
-    return get_recent_trades(symbol=symbol, timeframe=timeframe, limit=limit)
+    exit_reason ("stop_hit" | "target_hit").
+
+    Tier 3.22 (fifth external review): every trade now carries a
+    `provenance` field ("auto_policy" or "manual_dashboard" — see
+    app/paper_trades.open_trade_from_candidate()). This endpoint's
+    default behavior is UNCHANGED (returns everything, exactly as
+    before) — `exclude_provenance` is opt-in, so a caller building a
+    "system performance" view can exclude manual dashboard actions
+    (e.g. pipeline tests) without this endpoint silently deciding that
+    for them. Filtering happens AFTER `limit` is applied to the
+    underlying newest-first query — with a small account this rarely
+    matters, but a caller who needs an exact post-filter count should
+    pass a generously large `limit` rather than trust the response
+    length."""
+    trades = get_recent_trades(symbol=symbol, timeframe=timeframe, limit=limit)
+    if exclude_provenance:
+        excluded = {v.strip() for v in exclude_provenance.split(",") if v.strip()}
+        trades = [t for t in trades if t.get("provenance") not in excluded]
+    return trades
 
 
 @app.get("/trades/{trade_id}")
@@ -2488,11 +2542,28 @@ def account_risk_status() -> dict:
     Account-wide by design (not scoped to a symbol/timeframe) — the
     account's risk budget is one account-wide number regardless of how
     many symbols end up trading against it. No secret needed, same
-    pattern as /trades/* and /candidates/*."""
+    pattern as /trades/* and /candidates/*.
+
+    Tier 3.22 (fifth external review): `closed_trades_by_provenance`
+    is new — a breakdown of `closed_trades_considered` by
+    "auto_policy" vs "manual_dashboard" (see app/paper_trades.py),
+    purely for visibility into whether the numbers above include any
+    manually-opened dashboard trades (e.g. pipeline tests). Deliberately
+    NOT filtered out of `current_drawdown_used`/`daily_loss_used` by
+    default — whether a manual paper trade should count against the
+    account's real risk budget is a genuine open design question (does
+    a manual pipeline test consume real paper-account risk capacity, or
+    not?) that the review flagged but explicitly left to the user's own
+    judgment, same as the Analysis-load-bearing design question. Not
+    decided here; not silently changed."""
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     closed_trades = get_all_closed_trades_chronological()
     current_drawdown_used = compute_current_drawdown_used(trades=closed_trades)
     daily_loss_used = compute_daily_loss_used(now_iso, trades=closed_trades)
+    closed_trades_by_provenance: dict[str, int] = {}
+    for trade in closed_trades:
+        key = trade.get("provenance") or "unknown"
+        closed_trades_by_provenance[key] = closed_trades_by_provenance.get(key, 0) + 1
     return {
         "as_of": now_iso,
         "account_balance": ACCOUNT_BALANCE,
@@ -2503,6 +2574,7 @@ def account_risk_status() -> dict:
         "daily_loss_used": daily_loss_used,
         "remaining_daily_loss_room": round(DAILY_LOSS_LIMIT - daily_loss_used, 2),
         "closed_trades_considered": len(closed_trades),
+        "closed_trades_by_provenance": closed_trades_by_provenance,
     }
 
 
@@ -2666,7 +2738,7 @@ def risk_evaluate(
     trade = None
     if is_size_stage and risk_opinion.decision in ("approve", "modify"):
         candidate_for_trade = {**candidate, "risk": risk_opinion.to_dict()}
-        trade = open_trade_from_candidate(candidate_for_trade)
+        trade = open_trade_from_candidate(candidate_for_trade, provenance=PROVENANCE_MANUAL_DASHBOARD)
 
     # Also written to the older agent_opinions table — /system/status
     # and the dashboard's existing Risk display still read from there.
