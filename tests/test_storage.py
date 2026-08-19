@@ -287,3 +287,108 @@ def test_open_trade_if_room_idempotency_wins_over_capacity(fresh_storage):
     status, trade = storage.open_trade_if_room(_trade_dict("t2-ignored", "c1", "TEST"), max_open_positions=1)
     assert status == "already_exists"
     assert trade["trade_id"] == "t1"
+
+
+# ---------------------------------------------------------------------------
+# Tier 3.23 (fifth external review): rowid-based candidate access, the
+# no-peeking boundary app.experiments now uses instead of created_at.
+# ---------------------------------------------------------------------------
+
+def _save_min_candidate(storage, candidate_id, symbol="TEST", timeframe="5m"):
+    storage.save_candidate(
+        candidate_id=candidate_id, symbol=symbol, timeframe=timeframe,
+        bar=None, decision={"decision": "no_trade"},
+    )
+
+
+def test_get_max_candidate_rowid_zero_when_none_exist(fresh_storage):
+    storage = fresh_storage
+    assert storage.get_max_candidate_rowid("TEST", "5m") == 0
+
+
+def test_get_max_candidate_rowid_tracks_insertion_count(fresh_storage):
+    storage = fresh_storage
+    _save_min_candidate(storage, "c1")
+    _save_min_candidate(storage, "c2")
+    assert storage.get_max_candidate_rowid("TEST", "5m") == 2
+    _save_min_candidate(storage, "c3")
+    assert storage.get_max_candidate_rowid("TEST", "5m") == 3
+
+
+def test_get_max_candidate_rowid_scoped_to_symbol_and_timeframe(fresh_storage):
+    storage = fresh_storage
+    _save_min_candidate(storage, "c1", symbol="TEST", timeframe="5m")
+    _save_min_candidate(storage, "c2", symbol="OTHER", timeframe="5m")
+    assert storage.get_max_candidate_rowid("OTHER", "5m") == 2  # rowid is table-wide, not per-scope
+    assert storage.get_max_candidate_rowid("NEVER-SEEN", "5m") == 0
+
+
+def test_get_candidates_after_rowid_excludes_at_and_before_watermark(fresh_storage):
+    storage = fresh_storage
+    _save_min_candidate(storage, "c1")
+    watermark = storage.get_max_candidate_rowid("TEST", "5m")
+    _save_min_candidate(storage, "c2")
+    _save_min_candidate(storage, "c3")
+
+    after = storage.get_candidates_after_rowid("TEST", "5m", watermark)
+    assert [c["candidate_id"] for c in after] == ["c2", "c3"]
+    assert all(c["rowid"] > watermark for c in after)
+
+
+def test_get_candidates_after_rowid_ignores_created_at(fresh_storage):
+    """The exact property app.experiments relies on: rowid order, not
+    a created_at value, decides what's "after" the watermark -- a
+    candidate inserted before the watermark but backdated to claim a
+    future created_at must still be excluded."""
+    storage = fresh_storage
+    _save_min_candidate(storage, "c1")
+    watermark = storage.get_max_candidate_rowid("TEST", "5m")
+    conn = storage.get_connection()
+    conn.execute("UPDATE trade_candidates SET created_at = '2099-01-01 00:00:00' WHERE candidate_id = 'c1'")
+    conn.commit()
+    conn.close()
+
+    after = storage.get_candidates_after_rowid("TEST", "5m", watermark)
+    assert after == []
+
+
+def test_count_candidates_after_rowid_matches_get_candidates_after_rowid_length(fresh_storage):
+    storage = fresh_storage
+    _save_min_candidate(storage, "c1")
+    watermark = storage.get_max_candidate_rowid("TEST", "5m")
+    _save_min_candidate(storage, "c2")
+    _save_min_candidate(storage, "c3")
+    assert storage.count_candidates_after_rowid("TEST", "5m", watermark) == 2
+    assert storage.count_candidates_after_rowid("TEST", "5m", watermark) == len(
+        storage.get_candidates_after_rowid("TEST", "5m", watermark)
+    )
+
+
+def test_experiments_migration_backfills_registered_watermark_rowid(fresh_storage):
+    """Simulates a Tier 3.20-era experiment row (no
+    registered_watermark_rowid, the column's DEFAULT 0) alongside real
+    candidates, then re-runs init_db() -- the backfill must reconstruct
+    a sensible watermark from created_at/registered_at, the best
+    approximation available for data that predates rowid-based
+    tracking (see init_db()'s migration comment)."""
+    storage = fresh_storage
+    _save_min_candidate(storage, "before-1")  # rowid 1, will predate registered_at below
+    conn = storage.get_connection()
+    conn.execute(
+        "UPDATE trade_candidates SET created_at = '2026-01-01 00:00:00' WHERE candidate_id = 'before-1'"
+    )
+    conn.execute(
+        """
+        INSERT INTO experiments
+            (experiment_id, symbol, timeframe, hypothesis, locked_config_json,
+             target_metrics_json, stopping_rule_json, direction_source, registered_at)
+        VALUES ('exp1', 'TEST', '5m', 'h', '{}', '{}', '{}', 'coordinator', '2026-06-01 00:00:00')
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    storage.init_db()  # re-run the migration against the same DB
+
+    experiment = storage.get_experiment_by_id("exp1")
+    assert experiment["registered_watermark_rowid"] == 1  # "before-1" (created before registered_at) counted

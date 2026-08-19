@@ -1097,7 +1097,7 @@ trading logic.
 
 ---
 
-## Experiment registry (Tier 3.20)
+## Experiment registry (Tier 3.20, hardened Tier 3.23)
 
 The fourth external review (2026-08-18): every finding this project
 has produced has been retrospective, and the weekly scheduled check
@@ -1107,39 +1107,95 @@ ideas — by the time that threshold fires, none of its candidates will
 be a clean holdout in any normal sense, even with scoring untouched
 the whole time. This is a lightweight, append-only pre-registration
 mechanism: freeze a hypothesis, a stopping rule, and a snapshot of the
-live scoring config, then only count candidates created AT OR AFTER
-that moment toward it. Deliberately not the full "shadow trading
-engine" a prior review gestured at — the review's own guidance was
-that a simple registration + one-time resolution log is enough for
-now.
+live scoring config, then only count candidates inserted AFTER that
+moment toward it. Deliberately not the full "shadow trading engine" a
+prior review gestured at — the review's own guidance was that a simple
+registration + one-time resolution log is enough for now; Tier 3.23
+made that honest naming explicit — see below.
 
-### `POST /experiments?symbol=MNQ1!&timeframe=5m&hypothesis=...&target_metrics=win_rate&target_metrics=profit_factor&min_distinct_trading_days=15` (secret required)
+**Tier 3.23 (fifth external review, 2026-08-19).** The fifth review
+praised the pre-registration IDEA but found the EXECUTION incomplete —
+`locked_config` was recorded but never actually used. Six fixes:
+
+1. **Re-scoring, not trusting stored decisions.** If `direction_source`
+   is `"coordinator"`, every prospective candidate is now re-scored via
+   `app.replay.replay_candidate()` under the experiment's FROZEN
+   weights/threshold/min_available_weight before any backtest runs —
+   closing the gap where a live config change mid-experiment could
+   silently blend two different scoring configs into one resolution.
+   (Other `direction_source` values never depended on Coordinator
+   weights, so nothing to re-score there.)
+2. **Geometry locking.** `atr_stop_mult`/`atr_target_mult`/
+   `expiry_bars`/`non_overlapping` are captured at registration and
+   threaded through as real parameters at evaluation/resolution.
+   `slippage_points`/`commission_per_contract`/`backtest_logic_version`
+   aren't parametrizable in `app.backtest` yet, so those are
+   drift-CHECKED instead — see `geometry_drift` below.
+3. **Structured `target_metrics`.** No longer a free-text list —
+   `primary_metric` (one of `win_rate`/`profit_factor`/`avg_pnl_usd`/
+   `median_pnl_usd`/`total_pnl_usd`/`max_drawdown_usd`/`trades_taken`/
+   `wins`/`losses`), `comparator` (one of `>=`/`<=`/`>`/`<`/`==`),
+   `success_threshold` (a number), optional `secondary_metrics`
+   (reported, not gated). `resolve_experiment()` now computes whether
+   the primary metric actually met its bar.
+4. **`registered_watermark_rowid`, not `registered_at`.** The
+   no-peeking boundary is now a monotonic integer (the highest
+   `trade_candidates.rowid` that existed at registration), not a
+   second-precision timestamp string comparison — no same-second tie
+   is possible.
+5. **No silent truncation.** The prospective-candidate query is
+   unbounded (every candidate past the watermark), not a "newest
+   2000" query that could quietly drop the OLDEST prospective
+   candidates once a long-running experiment outgrew that limit.
+   `EXPERIMENT_MAX_PROSPECTIVE_CANDIDATES` (default 20000) now raises
+   `ExperimentError` loudly instead.
+6. **Honest naming.** This is a prospective experiment registry with
+   one-time aggregate resolution, not yet a full append-only shadow
+   evaluation engine (no per-candidate outcome ledger) — a real step
+   toward that, not the same thing under a bigger name.
+
+### `POST /experiments?symbol=MNQ1!&timeframe=5m&hypothesis=...&primary_metric=win_rate&comparator=%3E%3D&success_threshold=0.55&secondary_metrics=profit_factor&min_distinct_trading_days=15` (secret required)
 
 ```json
 {
   "experiment_id": "b0d1...", "symbol": "MNQ1!", "timeframe": "5m",
   "hypothesis": "Coordinator's blended decision beats Analysis alone on win_rate over the next 15 independent trading days",
-  "locked_config": {"coordinator_threshold": 25.0, "weights": {"analysis": 0.4, "news": 0.25, "timing": 0.2, "macro": 0.15}, "min_available_weight": 0.6},
-  "target_metrics": ["win_rate", "profit_factor"],
+  "locked_config": {
+    "coordinator_threshold": 25.0,
+    "weights": {"analysis": 0.4, "news": 0.25, "timing": 0.2, "macro": 0.15},
+    "min_available_weight": 0.6,
+    "backtest_geometry": {
+      "atr_stop_mult": 1.5, "atr_target_mult": 2.5, "expiry_bars": 24,
+      "non_overlapping": true, "slippage_points": 0.25,
+      "commission_per_contract": 2.0, "backtest_logic_version": "1"
+    }
+  },
+  "target_metrics": {
+    "primary_metric": "win_rate", "comparator": ">=", "success_threshold": 0.55,
+    "secondary_metrics": ["profit_factor"]
+  },
   "stopping_rule": {"min_distinct_trading_days": 15},
   "direction_source": "coordinator",
-  "registered_at": "2026-08-18 10:15:03", "status": "active",
-  "resolved_at": null, "resolution": null
+  "registered_at": "2026-08-19 09:40:03",
+  "registered_watermark_rowid": 374,
+  "status": "active", "resolved_at": null, "resolution": null
 }
 ```
 
-`locked_config` snapshots the CURRENT live `coordinator_threshold`/
-`weights`/`min_available_weight` at registration — read-only, never
-mutates them, and never changes even if the live config is later
-edited. `registered_at` is stamped by SQLite's own clock, the same
-clock every candidate's `created_at` uses — the hard, exact boundary:
-only candidates created at or after this moment ever count toward
-this experiment. `stopping_rule` accepts `min_distinct_trading_days`
-and/or `min_accepted_trades` (the latter computed via
+`locked_config` snapshots the CURRENT live scoring config AND backtest
+geometry at registration — read-only, never mutates them, and never
+changes even if the live values are later edited.
+`registered_watermark_rowid` is the real no-peeking boundary (see
+point 4 above); `registered_at` is kept for display/audit only.
+`stopping_rule` accepts `min_distinct_trading_days` and/or
+`min_accepted_trades` (the latter computed via
 `compute_backtest_comparison`'s `trades_taken` for `direction_source`
 — the same non-overlapping-schedule trade count backtest-lite already
-reports); at least one is required. 400 on an empty hypothesis, empty
-`target_metrics`, an empty/unrecognized `stopping_rule`, or an unknown
+reports, run against LOCKED-config-rescored candidates as of Tier
+3.23); at least one is required. 400 on an empty hypothesis, an
+invalid `target_metrics` (unknown `primary_metric`/`comparator`, a
+non-numeric `success_threshold`, an unknown `secondary_metrics`
+entry), an empty/unrecognized `stopping_rule`, or an unknown
 `direction_source`.
 
 ### `GET /experiments?symbol=MNQ1!&timeframe=5m`
@@ -1161,12 +1217,21 @@ consumes anything:
   "stopping_rule_status": {
     "prospective_candidates_considered": 40,
     "checks": {"min_distinct_trading_days": {"required": 15, "actual": 3, "met": false}},
-    "stopping_rule_met": false
+    "stopping_rule_met": false,
+    "geometry_drift": null
   }
 }
 ```
 
-404 if `experiment_id` doesn't exist.
+`geometry_drift` (Tier 3.23) is `null` when live slippage/commission/
+backtest-logic-version still match what was locked, or an object
+naming exactly which of those three drifted (`{"locked": ..., "live":
+...}` per key) if not — surfaced loudly rather than silently blended
+into the backtest. Raises `ExperimentError` (surfaced as a 500 from
+this endpoint, since it's an unusual/unexpected condition, not a
+normal 4xx) if the prospective window has grown past
+`EXPERIMENT_MAX_PROSPECTIVE_CANDIDATES`. 404 if `experiment_id`
+doesn't exist.
 
 ### `POST /experiments/{experiment_id}/resolve` (secret required)
 
@@ -1174,10 +1239,32 @@ The one-time outcome recording. 409 if the stopping rule isn't met yet
 (check `GET /experiments/{id}` first — this endpoint never forces an
 early look). Once resolved, returns the SAME `resolution` on every
 subsequent call — calling it again after more data accumulates never
-recomputes it; `resolution` embeds a `day_session` breakdown and a
-full `compute_backtest_comparison` result, computed ONLY from
-prospective candidates as of the moment the stopping rule was first
-satisfied. 404 for an unknown `experiment_id`.
+recomputes it; `resolution` embeds a `day_session` breakdown, a full
+`compute_backtest_comparison` result (Tier 3.23: run against
+LOCKED-config-rescored candidates, with locked geometry parameters),
+`target_metrics_result` (Tier 3.23: whether the pre-registered primary
+metric actually met its comparator/threshold — `met` is `null`, not
+`false`, when the metric itself is undefined, e.g. `profit_factor`
+with no losses yet), and `geometry_drift` (same shape as above) —
+computed ONLY from prospective candidates as of the moment the
+stopping rule was first satisfied. 404 for an unknown `experiment_id`.
+
+```json
+{
+  "...": "...",
+  "resolution": {
+    "resolved_from_candidates_considered": 22,
+    "day_session": { "...": "..." },
+    "backtest": { "...": "..." },
+    "target_metrics_result": {
+      "primary_metric": "win_rate", "comparator": ">=", "success_threshold": 0.55,
+      "actual": 0.61, "met": true,
+      "secondary_metrics": {"profit_factor": 1.8}
+    },
+    "geometry_drift": null
+  }
+}
+```
 
 Entirely additive: no existing endpoint's behavior changes,
 `COORDINATOR_THRESHOLD`/`WEIGHTS` are only read and snapshotted, never

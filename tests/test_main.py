@@ -1014,12 +1014,15 @@ def test_trading_date_integrity_endpoint_empty_history(client):
 # Tier 3.20: experiment registry (fourth external review, 2026-08-18)
 # ---------------------------------------------------------------------------
 
+_WIN_RATE_TARGET_PARAMS = {"primary_metric": "win_rate", "comparator": ">=", "success_threshold": 0.5}
+
+
 def test_register_experiment_endpoint_requires_secret(client):
     r = client.post(
         "/experiments",
         params={
             "symbol": "MNQ1!", "timeframe": "5m", "hypothesis": "h",
-            "target_metrics": ["win_rate"], "min_distinct_trading_days": 1,
+            **_WIN_RATE_TARGET_PARAMS, "min_distinct_trading_days": 1,
         },
     )
     assert r.status_code == 401
@@ -1031,7 +1034,8 @@ def test_register_experiment_endpoint_returns_locked_config(client):
         "/experiments",
         params={
             "symbol": "MNQ1!", "timeframe": "5m", "hypothesis": "Coordinator beats a coin flip",
-            "target_metrics": ["win_rate", "profit_factor"], "min_distinct_trading_days": 2,
+            "primary_metric": "win_rate", "comparator": ">=", "success_threshold": 0.5,
+            "secondary_metrics": ["profit_factor"], "min_distinct_trading_days": 2,
         },
         headers=headers,
     )
@@ -1039,17 +1043,22 @@ def test_register_experiment_endpoint_returns_locked_config(client):
     body = r.json()
     assert body["status"] == "active"
     assert body["hypothesis"] == "Coordinator beats a coin flip"
-    assert body["target_metrics"] == ["win_rate", "profit_factor"]
+    assert body["target_metrics"] == {
+        "primary_metric": "win_rate", "comparator": ">=", "success_threshold": 0.5,
+        "secondary_metrics": ["profit_factor"],
+    }
     assert body["stopping_rule"] == {"min_distinct_trading_days": 2}
     assert "coordinator_threshold" in body["locked_config"]
     assert "weights" in body["locked_config"]
+    assert "backtest_geometry" in body["locked_config"]
+    assert "registered_watermark_rowid" in body
 
 
 def test_register_experiment_endpoint_rejects_missing_stopping_rule(client):
     headers = {"X-Webhook-Secret": "test-secret"}
     r = client.post(
         "/experiments",
-        params={"symbol": "MNQ1!", "timeframe": "5m", "hypothesis": "h", "target_metrics": ["win_rate"]},
+        params={"symbol": "MNQ1!", "timeframe": "5m", "hypothesis": "h", **_WIN_RATE_TARGET_PARAMS},
         headers=headers,
     )
     assert r.status_code == 400
@@ -1061,7 +1070,7 @@ def test_experiments_list_and_detail_endpoints(client):
         "/experiments",
         params={
             "symbol": "MNQ1!", "timeframe": "5m", "hypothesis": "h",
-            "target_metrics": ["win_rate"], "min_distinct_trading_days": 5,
+            **_WIN_RATE_TARGET_PARAMS, "min_distinct_trading_days": 5,
         },
         headers=headers,
     ).json()
@@ -1090,7 +1099,7 @@ def test_resolve_experiment_endpoint_requires_secret(client):
         "/experiments",
         params={
             "symbol": "MNQ1!", "timeframe": "5m", "hypothesis": "h",
-            "target_metrics": ["win_rate"], "min_distinct_trading_days": 1,
+            **_WIN_RATE_TARGET_PARAMS, "min_distinct_trading_days": 1,
         },
         headers=headers,
     ).json()
@@ -1105,7 +1114,7 @@ def test_resolve_experiment_endpoint_409_when_stopping_rule_not_met(client):
         "/experiments",
         params={
             "symbol": "MNQ1!", "timeframe": "5m", "hypothesis": "h",
-            "target_metrics": ["win_rate"], "min_distinct_trading_days": 5,
+            **_WIN_RATE_TARGET_PARAMS, "min_distinct_trading_days": 5,
         },
         headers=headers,
     ).json()
@@ -1120,6 +1129,33 @@ def test_resolve_experiment_endpoint_404_for_unknown_id(client):
     assert r.status_code == 404
 
 
+def test_experiment_endpoints_500_past_the_safety_ceiling(client, monkeypatch):
+    import app.experiments as experiments
+    import app.storage as storage
+
+    monkeypatch.setattr(experiments, "EXPERIMENT_MAX_PROSPECTIVE_CANDIDATES", 1)
+    headers = {"X-Webhook-Secret": "test-secret"}
+    registered = client.post(
+        "/experiments",
+        params={
+            "symbol": "MNQ1!", "timeframe": "5m", "hypothesis": "h",
+            **_WIN_RATE_TARGET_PARAMS, "min_distinct_trading_days": 1,
+        },
+        headers=headers,
+    ).json()
+    for i in range(2):
+        anchor = f"2026-08-{11 + i:02d}T14:00:00Z"
+        bar = {"event_id": f"evt-ceiling-{i}", "symbol": "MNQ1!", "timeframe": "5m", "timestamp": anchor}
+        decision = {"decision": "no_trade", "timestamp": anchor, "opinions_used": {}}
+        storage.save_candidate(candidate_id=f"cand-ceiling-{i}", symbol="MNQ1!", timeframe="5m", bar=bar, decision=decision)
+
+    detail = client.get(f"/experiments/{registered['experiment_id']}")
+    assert detail.status_code == 500
+
+    resolve = client.post(f"/experiments/{registered['experiment_id']}/resolve", headers=headers)
+    assert resolve.status_code == 500
+
+
 def test_resolve_experiment_endpoint_succeeds_once_stopping_rule_met(client):
     import app.storage as storage
 
@@ -1128,14 +1164,13 @@ def test_resolve_experiment_endpoint_succeeds_once_stopping_rule_met(client):
         "/experiments",
         params={
             "symbol": "MNQ1!", "timeframe": "5m", "hypothesis": "h",
-            "target_metrics": ["win_rate"], "min_distinct_trading_days": 1,
+            **_WIN_RATE_TARGET_PARAMS, "min_distinct_trading_days": 1,
         },
         headers=headers,
     ).json()
 
-    # A candidate created AFTER registration (registered_at defaults to
-    # "now" via SQLite, and save_candidate's created_at also defaults
-    # to "now" -- close enough in the same test to land at/after it).
+    # A candidate inserted AFTER registration -- Tier 3.23's boundary is
+    # insertion order (rowid) relative to registration, not a timestamp.
     anchor = "2026-08-11T14:00:00Z"
     bar = {"event_id": "evt-exp-1", "symbol": "MNQ1!", "timeframe": "5m", "timestamp": anchor, "trading_date": "2026-08-11"}
     decision = {
@@ -1149,6 +1184,7 @@ def test_resolve_experiment_endpoint_succeeds_once_stopping_rule_met(client):
     body = r.json()
     assert body["status"] == "resolved"
     assert body["resolution"]["resolved_from_candidates_considered"] == 1
+    assert "target_metrics_result" in body["resolution"]
 
     # idempotent: resolving again returns the same resolution, 200 not 409
     r2 = client.post(f"/experiments/{registered['experiment_id']}/resolve", headers=headers)

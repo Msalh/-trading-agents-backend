@@ -131,6 +131,7 @@ CREATE TABLE IF NOT EXISTS experiments (
     stopping_rule_json TEXT NOT NULL,
     direction_source TEXT NOT NULL,
     registered_at TEXT NOT NULL DEFAULT (datetime('now')),
+    registered_watermark_rowid INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'active',
     resolved_at TEXT,
     resolution_json TEXT
@@ -193,6 +194,41 @@ def init_db() -> None:
         # date (repeatedly reconfirmed live via /system/status), so no
         # pre-migration row could possibly have come from that path.
         conn.execute("UPDATE paper_trades SET provenance = 'manual_dashboard' WHERE provenance IS NULL")
+        # Tier 3.23 (fifth external review — experiment registry
+        # hardening): registered_watermark_rowid replaces registered_at
+        # as the no-peeking boundary for app.experiments._prospective_
+        # candidates(). A second-precision string-timestamp comparison
+        # (the Tier 3.20 original) can't distinguish a candidate created
+        # in the SAME second as registration but a moment before it; a
+        # monotonic rowid has no such tie. See app/experiments.py.
+        try:
+            conn.execute("ALTER TABLE experiments ADD COLUMN registered_watermark_rowid INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e):
+                raise
+        # Backfill for any experiment registered before this migration
+        # (registered_watermark_rowid = 0, the column default, meaning
+        # "unset"): approximate the watermark as the highest
+        # trade_candidates.rowid that existed strictly before this
+        # experiment's own registered_at, for the SAME symbol/timeframe
+        # — the best reconstruction available from data recorded under
+        # the old (Tier 3.20) timestamp-only scheme. This is an
+        # approximation, not exact, for any such pre-existing row —
+        # documented here since no better information exists for rows
+        # that predate rowid-based tracking.
+        conn.execute(
+            """
+            UPDATE experiments
+            SET registered_watermark_rowid = (
+                SELECT COALESCE(MAX(tc.rowid), 0)
+                FROM trade_candidates tc
+                WHERE tc.symbol = experiments.symbol
+                  AND tc.timeframe = experiments.timeframe
+                  AND tc.created_at < experiments.registered_at
+            )
+            WHERE registered_watermark_rowid = 0
+            """
+        )
         conn.commit()
     finally:
         conn.close()
@@ -628,6 +664,77 @@ def get_recent_candidates(symbol: str, timeframe: str, limit: int = 20) -> list[
             (symbol, timeframe, limit),
         ).fetchall()
         return [_row_to_candidate(r) for r in rows]
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Tier 3.23 (fifth external review — experiment registry hardening):
+# rowid-based candidate access. trade_candidates' PRIMARY KEY is TEXT
+# (candidate_id), so unlike an INTEGER PRIMARY KEY table, SQLite's
+# hidden `rowid` is NOT included in `SELECT *` — it has to be selected
+# explicitly. app.experiments uses this monotonic integer as a
+# no-peeking boundary instead of a second-precision timestamp string
+# comparison (get_max_candidate_rowid() at registration,
+# get_candidates_after_rowid() at evaluation/resolution) — a rowid has
+# no same-second tie the way registered_at/created_at string comparison
+# could.
+# ---------------------------------------------------------------------------
+
+def get_max_candidate_rowid(symbol: str, timeframe: str) -> int:
+    """The highest rowid currently in trade_candidates for this symbol/
+    timeframe, or 0 if there are none yet. Called once, at experiment
+    registration — the exact boundary a later
+    get_candidates_after_rowid() call filters against."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(rowid), 0) as m FROM trade_candidates WHERE symbol = ? AND timeframe = ?",
+            (symbol, timeframe),
+        ).fetchone()
+        return row["m"]
+    finally:
+        conn.close()
+
+
+def count_candidates_after_rowid(symbol: str, timeframe: str, min_rowid: int) -> int:
+    """Cheap COUNT-only check, used as a safety pre-check before
+    get_candidates_after_rowid() below pulls full rows into memory —
+    lets a caller detect and refuse an unexpectedly huge prospective
+    window instead of silently truncating it."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) as c FROM trade_candidates WHERE symbol = ? AND timeframe = ? AND rowid > ?",
+            (symbol, timeframe, min_rowid),
+        ).fetchone()
+        return row["c"]
+    finally:
+        conn.close()
+
+
+def get_candidates_after_rowid(symbol: str, timeframe: str, min_rowid: int) -> list[dict]:
+    """EVERY candidate with rowid > min_rowid for this symbol/timeframe,
+    oldest first, no LIMIT — deliberately unbounded, unlike
+    get_recent_candidates() above. A "newest N" query is the wrong tool
+    for a prospective experiment window: if the true prospective set
+    ever exceeds N, a DESC+LIMIT query would silently keep the newest
+    rows and drop the OLDEST prospective ones (the ones closest to
+    registration) rather than failing loudly — exactly the fourth-
+    review-era "no silent truncation" principle this project already
+    applies elsewhere. Callers that need a size safety valve should
+    call count_candidates_after_rowid() first."""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT rowid, * FROM trade_candidates
+            WHERE symbol = ? AND timeframe = ? AND rowid > ?
+            ORDER BY rowid ASC
+            """,
+            (symbol, timeframe, min_rowid),
+        ).fetchall()
+        return [{**_row_to_candidate(r), "rowid": r["rowid"]} for r in rows]
     finally:
         conn.close()
 
@@ -1198,6 +1305,7 @@ def get_recent_llm_calls(limit: int = 50, agent: str | None = None) -> list[dict
 # ---------------------------------------------------------------------------
 
 def _row_to_experiment(row: sqlite3.Row) -> dict:
+    row_keys = row.keys()
     return {
         "experiment_id": row["experiment_id"],
         "symbol": row["symbol"],
@@ -1208,6 +1316,11 @@ def _row_to_experiment(row: sqlite3.Row) -> dict:
         "stopping_rule": json.loads(row["stopping_rule_json"]),
         "direction_source": row["direction_source"],
         "registered_at": row["registered_at"],
+        # Tier 3.23: the rowid-based no-peeking boundary — see
+        # get_max_candidate_rowid()/get_candidates_after_rowid() above.
+        # row_keys guard for the same reason as every other
+        # migration-added column in this file.
+        "registered_watermark_rowid": row["registered_watermark_rowid"] if "registered_watermark_rowid" in row_keys else 0,
         "status": row["status"],
         "resolved_at": row["resolved_at"],
         "resolution": json.loads(row["resolution_json"]) if row["resolution_json"] else None,
@@ -1220,30 +1333,33 @@ def save_experiment(
     timeframe: str,
     hypothesis: str,
     locked_config: dict,
-    target_metrics: list,
+    target_metrics: dict,
     stopping_rule: dict,
     direction_source: str,
+    registered_watermark_rowid: int,
 ) -> dict:
     """Inserts one new experiment row, status='active'. registered_at
-    is stamped by SQLite's own datetime('now') -- the SAME clock
-    trade_candidates.created_at is stamped with -- so a later
-    `candidate.created_at >= experiment.registered_at` comparison
-    (app.experiments._prospective_candidates) compares two timestamps
-    from the same clock, never the app server's local clock against
-    SQLite's."""
+    is stamped by SQLite's own datetime('now') -- kept for display/
+    audit purposes, but as of Tier 3.23 the actual no-peeking boundary
+    app.experiments._prospective_candidates() enforces is
+    registered_watermark_rowid (a monotonic integer, computed by the
+    caller via storage.get_max_candidate_rowid() immediately before
+    this call), not a timestamp comparison."""
     conn = get_connection()
     try:
         conn.execute(
             """
             INSERT INTO experiments
                 (experiment_id, symbol, timeframe, hypothesis, locked_config_json,
-                 target_metrics_json, stopping_rule_json, direction_source)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 target_metrics_json, stopping_rule_json, direction_source,
+                 registered_watermark_rowid)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 experiment_id, symbol, timeframe, hypothesis,
                 json.dumps(locked_config), json.dumps(target_metrics),
                 json.dumps(stopping_rule), direction_source,
+                registered_watermark_rowid,
             ),
         )
         conn.commit()

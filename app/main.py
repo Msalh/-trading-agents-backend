@@ -774,6 +774,39 @@ closed trade regardless of provenance — whether a manual paper trade
 should consume real risk-budget capacity is an open design question,
 flagged to the user rather than decided here.
 
+Tier 3.23 (experiment registry hardening, fifth external review,
+2026-08-19): the fifth review found six concrete gaps in Tier 3.20's
+experiment registry — praised the pre-registration IDEA, flagged the
+EXECUTION as incomplete. locked_config was recorded but never actually
+enforced: (a) evaluate_stopping_rule()/resolve_experiment() now
+re-score every prospective candidate via app.replay.replay_candidate()
+under the experiment's frozen weights/threshold/min_available_weight
+before running any backtest, instead of trusting each candidate's own
+stored decision (which may have been computed under a since-changed
+live config). (b) Backtest geometry (ATR stop/target mult, expiry_bars,
+non_overlapping) is now locked and threaded through as real parameters;
+slippage/commission/backtest-logic-version aren't parametrizable in
+app.backtest yet, so those are drift-CHECKED instead — a loud
+`geometry_drift` field appears whenever live no longer matches locked,
+rather than silently blending the two. (c) target_metrics is now a
+structured, validated commitment (primary_metric/comparator/
+success_threshold/secondary_metrics) — resolve_experiment() computes
+and reports whether the primary metric actually met its pre-registered
+bar (`target_metrics_result`), not just that some numbers were
+recorded. (d) The no-peeking boundary is now
+registered_watermark_rowid (a monotonic integer captured at
+registration) instead of a second-precision registered_at string
+comparison. (e) The prospective-candidate query is now unbounded
+(fetches every candidate past the watermark, oldest first) instead of
+a "newest 2000" query that could silently drop the OLDEST prospective
+candidates once a long-running experiment's window grew past that
+limit — EXPERIMENT_MAX_PROSPECTIVE_CANDIDATES now raises loudly
+instead of truncating silently. (f) Documented honestly: this is a
+prospective experiment registry with one-time aggregate resolution,
+not yet a full append-only shadow evaluation engine (no per-candidate
+outcome ledger) — a real step toward that, not the same thing under a
+bigger name. See app/experiments.py's module docstring for full detail.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -803,7 +836,13 @@ from app.backtest import (
     run_paired_barrier_backtest,
     run_sensitivity_grid,
 )
-from app.experiments import ExperimentError, evaluate_stopping_rule, list_experiments
+from app.experiments import (
+    VALID_COMPARATORS,
+    VALID_TARGET_METRIC_KEYS,
+    ExperimentError,
+    evaluate_stopping_rule,
+    list_experiments,
+)
 from app.experiments import register_experiment as register_new_experiment
 from app.experiments import resolve_experiment as resolve_existing_experiment
 from app.candidates import (
@@ -2348,28 +2387,40 @@ def register_experiment_endpoint(
     symbol: str = Query(...),
     timeframe: str = Query(...),
     hypothesis: str = Query(..., description="what this experiment is testing, in plain language"),
-    target_metrics: list[str] = Query(..., description="repeat this param once per metric, e.g. target_metrics=win_rate&target_metrics=profit_factor"),
+    primary_metric: str = Query(..., description=f"one of {VALID_TARGET_METRIC_KEYS} — the metric resolve_experiment() judges success/failure by"),
+    comparator: str = Query(..., description=f"one of {VALID_COMPARATORS}"),
+    success_threshold: float = Query(..., description="e.g. primary_metric=win_rate&comparator=>=&success_threshold=0.55"),
+    secondary_metrics: list[str] = Query(default=[], description="reported at resolution but not gated — repeat this param once per metric"),
     direction_source: str = Query(default="coordinator", description=f"one of {DIRECTION_SOURCES}"),
     min_distinct_trading_days: int | None = Query(default=None),
     min_accepted_trades: int | None = Query(default=None),
     x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret"),
 ) -> dict:
-    """Tier 3.20 (experiment registry): pre-registers a hypothesis
-    against the CURRENT live coordinator_threshold/weights/
-    min_available_weight, snapshotted and frozen at this moment —
-    changing the live config later never retroactively edits an
-    already-registered experiment's locked_config. registered_at (set
-    by SQLite's own clock, same as every candidate's created_at) marks
-    the hard boundary: only candidates created from this instant
-    forward are ever eligible to count toward this experiment's
-    stopping rule or resolution — existing candidates are exploratory
-    and permanently ineligible for this experiment, by design.
+    """Tier 3.20 (experiment registry), hardened in Tier 3.23 (fifth
+    external review): pre-registers a hypothesis against the CURRENT
+    live coordinator_threshold/weights/min_available_weight AND
+    backtest geometry (ATR stop/target mult, expiry_bars, slippage,
+    commission, backtest logic version), snapshotted and frozen at this
+    moment — changing any of these later never retroactively edits an
+    already-registered experiment's locked_config, and (Tier 3.23)
+    evaluate_stopping_rule()/resolve_experiment() actually RE-SCORE
+    every prospective candidate under this frozen config rather than
+    trusting whatever each candidate's own stored decision happened to
+    be computed under. registered_watermark_rowid (Tier 3.23 — a
+    monotonic integer, not a timestamp) marks the hard boundary: only
+    candidates inserted after this exact row are ever eligible to count
+    toward this experiment's stopping rule or resolution — existing
+    candidates are exploratory and permanently ineligible for this
+    experiment, by design.
 
     At least one of min_distinct_trading_days / min_accepted_trades
     must be set (the stopping rule) — an experiment with no stopping
-    rule could never legitimately be resolved. target_metrics is
-    recorded, not enforced by this endpoint — it's a commitment device
-    (what you said you'd judge this by), read back at resolution time.
+    rule could never legitimately be resolved. target_metrics (Tier
+    3.23: primary_metric/comparator/success_threshold, structured and
+    validated — no longer a free-text list) is a real commitment
+    device: resolve_experiment() computes and reports whether the
+    primary metric actually met its pre-registered bar, not just that
+    some numbers were recorded.
 
     Secret-protected: this writes to the database and, once resolved,
     the record is permanent — same guard as /webhook/tradingview and
@@ -2380,6 +2431,12 @@ def register_experiment_endpoint(
         stopping_rule["min_distinct_trading_days"] = min_distinct_trading_days
     if min_accepted_trades is not None:
         stopping_rule["min_accepted_trades"] = min_accepted_trades
+    target_metrics = {
+        "primary_metric": primary_metric,
+        "comparator": comparator,
+        "success_threshold": success_threshold,
+        "secondary_metrics": secondary_metrics,
+    }
     try:
         return register_new_experiment(
             symbol=symbol, timeframe=timeframe, hypothesis=hypothesis,
@@ -2408,14 +2465,21 @@ def experiment_by_id_endpoint(experiment_id: str) -> dict:
     read-only, non-consuming stopping_rule_status computed against
     prospective candidates right now — checking this as many times as
     you like never resolves the experiment or affects the eventual
-    outcome."""
+    outcome.
+
+    Tier 3.23: 500 (not an unhandled crash) if the prospective window
+    has grown past EXPERIMENT_MAX_PROSPECTIVE_CANDIDATES — an unusual
+    condition (a very long-running experiment), not a normal 4xx."""
     experiment = get_experiment_by_id(experiment_id)
     if experiment is None:
         raise HTTPException(status_code=404, detail=f"no experiment found with id={experiment_id}")
-    return {
-        **experiment,
-        "stopping_rule_status": evaluate_stopping_rule(experiment),
-    }
+    try:
+        return {
+            **experiment,
+            "stopping_rule_status": evaluate_stopping_rule(experiment),
+        }
+    except ExperimentError as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/experiments/{experiment_id}/resolve")
@@ -2428,13 +2492,22 @@ def resolve_experiment_endpoint(
     look). If already resolved, returns the SAME resolution recorded
     the first time this succeeded — calling this again after more data
     accumulates never recomputes it. Secret-protected, same guard as
-    registration."""
+    registration.
+
+    Tier 3.23: 500 (not 409) if the prospective window has grown past
+    EXPERIMENT_MAX_PROSPECTIVE_CANDIDATES — that's a safety ceiling
+    tripping, not "the stopping rule isn't met yet.\""""
     _check_secret(x_webhook_secret)
     try:
         return resolve_existing_experiment(experiment_id)
     except ExperimentError as e:
         message = str(e)
-        status_code = 404 if message.startswith("no experiment with id") else 409
+        if message.startswith("no experiment with id"):
+            status_code = 404
+        elif "not yet met" in message:
+            status_code = 409
+        else:
+            status_code = 500
         raise HTTPException(status_code=status_code, detail=message)
 
 

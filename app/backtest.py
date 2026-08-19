@@ -226,6 +226,18 @@ ATR_STOP_MULT = float(os.environ.get("BACKTEST_ATR_STOP_MULT", "1.5"))
 ATR_TARGET_MULT = float(os.environ.get("BACKTEST_ATR_TARGET_MULT", "2.5"))
 EXPIRY_BARS = int(os.environ.get("BACKTEST_EXPIRY_BARS", "24"))
 
+# Tier 3.23 (fifth external review — experiment registry hardening): a
+# hand-maintained marker for the barrier-simulation LOGIC itself (fill/
+# stop/target ordering, slippage/commission application, expiry
+# handling — everything in run_barrier_backtest that ISN'T a config
+# knob already covered by ATR_STOP_MULT/ATR_TARGET_MULT/EXPIRY_BARS/
+# SLIPPAGE_POINTS/COMMISSION_PER_CONTRACT above). Bump this by hand
+# whenever a change to that logic could alter results for candidates
+# that were simulated before vs after the change — app.experiments
+# locks this value at registration and flags a mismatch at resolution
+# rather than silently blending two different simulation behaviors.
+BACKTEST_LOGIC_VERSION = "1"
+
 
 def _parse_float_list(env_value: str | None, default: tuple[float, ...]) -> tuple[float, ...]:
     if not env_value:
