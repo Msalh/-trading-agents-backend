@@ -1336,12 +1336,15 @@ noticeably higher than their `present_and_directional` counts above
 (123/94) — presence includes candidates where the agent had a
 `neutral` opinion, not just a directional one. The `decision_changed_
 by_category`/`conflict_flags_changed_count`/`avg_abs_score_delta_*`
-fields are Tier 3.21 additions (see below) — the `null` averages and
-the illustrative `news_removed`/`macro_removed` category splits above
-are placeholder shapes pending a fresh production pull with the field
-live; `analysis_removed`'s category split is NOT a placeholder — it's
-mathematically guaranteed to be 100% `to_insufficient_data`, explained
-below.
+fields are Tier 3.21 additions — the `null` averages and the
+`news_removed`/`macro_removed` category splits shown in this 197-
+candidate example are illustrative placeholder shapes from before the
+field went live, kept here only as part of the historical Tier 3.16/
+3.17 record. `analysis_removed`'s category split was never a
+placeholder — it's mathematically guaranteed to be 100%
+`to_insufficient_data`, explained below. See "Tier 3.21 confirmed
+production numbers" further down for the real, cross-verified
+post-3.21 figures on a larger (300-candidate) sample.
 
 `cross_tab` is the complete picture — every candidate falls into
 exactly one `analysis_bucket -> coordinator_decision` cell.
@@ -1467,6 +1470,52 @@ candidate sample.
 Entirely offline and read-only — no LLM calls, no new candidates or
 trades, no effect on `COORDINATOR_THRESHOLD` or the live scoring
 config.
+
+**Tier 3.21 confirmed production numbers.** Pulled from production
+(`b57e0d6`, MNQ1!/5m, 300 candidates) via two independently-phrased
+cross-verified fetches, both matching exactly:
+
+```json
+{
+  "candidates_considered": 300,
+  "ablation": {
+    "analysis_removed": {
+      "agent_present_count": 300, "decision_changed": 223, "decision_unchanged": 77,
+      "decision_changed_by_category": { "to_insufficient_data": 223 },
+      "avg_abs_score_delta_when_changed": 33.53
+    },
+    "news_removed": {
+      "agent_present_count": 223, "decision_changed": 40, "decision_unchanged": 260,
+      "decision_changed_by_category": { "threshold_crossing": 32, "to_insufficient_data": 8 },
+      "avg_abs_score_delta_when_changed": 30.34
+    },
+    "macro_removed": {
+      "agent_present_count": 215, "decision_changed": 2, "decision_unchanged": 298,
+      "decision_changed_by_category": { "threshold_crossing": 2 },
+      "avg_abs_score_delta_when_changed": 9.59
+    }
+  }
+}
+```
+
+This confirms the reclassification empirically, on a larger sample
+than the original 197-candidate dataset: `analysis_removed` is 100%
+`to_insufficient_data` as proven (223/223, zero `threshold_crossing`
+or `direction_flipped`) — a pure quorum effect, not evidence Analysis's
+*direction* was right 74% of the time. `macro_removed` is now almost
+entirely inert (2/300, both `threshold_crossing`, zero quorum effect —
+Macro was present in only 215/300 candidates and rarely pivotal even
+then). `news_removed` is the one case with a real mix: 32 of its 40
+changes are genuine `threshold_crossing` (News moved the score across
+`COORDINATOR_THRESHOLD` while both sides stayed data-sufficient) versus
+only 8 quorum-only `to_insufficient_data` changes — meaning most of
+News's ablation impact really is directional influence, not just
+completing the availability gate, which is the opposite mix from what
+the raw un-reclassified 47%-changed figure alone would suggest. As
+expected, `direction_flipped` appears zero times across all three
+agents, matching the proof above. `agent_present_count` for Macro
+(215/300) also confirms it's the least-often-present directional
+agent in this larger sample.
 
 ---
 
