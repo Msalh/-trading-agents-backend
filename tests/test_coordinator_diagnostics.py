@@ -9,10 +9,19 @@ app/candidates.create_candidate() actually persists.
 Run with: pytest tests/test_coordinator_diagnostics.py -v
 """
 
+import importlib
 import itertools
+import tempfile
+from datetime import datetime, timedelta, timezone
+
+import pytest
 
 from app.coordinator import MIN_AVAILABLE_WEIGHT, WEIGHTS, _score_opinions
-from app.coordinator_diagnostics import _classify_ablation_change, compute_coordinator_divergence_report
+from app.coordinator_diagnostics import (
+    _classify_ablation_change,
+    compute_coordinator_divergence_report,
+    compute_threshold_crossing_deep_dive,
+)
 
 _candidate_ids = itertools.count(1)
 
@@ -327,3 +336,287 @@ def test_empty_candidate_list_returns_zeroed_report():
     for agent_key in ("analysis_removed", "news_removed", "macro_removed"):
         assert report["ablation"][agent_key]["candidates_considered"] == 0
         assert report["ablation"][agent_key]["agent_present_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# compute_threshold_crossing_deep_dive — Tier 3.26
+#
+# Needs real storage (compute_outcome_for_candidate reads trade rows and
+# outcomes.compute_outcome_at_horizon reads market_state bars), unlike
+# the tests above -- same temp-DB "fresh_env" pattern as test_replay.py/
+# test_outcomes.py, reloading storage -> coordinator -> outcomes ->
+# replay -> coordinator_diagnostics in dependency order so every
+# already-bound `from X import Y` name in this chain points at the
+# fresh DB, not whatever DB_PATH an earlier test file left behind.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def fresh_env(monkeypatch):
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.close()
+    monkeypatch.setenv("DB_PATH", tmp.name)
+
+    import app.storage as storage
+    importlib.reload(storage)
+    storage.init_db()
+
+    import app.coordinator as coordinator
+    importlib.reload(coordinator)
+
+    import app.outcomes as outcomes
+    importlib.reload(outcomes)
+
+    import app.replay as replay
+    importlib.reload(replay)
+
+    import app.coordinator_diagnostics as coordinator_diagnostics
+    importlib.reload(coordinator_diagnostics)
+
+    yield storage, coordinator, outcomes, replay, coordinator_diagnostics
+
+
+def _dd_iso(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _dd_save_bar(storage, symbol, timeframe, timestamp_dt, close):
+    import json
+    conn = storage.get_connection()
+    payload = {
+        "event_id": f"{symbol}:{timeframe}:{_dd_iso(timestamp_dt)}",
+        "symbol": symbol, "timeframe": timeframe, "timestamp": _dd_iso(timestamp_dt),
+        "close": close, "high": close, "low": close, "open": close,
+    }
+    conn.execute(
+        "INSERT INTO market_state (event_id, symbol, timeframe, timestamp, payload_json) VALUES (?, ?, ?, ?, ?)",
+        (payload["event_id"], symbol, timeframe, payload["timestamp"], json.dumps(payload)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _dd_opinion(direction, confidence, timestamp, flags=None):
+    return {
+        "direction": direction, "confidence": confidence, "reasoning": "test",
+        "key_data": {}, "flags": flags or [], "timestamp": timestamp,
+    }
+
+
+def _dd_candidate(coordinator, candidate_id, symbol, timeframe, decision_timestamp, analysis=None, news=None, macro=None):
+    """Builds a real CoordinatorDecision (via the reloaded coordinator
+    module's own _score_opinions, live WEIGHTS/DECISION_THRESHOLD/
+    MIN_AVAILABLE_WEIGHT) and wraps it candidate-shaped, same as the
+    top-of-file _candidate() helper but scoped to the reloaded module
+    so ablation replays inside compute_threshold_crossing_deep_dive see
+    the exact same live config this fixture set up."""
+    opinions = {}
+    if analysis is not None:
+        opinions["analysis"] = analysis
+    if news is not None:
+        opinions["news"] = news
+    if macro is not None:
+        opinions["macro"] = macro
+    decision = coordinator._score_opinions(
+        symbol=symbol, timeframe=timeframe, opinions=opinions,
+        missing_agents=[], stale_agents=[],
+        weights=coordinator.WEIGHTS, threshold=coordinator.DECISION_THRESHOLD,
+        min_available_weight=coordinator.MIN_AVAILABLE_WEIGHT,
+    ).to_dict()
+    decision["timestamp"] = decision_timestamp
+    return {"candidate_id": candidate_id, "symbol": symbol, "timeframe": timeframe, "decision": decision}
+
+
+def _dd_trade(candidate_id, symbol, timeframe, direction, entry, opened_at):
+    return {
+        "trade_id": f"trade-{candidate_id}", "candidate_id": candidate_id,
+        "symbol": symbol, "timeframe": timeframe, "direction": direction, "size": 1,
+        "order_type": "market", "entry_price": entry, "stop_loss": entry - 10,
+        "targets": [entry + 20], "status": "open", "opened_at": opened_at, "fill_price": entry,
+    }
+
+
+def test_deep_dive_rejects_unknown_agent(fresh_env):
+    storage, coordinator, outcomes, replay, coordinator_diagnostics = fresh_env
+    with pytest.raises(ValueError):
+        coordinator_diagnostics.compute_threshold_crossing_deep_dive([], agent="timing")
+
+
+def test_deep_dive_agent_enabled_trade_hypothetical_outcome(fresh_env):
+    """News's presence alone crosses the threshold (analysis 20 +
+    macro 10 alone stay well under it, per _score_opinions with live
+    WEIGHTS -- verified empirically while designing this test) -- a
+    clean agent_enabled_trade case with no real trade attached, so the
+    outcome falls back to the existing hypothetical horizon estimate."""
+    storage, coordinator, outcomes, replay, coordinator_diagnostics = fresh_env
+    decision_time = datetime.now(timezone.utc) - timedelta(hours=2)
+    horizon_time = decision_time + timedelta(minutes=15)
+    _dd_save_bar(storage, "TEST", "5m", decision_time, 100.0)
+    _dd_save_bar(storage, "TEST", "5m", horizon_time, 105.0)
+
+    candidate = _dd_candidate(
+        coordinator, "c1", "TEST", "5m", _dd_iso(decision_time),
+        analysis=_dd_opinion("bullish", 20, _dd_iso(decision_time)),
+        news=_dd_opinion("bullish", 70, _dd_iso(decision_time)),
+        macro=_dd_opinion("bullish", 10, _dd_iso(decision_time)),
+    )
+    assert candidate["decision"]["decision"] == "enter_long"
+
+    result = coordinator_diagnostics.compute_threshold_crossing_deep_dive([candidate], agent="news", horizons=[15])
+    assert result["cases_considered"] == 1
+    case = result["cases"][0]
+    assert case["side"] == "agent_enabled_trade"
+    assert case["agreement_with_analysis"] == "agree"
+    assert case["outcome"]["kind"] == "hypothetical"
+    assert case["outcome"]["by_horizon"][15] == "correct"  # bullish call, price rose
+    assert result["summary"]["by_side"] == {"agent_enabled_trade": 1}
+    assert result["summary"]["agent_enabled_trade_hypothetical_outcomes_by_horizon"][15] == {"correct": 1}
+
+
+def test_deep_dive_agent_enabled_trade_real_trade_outcome(fresh_env):
+    """Same enabling scenario as above, but this candidate actually
+    became a real, closed paper trade -- the outcome must come from the
+    real P&L (compute_outcome_for_candidate's preferred source), not
+    the hypothetical horizon estimate."""
+    storage, coordinator, outcomes, replay, coordinator_diagnostics = fresh_env
+    decision_time = datetime.now(timezone.utc) - timedelta(hours=2)
+
+    candidate = _dd_candidate(
+        coordinator, "c1", "TEST", "5m", _dd_iso(decision_time),
+        analysis=_dd_opinion("bullish", 20, _dd_iso(decision_time)),
+        news=_dd_opinion("bullish", 70, _dd_iso(decision_time)),
+        macro=_dd_opinion("bullish", 10, _dd_iso(decision_time)),
+    )
+    trade = _dd_trade("c1", "TEST", "5m", "bullish", 20020.0, _dd_iso(decision_time))
+    storage.save_paper_trade(trade)
+    storage.close_trade(trade["trade_id"], exit_price=20100.0, exit_reason="target_hit", pnl_usd=160.0, closed_at=_dd_iso(datetime.now(timezone.utc)))
+
+    result = coordinator_diagnostics.compute_threshold_crossing_deep_dive([candidate], agent="news")
+    case = result["cases"][0]
+    assert case["outcome"] == {"kind": "real_trade", "status": "closed", "outcome": "win", "pnl_usd": 160.0}
+    assert result["summary"]["agent_enabled_trade_real_outcomes"] == {"win": 1}
+
+
+def test_deep_dive_agent_prevented_trade(fresh_env):
+    """News bearish against an otherwise-bullish analysis+macro drags
+    the blended score under threshold (no_trade); removing News alone
+    crosses it back over (enter_long) -- an agent_prevented_trade case,
+    with News opposing Analysis's own direction. There's no real trade
+    to look up (it never happened) -- outcome must come from the
+    REPLAYED decision's hypothetical estimate, relabeled prevented_*."""
+    storage, coordinator, outcomes, replay, coordinator_diagnostics = fresh_env
+    decision_time = datetime.now(timezone.utc) - timedelta(hours=2)
+    horizon_time = decision_time + timedelta(minutes=15)
+    _dd_save_bar(storage, "TEST", "5m", decision_time, 100.0)
+    _dd_save_bar(storage, "TEST", "5m", horizon_time, 105.0)
+
+    candidate = _dd_candidate(
+        coordinator, "c1", "TEST", "5m", _dd_iso(decision_time),
+        analysis=_dd_opinion("bullish", 60, _dd_iso(decision_time)),
+        news=_dd_opinion("bearish", 40, _dd_iso(decision_time)),
+        macro=_dd_opinion("bullish", 30, _dd_iso(decision_time)),
+    )
+    assert candidate["decision"]["decision"] == "no_trade"
+
+    result = coordinator_diagnostics.compute_threshold_crossing_deep_dive([candidate], agent="news", horizons=[15])
+    assert result["cases_considered"] == 1
+    case = result["cases"][0]
+    assert case["side"] == "agent_prevented_trade"
+    assert case["agreement_with_analysis"] == "oppose"
+    assert case["outcome"]["kind"] == "prevented_hypothetical"
+    # The replayed (would-have-been) decision is enter_long; price rose,
+    # so the prevented trade WOULD have won -- a missed opportunity.
+    assert case["outcome"]["by_horizon"][15] == "prevented_win"
+    assert result["summary"]["by_side"] == {"agent_prevented_trade": 1}
+    assert result["summary"]["agent_prevented_trade_hypothetical_outcomes_by_horizon"][15] == {"prevented_win": 1}
+
+
+def test_deep_dive_skips_candidates_where_agent_absent(fresh_env):
+    storage, coordinator, outcomes, replay, coordinator_diagnostics = fresh_env
+    decision_time = datetime.now(timezone.utc) - timedelta(hours=2)
+    candidate = _dd_candidate(
+        coordinator, "c1", "TEST", "5m", _dd_iso(decision_time),
+        analysis=_dd_opinion("bullish", 90, _dd_iso(decision_time)),
+    )
+    result = coordinator_diagnostics.compute_threshold_crossing_deep_dive([candidate], agent="news")
+    assert result["cases_considered"] == 0
+    assert result["cases"] == []
+
+
+def test_deep_dive_distinct_opinion_timestamps_dedupes_reused_opinion(fresh_env):
+    """Two candidates that both reused the SAME News opinion (identical
+    opinion_timestamp, the real News/Macro reuse pattern -- see the
+    Tier 3.6 note in app/outcomes.py) must count as ONE distinct
+    opinion, not two, even though both surface as separate cases."""
+    storage, coordinator, outcomes, replay, coordinator_diagnostics = fresh_env
+    decision_time_1 = datetime.now(timezone.utc) - timedelta(hours=3)
+    decision_time_2 = datetime.now(timezone.utc) - timedelta(hours=2)
+    shared_news_timestamp = _dd_iso(decision_time_1)
+
+    candidate_1 = _dd_candidate(
+        coordinator, "c1", "TEST", "5m", _dd_iso(decision_time_1),
+        analysis=_dd_opinion("bullish", 20, _dd_iso(decision_time_1)),
+        news=_dd_opinion("bullish", 70, shared_news_timestamp),
+        macro=_dd_opinion("bullish", 10, _dd_iso(decision_time_1)),
+    )
+    candidate_2 = _dd_candidate(
+        coordinator, "c2", "TEST", "5m", _dd_iso(decision_time_2),
+        analysis=_dd_opinion("bullish", 20, _dd_iso(decision_time_2)),
+        news=_dd_opinion("bullish", 70, shared_news_timestamp),
+        macro=_dd_opinion("bullish", 10, _dd_iso(decision_time_2)),
+    )
+
+    result = coordinator_diagnostics.compute_threshold_crossing_deep_dive(
+        [candidate_1, candidate_2], agent="news", horizons=[15],
+    )
+    assert result["cases_considered"] == 2
+    assert result["distinct_opinion_timestamps"] == 1
+
+
+def test_deep_dive_urgent_flag_counted_for_news_not_forced_for_macro(fresh_env):
+    """News's "urgent" flag isn't just descriptive metadata here -- it
+    also halves the blended score (coordinator.py's own dampening
+    rule), which is itself capable of turning what would have been an
+    agent_enabled_trade case into an agent_prevented_trade one even
+    though News and Analysis AGREE on direction (the dampen, not
+    opposition, is what dropped the original score under threshold).
+    urgent_flag_count must still count it. Ablating macro on a
+    candidate where macro carries a DIFFERENT flag vocabulary (no
+    "urgent" concept at all, see app/macro_agent.py) must show
+    urgent_flag_count == 0 -- by construction, not because urgency was
+    checked and found absent for that specific case."""
+    storage, coordinator, outcomes, replay, coordinator_diagnostics = fresh_env
+    decision_time = datetime.now(timezone.utc) - timedelta(hours=2)
+    horizon_time = decision_time + timedelta(minutes=15)
+    _dd_save_bar(storage, "TEST", "5m", decision_time, 100.0)
+    _dd_save_bar(storage, "TEST", "5m", horizon_time, 95.0)
+
+    news_urgent_candidate = _dd_candidate(
+        coordinator, "c1", "TEST", "5m", _dd_iso(decision_time),
+        analysis=_dd_opinion("bullish", 30, _dd_iso(decision_time)),
+        news=_dd_opinion("bullish", 100, _dd_iso(decision_time), flags=["urgent"]),
+        macro=_dd_opinion("bullish", 20, _dd_iso(decision_time)),
+    )
+    assert news_urgent_candidate["decision"]["decision"] == "no_trade"  # urgent-dampened below threshold
+
+    news_result = coordinator_diagnostics.compute_threshold_crossing_deep_dive(
+        [news_urgent_candidate], agent="news", horizons=[15],
+    )
+    assert news_result["cases_considered"] == 1
+    case = news_result["cases"][0]
+    assert case["side"] == "agent_prevented_trade"  # without the dampen, this would have crossed
+    assert case["agreement_with_analysis"] == "agree"  # News and Analysis both bullish -- the dampen, not opposition, blocked it
+    assert news_result["summary"]["urgent_flag_count"] == 1
+
+    macro_candidate = _dd_candidate(
+        coordinator, "c2", "TEST", "5m", _dd_iso(decision_time),
+        analysis=_dd_opinion("bullish", 10, _dd_iso(decision_time)),
+        news=_dd_opinion("bullish", 15, _dd_iso(decision_time)),
+        macro=_dd_opinion("bullish", 90, _dd_iso(decision_time), flags=["risk_off"]),
+    )
+    assert macro_candidate["decision"]["decision"] == "enter_long"
+    macro_result = coordinator_diagnostics.compute_threshold_crossing_deep_dive(
+        [macro_candidate], agent="macro", horizons=[15],
+    )
+    assert macro_result["cases_considered"] == 1
+    assert macro_result["cases"][0]["side"] == "agent_enabled_trade"
+    assert macro_result["summary"]["urgent_flag_count"] == 0

@@ -109,13 +109,93 @@ open: "Macro غيّر 21% من القرارات قد يعني فقط Macro كا�
 pair counts, unchanged since Tier 3.16) is kept alongside the new
 category breakdown, not replaced by it — this is additive detail, not
 a redefinition of any existing field.
+
+Tier 3.26 (News/Macro threshold-crossing deep dive, fifth external
+review, item #6): Tier 3.21 named threshold_crossing as "everything
+that isn't a quorum effect or a direction reversal" but stopped at the
+count — 32/223-present for News, 2/215-present for Macro (production,
+confirmed prior to this tier). A count alone doesn't say whether those
+crossings were GOOD for the strategy (the agent's presence stopped a
+losing trade, or added a winning one Analysis alone would have
+missed) or just noise. compute_threshold_crossing_deep_dive() answers
+that for one agent at a time by re-walking ONLY that agent's
+threshold_crossing subset (reusing _ablate_agent/_classify_ablation_
+change, not new scoring logic) and adding four dimensions the raw
+count doesn't have:
+
+  - side: every threshold_crossing case is either the ablated agent's
+    presence being the reason a real trade WAS taken
+    ("agent_enabled_trade" — original decision was directional,
+    replayed-without-the-agent was no_trade) or the reason a trade was
+    NOT taken ("agent_prevented_trade" — the reverse). These need
+    different outcome machinery: an agent_enabled_trade candidate is a
+    REAL historical decision that may have become a real paper trade,
+    so its outcome comes from app.outcomes.compute_outcome_for_candidate()
+    (prefers real closed-trade P&L, same as everywhere else in this
+    project). An agent_prevented_trade candidate never happened — there
+    is no real trade to look up — so its outcome comes from the
+    REPLAYED decision's own hypothetical horizon estimate, which
+    replay_candidate(include_outcome=True) already computes anchored to
+    the original decision's timestamp. Because ablation only ever
+    removes evidence, a to_insufficient_data or unrelated transition
+    can never land in this "side" split; a defensive "other" bucket
+    catches anything that doesn't fit either pattern instead of
+    silently mis-tagging it.
+  - agreement_with_analysis: whether the ablated agent's own real
+    opinion direction (before ablation) agreed or opposed Analysis's
+    own real opinion direction on that same candidate — same
+    same-direction/opposing-direction question news_impact/macro_impact
+    already ask in compute_coordinator_divergence_report, but scoped to
+    just this agent's threshold-crossing subset.
+  - the agent's own self-reported flags (e.g. News's "urgent"/
+    "low_data"/"stale_data" or Macro's "risk_off"/"conflicting_
+    signals"/"stale_data" — app/news_agent.py and app/macro_agent.py
+    define different vocabularies, so no flag name is assumed to mean
+    the same thing for both agents). urgent_flag_count in the summary
+    specifically counts "urgent" — a flag only News's prompt defines —
+    so it reads 0 for Macro by construction (Macro has no comparable
+    urgency concept in its own vocabulary), not because urgency never
+    matters for Macro.
+  - distinct_opinion_timestamps: how many of the cases in this subset
+    actually trace back to distinct underlying agent opinions, vs. the
+    same slow-cadence News/Macro call (NEWS_INTERVAL_MINUTES/
+    MACRO_INTERVAL_MINUTES, default 60, reusable up to
+    NEWS_MACRO_MAX_AGE_MINUTES, default 90) being counted once per
+    candidate that reused it — the same duplication concern Tier 3.6
+    raised for per-agent accuracy, applied here.
+
+Outcome vocabulary is deliberately NOT collapsed into a single win/
+loss boolean, consistent with the rest of this project: an
+agent_enabled_trade candidate reports either a real trade's
+win/loss/breakeven/pending/cancelled status (with real pnl_usd when
+closed) or, if it never became a trade, the same per-horizon
+hypothetical correct/incorrect/flat/pending/no_data breakdown
+outcomes.py already uses elsewhere. An agent_prevented_trade candidate
+reports a per-horizon breakdown too, but relabeled for what "correct"/
+"incorrect" mean when the trade never happened: the hypothetical
+direction being "correct" means the prevented trade WOULD have won
+(prevented_win — a missed opportunity), and "incorrect" means the
+trade would have lost, i.e. the agent's real presence correctly
+avoided it (prevented_loss). "flat"/"pending"/"no_data" keep their
+existing meaning.
+
+Read-only, offline, no LLM calls, no new candidates or trades — same
+guarantee as the rest of this module and app/replay.py.
 """
 
 from app.coordinator import DIRECTIONAL_AGENTS, WEIGHTS
+from app.outcomes import HORIZON_MINUTES_DEFAULT, compute_outcome_for_candidate
 from app.replay import replay_candidate
 
 _DIRECTIONAL_DECISIONS = ("enter_long", "enter_short")
 _DECISION_DIRECTION = {"enter_long": "bullish", "enter_short": "bearish"}
+_PREVENTED_OUTCOME_LABEL = {
+    "correct": "prevented_win",
+    "incorrect": "prevented_loss",
+    "flat": "flat",
+    "pending": "pending",
+    "no_data": "no_data",
+}
 
 
 def _analysis_bucket(opinions_used: dict, missing_agents: list[str], stale_agents: list[str]) -> str:
@@ -369,4 +449,184 @@ def compute_coordinator_divergence_report(candidates: list[dict]) -> dict:
         "macro_impact": _agent_impact(macro_present_directional, macro_opposing_analysis, macro_contribution_sum),
         "timing_blocked_count": timing_blocked,
         "ablation": ablation,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Threshold-crossing deep dive — Tier 3.26
+# ---------------------------------------------------------------------------
+
+def _threshold_crossing_side(original_decision: str, replayed_decision: str) -> str:
+    """Which direction a threshold_crossing case moved in. Ablation can
+    only ever REMOVE evidence, so a to_insufficient_data transition is
+    already excluded by the caller (only threshold_crossing-classified
+    cases reach this function) — the two patterns below are the only
+    ones a live production run has ever produced, but "other" is kept
+    as an honest fallback rather than assuming that's exhaustive."""
+    if original_decision in _DIRECTIONAL_DECISIONS and replayed_decision == "no_trade":
+        return "agent_enabled_trade"
+    if original_decision == "no_trade" and replayed_decision in _DIRECTIONAL_DECISIONS:
+        return "agent_prevented_trade"
+    return "other"
+
+
+def _real_outcome_bucket(candidate: dict, horizons: list[int]) -> dict:
+    """For an agent_enabled_trade case: the ORIGINAL candidate actually
+    happened, so its outcome comes from outcomes.compute_outcome_for_candidate()
+    — real closed-trade P&L when a trade exists, the existing
+    hypothetical horizon fallback otherwise. Never touches the ablated
+    copy; a real trade lookup is keyed by the original candidate_id."""
+    outcome = compute_outcome_for_candidate(candidate, horizons=horizons)
+    if outcome is None:
+        # Defensive only — an agent_enabled_trade case's original
+        # decision is directional by construction (that's what makes it
+        # "enabled"), so compute_outcome_for_candidate() should never
+        # return None (its only None case is a non-directional decision).
+        return {"kind": "no_outcome_evaluable"}
+    if outcome["source"] == "actual_trade":
+        result = {"kind": "real_trade", "status": outcome["status"], "outcome": outcome["outcome"]}
+        if "pnl_usd" in outcome:
+            result["pnl_usd"] = outcome["pnl_usd"]
+        return result
+    return {"kind": "hypothetical", "by_horizon": {h: o["outcome"] for h, o in (outcome.get("horizons") or {}).items()}}
+
+
+def _prevented_outcome_bucket(replay_result: dict) -> dict:
+    """For an agent_prevented_trade case: the replayed decision never
+    became a real trade, so there's nothing to look up — reuses
+    replay_candidate()'s own replayed_hypothetical_outcome (anchored to
+    the ORIGINAL decision's timestamp, scored for the REPLAYED
+    direction — exactly "if this had been taken instead, would price
+    have agreed?"), relabeling correct/incorrect into prevented_win/
+    prevented_loss (see module docstring for why)."""
+    hypothetical = replay_result.get("replayed_hypothetical_outcome") or {}
+    return {
+        h: _PREVENTED_OUTCOME_LABEL.get(o["outcome"], o["outcome"])
+        for h, o in hypothetical.items()
+    }
+
+
+def _summarize_deep_dive(cases: list[dict], horizons: list[int]) -> dict:
+    by_side: dict[str, int] = {}
+    by_agreement: dict[str, int] = {}
+    urgent_count = 0
+
+    enabled_real: dict[str, int] = {}
+    enabled_hypothetical_by_horizon = {h: {} for h in horizons}
+    prevented_by_horizon = {h: {} for h in horizons}
+
+    for case in cases:
+        by_side[case["side"]] = by_side.get(case["side"], 0) + 1
+        by_agreement[case["agreement_with_analysis"]] = by_agreement.get(case["agreement_with_analysis"], 0) + 1
+        if "urgent" in (case["agent_flags"] or []):
+            urgent_count += 1
+
+        outcome = case["outcome"]
+        if case["side"] == "agent_enabled_trade":
+            if outcome["kind"] == "real_trade":
+                key = outcome["outcome"]
+                enabled_real[key] = enabled_real.get(key, 0) + 1
+            elif outcome["kind"] == "hypothetical":
+                for h, o in outcome["by_horizon"].items():
+                    bucket = enabled_hypothetical_by_horizon.setdefault(h, {})
+                    bucket[o] = bucket.get(o, 0) + 1
+        elif case["side"] == "agent_prevented_trade":
+            for h, o in outcome["by_horizon"].items():
+                bucket = prevented_by_horizon.setdefault(h, {})
+                bucket[o] = bucket.get(o, 0) + 1
+
+    return {
+        "by_side": by_side,
+        "by_agreement_with_analysis": by_agreement,
+        "urgent_flag_count": urgent_count,
+        "agent_enabled_trade_real_outcomes": enabled_real,
+        "agent_enabled_trade_hypothetical_outcomes_by_horizon": enabled_hypothetical_by_horizon,
+        "agent_prevented_trade_hypothetical_outcomes_by_horizon": prevented_by_horizon,
+    }
+
+
+def compute_threshold_crossing_deep_dive(candidates: list[dict], agent: str, horizons: list[int] = None) -> dict:
+    """Tier 3.26 — see module docstring for full rationale. Re-walks
+    candidate history, ablates `agent` on every candidate that actually
+    had an opinion from it (a candidate where the agent was never
+    present is a true ablation no-op — skipped, not just filtered out
+    after the fact), keeps only the threshold_crossing-classified
+    subset (same classifier compute_coordinator_divergence_report's
+    ablation pass already uses), and reports each surviving case's
+    side/outcome/agreement-with-Analysis/flags plus a distinct-opinion-
+    timestamp count and an aggregate summary.
+
+    `agent` must be one of coordinator.DIRECTIONAL_AGENTS
+    (analysis/news/macro) — built generically even though the fifth
+    review specifically asked about News/Macro, since Analysis's own
+    threshold_crossing subset (typically tiny; most of its ablation
+    impact is to_insufficient_data per Tier 3.21) is a well-defined
+    question under the exact same machinery, not a special case.
+
+    Entirely offline for the ablation/replay step; compute_outcome_
+    for_candidate() (agent_enabled_trade cases only) does read real
+    trade rows via storage, same as every other outcome-aware endpoint
+    in this project — still no LLM calls, no new candidates or trades,
+    no mutation of anything stored."""
+    if agent not in DIRECTIONAL_AGENTS:
+        raise ValueError(f"agent must be one of {sorted(DIRECTIONAL_AGENTS)}, got {agent!r}")
+    horizons = horizons or HORIZON_MINUTES_DEFAULT
+
+    cases = []
+    distinct_opinion_timestamps: set[str] = set()
+
+    for candidate in candidates:
+        decision = candidate.get("decision") or {}
+        opinions_used = decision.get("opinions_used") or {}
+        agent_opinion = opinions_used.get(agent)
+        if not agent_opinion:
+            continue  # agent wasn't present -- ablation would be a no-op
+
+        replay_result = replay_candidate(
+            _ablate_agent(candidate, agent),
+            weights=WEIGHTS,
+            include_outcome=True,
+            outcome_horizons=horizons,
+        )
+        classified = _classify_ablation_change(decision.get("conflict_flags") or [], replay_result)
+        if classified["category"] != "threshold_crossing":
+            continue
+
+        side = _threshold_crossing_side(classified["original_decision"], classified["replayed_decision"])
+
+        analysis_opinion = opinions_used.get("analysis")
+        analysis_direction = analysis_opinion.get("direction") if analysis_opinion else None
+        agent_direction = agent_opinion.get("direction")
+        if analysis_direction in ("bullish", "bearish") and agent_direction in ("bullish", "bearish"):
+            agreement = "agree" if agent_direction == analysis_direction else "oppose"
+        else:
+            agreement = "analysis_not_directional_or_absent"
+
+        opinion_timestamp = agent_opinion.get("timestamp")
+        if opinion_timestamp:
+            distinct_opinion_timestamps.add(opinion_timestamp)
+
+        if side == "agent_enabled_trade":
+            outcome = _real_outcome_bucket(candidate, horizons)
+        elif side == "agent_prevented_trade":
+            outcome = {"kind": "prevented_hypothetical", "by_horizon": _prevented_outcome_bucket(replay_result)}
+        else:
+            outcome = {"kind": "unclassified_side"}
+
+        cases.append({
+            "candidate_id": candidate.get("candidate_id"),
+            "side": side,
+            "score_delta": classified["score_delta"],
+            "agreement_with_analysis": agreement,
+            "agent_flags": agent_opinion.get("flags") or [],
+            "agent_opinion_timestamp": opinion_timestamp,
+            "outcome": outcome,
+        })
+
+    return {
+        "agent": agent,
+        "cases_considered": len(cases),
+        "distinct_opinion_timestamps": len(distinct_opinion_timestamps),
+        "cases": cases,
+        "summary": _summarize_deep_dive(cases, horizons),
     }

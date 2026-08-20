@@ -1443,7 +1443,7 @@ output in any way.
 
 ---
 
-## Coordinator/Analysis divergence + ablation (Tier 3.16, corrected Tier 3.17, reclassified Tier 3.21)
+## Coordinator/Analysis divergence + ablation (Tier 3.16, corrected Tier 3.17, reclassified Tier 3.21, threshold-crossing deep dive added Tier 3.26)
 
 Every backtest-lite/paired/grid result since Tier 3.10 has shown
 Coordinator's own blended decision performing at or below Analysis
@@ -1709,6 +1709,104 @@ expected, `direction_flipped` appears zero times across all three
 agents, matching the proof above. `agent_present_count` for Macro
 (215/300) also confirms it's the least-often-present directional
 agent in this larger sample.
+
+### `GET /candidates/history/threshold-crossing-deep-dive?symbol=MNQ1!&timeframe=5m&agent=news&limit=300&horizons=15,30,60`
+
+Tier 3.26 (fifth external review, item #6). The `threshold_crossing`
+counts above (News: 32/223-present; Macro: 2/215-present) say HOW
+OFTEN removing an agent crossed the enter/no_trade line without a
+quorum or direction-reversal effect involved — nothing about whether
+that was good or bad for the strategy. This endpoint re-walks just one
+agent's `threshold_crossing` subset and adds four dimensions per case:
+
+```json
+{
+  "symbol": "MNQ1!",
+  "timeframe": "5m",
+  "agent": "news",
+  "cases_considered": 2,
+  "distinct_opinion_timestamps": 2,
+  "cases": [
+    {
+      "candidate_id": "cand-1",
+      "side": "agent_enabled_trade",
+      "score_delta": -16.48,
+      "agreement_with_analysis": "agree",
+      "agent_flags": [],
+      "agent_opinion_timestamp": "2026-08-16T14:00:00Z",
+      "outcome": {"kind": "real_trade", "status": "closed", "outcome": "win", "pnl_usd": 160.0}
+    },
+    {
+      "candidate_id": "cand-2",
+      "side": "agent_prevented_trade",
+      "score_delta": 4.77,
+      "agreement_with_analysis": "oppose",
+      "agent_flags": ["urgent"],
+      "agent_opinion_timestamp": "2026-08-16T15:00:00Z",
+      "outcome": {"kind": "prevented_hypothetical", "by_horizon": {"15": "prevented_win", "30": "prevented_loss", "60": "pending"}}
+    }
+  ],
+  "summary": {
+    "by_side": {"agent_enabled_trade": 1, "agent_prevented_trade": 1},
+    "by_agreement_with_analysis": {"agree": 1, "oppose": 1},
+    "urgent_flag_count": 1,
+    "agent_enabled_trade_real_outcomes": {"win": 1},
+    "agent_enabled_trade_hypothetical_outcomes_by_horizon": {"15": {}, "30": {}, "60": {}},
+    "agent_prevented_trade_hypothetical_outcomes_by_horizon": {"15": {"prevented_win": 1}, "30": {"prevented_loss": 1}, "60": {"pending": 1}}
+  }
+}
+```
+
+(Illustrative shape from mixed fixture data, not a production pull —
+this tier is diagnostic tooling delivered alongside its test suite,
+not yet run against live production history.)
+
+`agent` must be `analysis`, `news`, or `macro` (400 otherwise). Every
+case is classified into exactly one `side`: `agent_enabled_trade` (the
+ablated agent's presence is why a real trade was taken — without it,
+the candidate would have been `no_trade`) or `agent_prevented_trade`
+(the reverse). The two sides need different outcome machinery, since
+only one of them ever really happened:
+
+- `agent_enabled_trade` — the ORIGINAL candidate is a real historical
+  decision, so `outcome` comes from `app.outcomes.compute_outcome_for_
+  candidate()`: real closed-trade `win`/`loss`/`breakeven` with
+  `pnl_usd` when a paper trade exists (`{"kind": "real_trade", ...}`),
+  or the same existing hypothetical per-horizon `correct`/`incorrect`/
+  `flat`/`pending`/`no_data` estimate otherwise
+  (`{"kind": "hypothetical", "by_horizon": {...}}`).
+- `agent_prevented_trade` — the replayed decision never became a real
+  trade (it never happened), so `outcome` reuses `replay_candidate()`'s
+  own hypothetical horizon estimate for the REPLAYED direction,
+  relabeled: `"correct"` (the prevented trade would have won) becomes
+  `"prevented_win"` — a missed opportunity — and `"incorrect"` becomes
+  `"prevented_loss"` — the agent's real presence correctly avoided a
+  loser. `"flat"`/`"pending"`/`"no_data"` keep their existing meaning.
+
+`agreement_with_analysis` is whether the ablated agent's own real
+opinion direction agreed or opposed Analysis's own real opinion
+direction on that candidate — note this is independent of `side`: the
+urgent-dampening example above shows a case where News and Analysis
+*agree* on direction, yet News's presence still `agent_prevented_trade`
+(coordinator.py halves the score whenever News's `"urgent"` flag is
+set, regardless of agreement — see `app/coordinator.py`'s Tier 2.9
+note). `agent_flags` are the agent's own self-reported flags on that
+opinion — News and Macro use different vocabularies (News: `urgent`/
+`low_data`/`stale_data`; Macro: `risk_off`/`conflicting_signals`/
+`stale_data`), never unified into one list. `summary.urgent_flag_count`
+specifically counts `"urgent"` — a flag only News's prompt defines —
+so it reads `0` for `agent=macro` by construction, not because urgency
+was checked and found absent. `distinct_opinion_timestamps` counts how
+many of the returned cases trace back to distinct underlying LLM
+opinions rather than the same slow-cadence News/Macro call being
+reused across several consecutive candidates (fresh for up to
+`NEWS_MACRO_MAX_AGE_MINUTES`, default 90 minutes) — a small case count
+from a low-cadence agent can rest on very few independent calls.
+
+Entirely offline for the ablation/replay step (no LLM calls,
+`COORDINATOR_THRESHOLD`/`WEIGHTS` untouched, no candidate mutated);
+the `agent_enabled_trade` real-outcome lookup reads trade rows the
+same way every other outcome-aware endpoint in this project does.
 
 ---
 

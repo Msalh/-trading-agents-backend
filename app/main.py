@@ -850,6 +850,33 @@ cost total; (3) pre-migration rows backfilled to pricing_version="1"
 (a real fact — these constants haven't changed since Tier 3.15, not a
 guess). See app/llm_telemetry.py's module docstring for full detail.
 
+Tier 3.26 (News/Macro threshold-crossing deep dive, fifth external
+review item #6, 2026-08-19): Tier 3.21's ablation.*.decision_changed_
+by_category.threshold_crossing count said HOW OFTEN removing an
+agent's opinion crossed the enter/no_trade line without a quorum or
+direction-reversal effect involved, but nothing about whether that
+crossing was good or bad for the strategy. New app/coordinator_
+diagnostics.compute_threshold_crossing_deep_dive() and GET
+/candidates/history/threshold-crossing-deep-dive re-walk one agent's
+threshold_crossing subset and add: which side each case is on
+(agent_enabled_trade — its presence is why a real trade was taken —
+vs. agent_prevented_trade, the reverse); the real outcome for
+agent_enabled_trade cases (actual closed-trade P&L when one exists,
+same hypothetical fallback as elsewhere otherwise) or the replayed
+decision's hypothetical outcome — relabeled prevented_win/prevented_
+loss — for agent_prevented_trade cases, since those never became a
+real trade; whether the agent's own direction agreed or opposed
+Analysis's on that candidate; the agent's own self-reported flags
+(News and Macro use different vocabularies — not unified, and
+urgent_flag_count is always 0 for macro by construction, since only
+News's prompt defines "urgent"); and a distinct-opinion-timestamp
+count so a small case count from a slow-cadence agent isn't mistaken
+for that many independent LLM calls. Entirely offline for the
+ablation/replay step (no LLM calls, COORDINATOR_THRESHOLD/WEIGHTS
+untouched, no candidate mutated); the agent_enabled_trade real-outcome
+lookup reads trade rows the same way every other outcome-aware
+endpoint in this project already does.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -913,7 +940,10 @@ from app.outcomes import (
     summarize_opinions_by_day,
     summarize_outcomes,
 )
-from app.coordinator_diagnostics import compute_coordinator_divergence_report
+from app.coordinator_diagnostics import (
+    compute_coordinator_divergence_report,
+    compute_threshold_crossing_deep_dive,
+)
 from app.llm_telemetry import get_telemetry_health
 from app.paper_trades import (
     PROVENANCE_AUTO_POLICY,
@@ -2081,6 +2111,80 @@ def candidates_history_coordinator_divergence(
         "symbol": symbol,
         "timeframe": timeframe,
         **compute_coordinator_divergence_report(candidates),
+    }
+
+
+@app.get("/candidates/history/threshold-crossing-deep-dive")
+def candidates_history_threshold_crossing_deep_dive(
+    symbol: str = Query(...),
+    timeframe: str = Query(...),
+    agent: str = Query(..., description="which directional agent to ablate: analysis, news, or macro"),
+    limit: int = Query(default=300, le=1000),
+    horizons: str = Query(default="15,30,60"),
+) -> dict:
+    """Tier 3.26 (News/Macro threshold-crossing deep dive, fifth
+    external review, item #6): the coordinator-divergence endpoint's
+    ablation.*.decision_changed_by_category.threshold_crossing count
+    (32/223-present for News, 2/215-present for Macro, confirmed
+    2026-08 production) says HOW OFTEN this agent's presence crossed
+    the enter/no_trade line without a quorum or direction-reversal
+    effect involved — not whether that was good or bad for the
+    strategy. This re-walks just that one agent's threshold_crossing
+    subset and adds:
+
+    `side` — "agent_enabled_trade" (this agent's presence is why a
+    real trade was taken; without it, the candidate would have been
+    no_trade) vs. "agent_prevented_trade" (the reverse: without this
+    agent, a trade would have been taken that wasn't).
+
+    `outcome` — for agent_enabled_trade, the REAL outcome
+    (app.outcomes.compute_outcome_for_candidate(): real closed-trade
+    win/loss/breakeven/P&L when a trade exists, the existing
+    hypothetical per-horizon estimate otherwise) of the candidate that
+    actually happened. For agent_prevented_trade, there is no real
+    trade to look up (it never happened) — outcome is the REPLAYED
+    decision's own hypothetical per-horizon estimate, relabeled
+    "prevented_win" (the hypothetical direction would have been
+    correct — a missed opportunity) / "prevented_loss" (it would have
+    been wrong — the agent's real presence correctly avoided it).
+
+    `agreement_with_analysis` — whether this agent's own real opinion
+    direction agreed or opposed Analysis's own real opinion direction
+    on that candidate ("agree" / "oppose" / "analysis_not_directional_
+    or_absent").
+
+    `agent_flags` — this agent's own self-reported flags on that
+    opinion (News: urgent/low_data/stale_data; Macro: risk_off/
+    conflicting_signals/stale_data — different vocabularies, not
+    unified). `summary.urgent_flag_count` specifically counts "urgent"
+    — a flag only News's prompt defines, so it is always 0 for
+    agent=macro by construction, not a sign urgency never applies to
+    Macro.
+
+    `distinct_opinion_timestamps` — how many of the returned cases
+    trace back to distinct underlying LLM opinions vs. the same
+    slow-cadence News/Macro call being reused (fresh for up to
+    NEWS_MACRO_MAX_AGE_MINUTES, default 90 minutes) across several
+    consecutive candidates — the same duplication concern Tier 3.6
+    raised for per-agent accuracy, surfaced here too so a small case
+    count isn't mistaken for that many independent data points.
+
+    Entirely offline for the ablation/replay step (no LLM calls, no
+    mutation of any stored candidate, COORDINATOR_THRESHOLD/WEIGHTS
+    untouched); the agent_enabled_trade side does read real trade rows
+    the same way every other outcome-aware endpoint in this project
+    does."""
+    if agent not in ("analysis", "news", "macro"):
+        raise HTTPException(status_code=400, detail="agent must be one of: analysis, news, macro")
+    candidates = get_candidate_history(symbol=symbol, timeframe=timeframe, limit=limit)
+    return {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        **compute_threshold_crossing_deep_dive(
+            candidates,
+            agent=agent,
+            horizons=_parse_replay_horizons(horizons),
+        ),
     }
 
 

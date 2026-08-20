@@ -942,6 +942,70 @@ def test_coordinator_divergence_endpoint_empty_history(client):
 
 
 # ---------------------------------------------------------------------------
+# Tier 3.26: News/Macro threshold-crossing deep dive
+# ---------------------------------------------------------------------------
+
+def test_threshold_crossing_deep_dive_endpoint_returns_case_shape(client):
+    import app.storage as storage
+
+    anchor = "2026-08-11T14:00:00Z"
+    bar = {"event_id": "evt-tcd-1", "symbol": "MNQ1!", "timeframe": "5m", "timestamp": anchor}
+    # analysis=20/news=70/macro=10 bullish, live WEIGHTS -- News alone crosses
+    # the threshold (enter_long); ablating News alone (analysis+macro only)
+    # falls back to no_trade -- a clean agent_enabled_trade threshold_crossing
+    # case, same scenario verified in test_coordinator_diagnostics.py.
+    decision = {
+        "decision": "enter_long",
+        "score": 33.75,
+        "threshold": 25.0,
+        "opinions_used": {
+            "analysis": {"direction": "bullish", "confidence": 20, "timestamp": anchor, "flags": []},
+            "news": {"direction": "bullish", "confidence": 70, "timestamp": anchor, "flags": []},
+            "macro": {"direction": "bullish", "confidence": 10, "timestamp": anchor, "flags": []},
+        },
+        "missing_agents": [],
+        "stale_agents": [],
+        "contributions": {},
+        "conflict_flags": [],
+        "timestamp": anchor,
+    }
+    storage.save_candidate(candidate_id="cand-tcd-1", symbol="MNQ1!", timeframe="5m", bar=bar, decision=decision)
+
+    r = client.get(
+        "/candidates/history/threshold-crossing-deep-dive",
+        params={"symbol": "MNQ1!", "timeframe": "5m", "agent": "news"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["symbol"] == "MNQ1!"
+    assert body["agent"] == "news"
+    assert body["cases_considered"] == 1
+    case = body["cases"][0]
+    assert case["side"] == "agent_enabled_trade"
+    assert case["agreement_with_analysis"] == "agree"
+    assert "summary" in body
+
+
+def test_threshold_crossing_deep_dive_endpoint_rejects_unknown_agent(client):
+    r = client.get(
+        "/candidates/history/threshold-crossing-deep-dive",
+        params={"symbol": "MNQ1!", "timeframe": "5m", "agent": "timing"},
+    )
+    assert r.status_code == 400
+
+
+def test_threshold_crossing_deep_dive_endpoint_empty_history(client):
+    r = client.get(
+        "/candidates/history/threshold-crossing-deep-dive",
+        params={"symbol": "NOSUCH", "timeframe": "5m", "agent": "macro"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["cases_considered"] == 0
+    assert body["cases"] == []
+
+
+# ---------------------------------------------------------------------------
 # Tier 3.18: day/session reporting
 # ---------------------------------------------------------------------------
 
