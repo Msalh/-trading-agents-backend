@@ -33,11 +33,43 @@ since pricing changes over time and this project has no billing-
 account access to verify it automatically — `estimated_cost_usd`
 throughout this project is exactly that, an estimate for relative
 comparison and trend-watching, not an authoritative billing figure.
+
+Tier 3.25 (fifth external review — "cost telemetry health", the
+review's own lower-priority-but-real item #5): this module's own
+write to llm_call_log is deliberately swallowed on failure (see
+track_llm_call's finally block below) so a logging problem can never
+break a real agent call — correct, but it also meant a telemetry
+outage (a locked DB, a full disk, a schema drift) was completely
+INVISIBLE: get_llm_call_summary() would just report fewer calls than
+actually happened, with no signal that anything was missing. Three
+fixes, all read-only/additive, none of which change what any agent
+call does:
+
+  - attempted/written/failed in-process counters (see
+    get_telemetry_health() below), reset on every process start —
+    written/attempted is this process's telemetry write success rate
+    since it started. Plain module-level ints, not a lock-protected
+    atomic counter: good enough for a rough health signal under
+    normal (GIL-serialized) concurrency, not a strict ledger — same
+    "estimate, not authoritative" honesty as estimated_cost_usd
+    itself.
+  - TELEMETRY_STARTED_AT — when THIS PROCESS's counters became valid,
+    so "0 failures" can be read correctly as "0 failures since
+    <time>", not "0 failures ever" (this process may have restarted
+    since telemetry first existed, e.g. a Railway redeploy).
+  - pricing_version (see PRICING_VERSION below), stamped onto every
+    llm_call_log row and reported back in get_llm_call_summary()'s new
+    pricing_versions_present list — the same hand-maintained "version
+    marker" pattern as Tier 3.23's BACKTEST_LOGIC_VERSION, so a future
+    change to the five TELEMETRY_*_COST_PER_MTOK/*_MULTIPLIER
+    constants is visible in the data instead of silently blending two
+    pricing regimes into one estimated_cost_usd total.
 """
 
 import os
 import time
 from contextlib import contextmanager
+from datetime import datetime, timezone
 
 from app import storage
 
@@ -46,6 +78,47 @@ OUTPUT_COST_PER_MTOK = float(os.environ.get("TELEMETRY_OUTPUT_COST_PER_MTOK", "1
 CACHE_WRITE_MULTIPLIER = float(os.environ.get("TELEMETRY_CACHE_WRITE_MULTIPLIER", "1.25"))
 CACHE_READ_MULTIPLIER = float(os.environ.get("TELEMETRY_CACHE_READ_MULTIPLIER", "0.1"))
 WEB_SEARCH_COST_PER_SEARCH = float(os.environ.get("TELEMETRY_WEB_SEARCH_COST_PER_SEARCH", "0.01"))
+
+# Tier 3.25: a hand-maintained marker for which of the five pricing
+# constants above produced a given llm_call_log row's estimated_cost_usd
+# — bump this BY HAND whenever any of those five constants changes
+# materially (mirrors app.backtest.BACKTEST_LOGIC_VERSION exactly).
+# Stamped onto every row via record_llm_call(); surfaced back in
+# get_llm_call_summary()'s pricing_versions_present.
+PRICING_VERSION = os.environ.get("TELEMETRY_PRICING_VERSION", "1")
+
+# Tier 3.25: when THIS PROCESS's telemetry health counters below became
+# valid — set once at import time, not persisted, so it naturally
+# resets on every restart along with the counters it describes.
+TELEMETRY_STARTED_AT = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+# Tier 3.25: in-process telemetry health counters — see
+# get_telemetry_health() below for the read side and this module's
+# docstring for the full reasoning. Plain ints, not thread-locked: a
+# rough health signal, not a strict ledger.
+_telemetry_attempted = 0
+_telemetry_written = 0
+_telemetry_failed = 0
+
+
+def get_telemetry_health() -> dict:
+    """Tier 3.25: THIS PROCESS's telemetry write health since
+    TELEMETRY_STARTED_AT — attempted (every agent call that reached
+    track_llm_call's logging step), written (successfully inserted
+    into llm_call_log), failed (the insert raised and was swallowed).
+    write_success_rate is None (not 0 or 1) when attempted is 0 —
+    "no data yet" is a real, distinct third state, not silently
+    presented as either extreme."""
+    return {
+        "telemetry_started_at": TELEMETRY_STARTED_AT,
+        "pricing_version": PRICING_VERSION,
+        "attempted": _telemetry_attempted,
+        "written": _telemetry_written,
+        "failed": _telemetry_failed,
+        "write_success_rate": (
+            round(_telemetry_written / _telemetry_attempted, 4) if _telemetry_attempted else None
+        ),
+    }
 
 
 def estimate_cost_usd(
@@ -131,6 +204,11 @@ def track_llm_call(agent: str, model: str, trigger_context: str | None = None):
             if usage
             else None
         )
+        # Tier 3.25: counted BEFORE the write is attempted, so
+        # "attempted" always reflects real call volume even if the
+        # write itself never completes (a hang, not just a raise).
+        global _telemetry_attempted, _telemetry_written, _telemetry_failed
+        _telemetry_attempted += 1
         try:
             storage.record_llm_call(
                 agent=agent,
@@ -145,10 +223,14 @@ def track_llm_call(agent: str, model: str, trigger_context: str | None = None):
                 cache_read_input_tokens=usage.get("cache_read_input_tokens"),
                 web_search_requests=usage.get("web_search_requests"),
                 estimated_cost_usd=cost,
+                pricing_version=PRICING_VERSION,
             )
+            _telemetry_written += 1
         except Exception:
             # Telemetry must never be able to break a real agent call
             # or mask its actual error — swallow a logging failure
             # rather than raising on top of (or instead of) whatever
-            # the `with` block itself raised.
-            pass
+            # the `with` block itself raised. Tier 3.25: but no longer
+            # SILENTLY — this is exactly what _telemetry_failed exists
+            # to make visible via get_telemetry_health().
+            _telemetry_failed += 1

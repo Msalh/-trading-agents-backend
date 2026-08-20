@@ -116,7 +116,8 @@ CREATE TABLE IF NOT EXISTS llm_call_log (
     cache_creation_input_tokens INTEGER,
     cache_read_input_tokens INTEGER,
     web_search_requests INTEGER,
-    estimated_cost_usd REAL
+    estimated_cost_usd REAL,
+    pricing_version TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_llm_call_log_agent_called_at
     ON llm_call_log (agent, called_at DESC);
@@ -229,6 +230,30 @@ def init_db() -> None:
             WHERE registered_watermark_rowid = 0
             """
         )
+        # Tier 3.25 (fifth external review — cost telemetry health):
+        # pricing_version stamps which pricing REGIME (the five
+        # TELEMETRY_*_COST_PER_MTOK / *_MULTIPLIER env constants —
+        # see app/llm_telemetry.py) produced a row's estimated_cost_usd,
+        # the same "hand-maintained version marker" pattern as Tier
+        # 3.23's BACKTEST_LOGIC_VERSION. Without this, changing those
+        # constants later (pricing does change over time, per Tier
+        # 3.15's own docstring) would silently blend two different
+        # pricing regimes into one estimated_cost_usd total with no way
+        # to tell which rows used which prices.
+        try:
+            conn.execute("ALTER TABLE llm_call_log ADD COLUMN pricing_version TEXT")
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e):
+                raise
+        # Backfill: pricing_version is a BRAND NEW concept as of this
+        # tier, so "1" is its very first value -- every pre-migration
+        # row was necessarily written under whatever pricing constants
+        # were live at Tier 3.15's launch, which have not changed since
+        # (Tier 3.15 confirmed them against Anthropic's pricing page on
+        # 2026-08-16 and nothing has touched them). Backfilling to "1"
+        # is a real fact about this project's history, not a guess --
+        # the same reasoning Tier 3.22 used to backfill provenance.
+        conn.execute("UPDATE llm_call_log SET pricing_version = '1' WHERE pricing_version IS NULL")
         conn.commit()
     finally:
         conn.close()
@@ -1184,12 +1209,17 @@ def record_llm_call(
     cache_read_input_tokens: int | None,
     web_search_requests: int | None,
     estimated_cost_usd: float | None,
+    pricing_version: str | None,
 ) -> None:
     """One row per client.messages.create() call site, success or
     failure -- see app/llm_telemetry.track_llm_call(), which is what
     every agent module actually calls (this function is the storage
     layer underneath it, kept here for the same reason every other
-    table's read/write pair lives in this module)."""
+    table's read/write pair lives in this module). pricing_version
+    (Tier 3.25) is stamped by the caller from its own live
+    PRICING_VERSION constant at call time -- this function never
+    computes or defaults it, exactly like every other already-computed
+    field here."""
     conn = get_connection()
     try:
         conn.execute(
@@ -1197,13 +1227,15 @@ def record_llm_call(
             INSERT INTO llm_call_log (
                 agent, model, trigger_context, success, error_message, latency_ms,
                 input_tokens, output_tokens, cache_creation_input_tokens,
-                cache_read_input_tokens, web_search_requests, estimated_cost_usd
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                cache_read_input_tokens, web_search_requests, estimated_cost_usd,
+                pricing_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 agent, model, trigger_context, 1 if success else 0, error_message, latency_ms,
                 input_tokens, output_tokens, cache_creation_input_tokens,
                 cache_read_input_tokens, web_search_requests, estimated_cost_usd,
+                pricing_version,
             ),
         )
         conn.commit()
@@ -1216,7 +1248,16 @@ def get_llm_call_summary(since: str | None = None) -> dict:
     failure), token totals, total estimated cost, average latency, and
     total web_search calls. `since` (ISO timestamp) restricts to calls
     at or after that time; omit for all-time. Returns an `overall`
-    rollup plus one entry per agent under `by_agent`."""
+    rollup plus one entry per agent under `by_agent`.
+
+    Tier 3.25: also returns `pricing_versions_present` -- the distinct
+    `pricing_version` values found in the queried window, sorted. A
+    single value means every row's estimated_cost_usd was computed
+    under the same pricing constants; more than one means the window
+    spans a pricing change and `total_estimated_cost_usd` sums across
+    two different regimes -- surfaced loudly rather than silently
+    blended, the same "never hide a config change behind one number"
+    principle as Tier 3.23's geometry_drift."""
     conn = get_connection()
     try:
         where = "WHERE called_at >= ?" if since else ""
@@ -1240,6 +1281,16 @@ def get_llm_call_summary(since: str | None = None) -> dict:
             """,
             params,
         ).fetchall()
+        pricing_version_rows = conn.execute(
+            f"""
+            SELECT DISTINCT pricing_version FROM llm_call_log
+            {where}
+            """,
+            params,
+        ).fetchall()
+        pricing_versions_present = sorted(
+            r["pricing_version"] for r in pricing_version_rows if r["pricing_version"] is not None
+        )
 
         by_agent = {}
         overall = {
@@ -1268,7 +1319,12 @@ def get_llm_call_summary(since: str | None = None) -> dict:
             overall["total_estimated_cost_usd"] = round(
                 overall["total_estimated_cost_usd"] + entry["total_estimated_cost_usd"], 4
             )
-        return {"since": since, "overall": overall, "by_agent": by_agent}
+        return {
+            "since": since,
+            "overall": overall,
+            "by_agent": by_agent,
+            "pricing_versions_present": pricing_versions_present,
+        }
     finally:
         conn.close()
 

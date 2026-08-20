@@ -1340,7 +1340,7 @@ were NOT touched by this tier.
 
 ---
 
-## Cost/usage telemetry (Tier 3.15)
+## Cost/usage telemetry (Tier 3.15, health counters added Tier 3.25)
 
 Three external review cycles in a row named the same gap: this
 project had no visibility into what its own LLM calls actually cost.
@@ -1350,10 +1350,41 @@ which logs exactly one row — success or failure — to a new
 `llm_call_log` table: agent, model, a short `trigger_context`
 (symbol/timeframe or similar), latency, input/output/cache token
 counts, web_search call count (News/Macro use Claude's hosted
-`web_search` tool), and an estimated USD cost. A telemetry write
-failure is swallowed, never allowed to break or mask the actual agent
-call it's observing — this is purely observational, it never changes
-what an agent does.
+`web_search` tool), an estimated USD cost, and (Tier 3.25) a
+`pricing_version`. A telemetry write failure is swallowed, never
+allowed to break or mask the actual agent call it's observing — this
+is purely observational, it never changes what an agent does.
+
+**Tier 3.25 (fifth external review, item #5 — "cost telemetry
+health").** Swallowing a telemetry write failure was always correct
+(it must never break a real agent call) but it also made a telemetry
+outage completely invisible — `get_llm_call_summary()` would just
+quietly report fewer calls than actually happened. Two additive
+fixes, no agent behavior changed:
+
+  - **`telemetry_health`** (new field on `GET /system/llm-usage`, see
+    below): THIS PROCESS's in-memory `attempted`/`written`/`failed`
+    counters for the telemetry write itself, since `telemetry_started_at`
+    (this process's start time — resets on every restart/redeploy, so
+    "0 failures" always reads as "0 failures since telemetry_started_at",
+    never as "0 failures ever"). `write_success_rate` is `written /
+    attempted`, `null` (not `0`) when `attempted` is `0` — "no calls
+    yet" is a real third state, not silently presented as either
+    extreme. Plain in-process counters, not a durable/atomic ledger —
+    a rough health signal, same "estimate, not authoritative" honesty
+    already applied to `estimated_cost_usd` itself.
+  - **`pricing_version`** — a hand-maintained marker (same pattern as
+    `app.backtest.BACKTEST_LOGIC_VERSION`, Tier 3.23) for which of the
+    five `TELEMETRY_*_COST_PER_MTOK`/`*_MULTIPLIER` constants below
+    produced a row's `estimated_cost_usd`. Env-configurable via
+    `TELEMETRY_PRICING_VERSION` (default `"1"`), bumped by hand
+    whenever those constants change materially. Stamped on every new
+    row; pre-Tier-3.25 rows backfilled to `"1"` (the constants haven't
+    changed since Tier 3.15's launch, so this is a real fact, not a
+    guess). `get_llm_call_summary()`'s `pricing_versions_present`
+    reports every distinct value in the queried window — more than one
+    means the window's `total_estimated_cost_usd` blends two pricing
+    regimes, surfaced loudly rather than silently averaged away.
 
 ### `GET /system/llm-usage?since=2026-08-16T00:00:00Z&recent_limit=20&recent_agent=analysis`
 `since` (optional, ISO timestamp) restricts the aggregation window;
@@ -1379,14 +1410,22 @@ recent-calls tail (default last 20 calls across all agents).
     "macro": { "...": "same shape" },
     "execution": { "...": "same shape" }
   },
+  "pricing_versions_present": ["1"],
   "recent_calls": [
     {
       "id": 214, "called_at": "2026-08-16 12:03:44", "agent": "analysis", "model": "claude-sonnet-5",
       "trigger_context": "MNQ1!/5m", "success": 1, "error_message": null, "latency_ms": 1712.4,
       "input_tokens": 812, "output_tokens": 240, "cache_creation_input_tokens": 0,
-      "cache_read_input_tokens": 0, "web_search_requests": 0, "estimated_cost_usd": 0.004024
+      "cache_read_input_tokens": 0, "web_search_requests": 0, "estimated_cost_usd": 0.004024,
+      "pricing_version": "1"
     }
-  ]
+  ],
+  "telemetry_health": {
+    "telemetry_started_at": "2026-08-19T10:30:00Z",
+    "pricing_version": "1",
+    "attempted": 214, "written": 214, "failed": 0,
+    "write_success_rate": 1.0
+  }
 }
 ```
 
@@ -1711,6 +1750,7 @@ agent in this larger sample.
 | `TELEMETRY_CACHE_WRITE_MULTIPLIER` | no | `1.25` | Tier 3.15: cache-write token cost as a multiple of the base input rate (Anthropic's standard prompt-caching formula) |
 | `TELEMETRY_CACHE_READ_MULTIPLIER` | no | `0.1` | Tier 3.15: same, cache-read tokens |
 | `TELEMETRY_WEB_SEARCH_COST_PER_SEARCH` | no | `0.01` | Tier 3.15: estimated USD cost per `web_search` tool call (News/Macro) — $10 per 1,000 searches |
+| `TELEMETRY_PRICING_VERSION` | no | `1` | Tier 3.25: hand-maintained marker stamped on every `llm_call_log` row — bump by hand whenever the five `TELEMETRY_*` pricing constants above change materially, so `GET /system/llm-usage`'s `pricing_versions_present` can flag a blended-regime window instead of silently averaging it |
 
 ---
 

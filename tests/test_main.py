@@ -829,13 +829,13 @@ def test_llm_usage_endpoint_reports_overall_and_by_agent(client):
         agent="analysis", model="claude-sonnet-5", trigger_context="MNQ1!/5m",
         success=True, error_message=None, latency_ms=150.0,
         input_tokens=300, output_tokens=120, cache_creation_input_tokens=0,
-        cache_read_input_tokens=0, web_search_requests=0, estimated_cost_usd=0.0018,
+        cache_read_input_tokens=0, web_search_requests=0, estimated_cost_usd=0.0018, pricing_version="1",
     )
     storage.record_llm_call(
         agent="news", model="claude-sonnet-5", trigger_context="MNQ1!",
         success=False, error_message="timeout", latency_ms=6000.0,
         input_tokens=None, output_tokens=None, cache_creation_input_tokens=None,
-        cache_read_input_tokens=None, web_search_requests=None, estimated_cost_usd=None,
+        cache_read_input_tokens=None, web_search_requests=None, estimated_cost_usd=None, pricing_version="1",
     )
 
     r = client.get("/system/llm-usage")
@@ -846,6 +846,26 @@ def test_llm_usage_endpoint_reports_overall_and_by_agent(client):
     assert body["overall"]["failed_calls"] == 1
     assert body["by_agent"]["analysis"]["total_input_tokens"] == 300
     assert len(body["recent_calls"]) == 2
+    assert body["pricing_versions_present"] == ["1"]
+
+
+def test_llm_usage_endpoint_reports_telemetry_health(client):
+    """Tier 3.25: telemetry_health is present and self-consistent even
+    with zero calls made through the ACTUAL track_llm_call wrapper in
+    this test run (the two rows above were inserted directly via
+    storage.record_llm_call, which doesn't touch the in-process
+    attempted/written/failed counters -- those only move via
+    track_llm_call itself, see test_llm_telemetry.py)."""
+    r = client.get("/system/llm-usage")
+    assert r.status_code == 200
+    body = r.json()
+    health = body["telemetry_health"]
+    assert "telemetry_started_at" in health
+    assert "pricing_version" in health
+    assert health["attempted"] >= 0
+    assert health["written"] >= 0
+    assert health["failed"] >= 0
+    assert (health["write_success_rate"] is None) or (0.0 <= health["write_success_rate"] <= 1.0)
 
 
 def test_llm_usage_endpoint_filters_recent_calls_by_agent(client):
@@ -855,13 +875,13 @@ def test_llm_usage_endpoint_filters_recent_calls_by_agent(client):
         agent="macro", model="claude-sonnet-5", trigger_context="MNQ1!",
         success=True, error_message=None, latency_ms=400.0,
         input_tokens=50, output_tokens=20, cache_creation_input_tokens=0,
-        cache_read_input_tokens=0, web_search_requests=1, estimated_cost_usd=0.0005,
+        cache_read_input_tokens=0, web_search_requests=1, estimated_cost_usd=0.0005, pricing_version="1",
     )
     storage.record_llm_call(
         agent="execution", model="claude-sonnet-5", trigger_context="MNQ1!/5m",
         success=True, error_message=None, latency_ms=900.0,
         input_tokens=200, output_tokens=90, cache_creation_input_tokens=0,
-        cache_read_input_tokens=0, web_search_requests=0, estimated_cost_usd=0.0013,
+        cache_read_input_tokens=0, web_search_requests=0, estimated_cost_usd=0.0013, pricing_version="1",
     )
 
     r = client.get("/system/llm-usage", params={"recent_agent": "macro"})

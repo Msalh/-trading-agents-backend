@@ -832,6 +832,24 @@ endpoints below, and app.experiments._current_locked_config() (a fifth
 locked, ENFORCED scoring knob — pre-Tier-3.24 experiments default to
 True on read, the only value it has ever actually had live).
 
+Tier 3.25 (cost telemetry health, fifth external review item #5,
+2026-08-19): app.llm_telemetry's write to llm_call_log has always
+swallowed a failure on purpose (a logging problem must never break a
+real agent call) — but that also made a telemetry outage invisible.
+Three additive fixes, no agent behavior changed: (1) in-process
+attempted/written/failed counters plus TELEMETRY_STARTED_AT (process
+start), exposed via GET /system/llm-usage's new `telemetry_health`
+field — a degraded write rate is now visible instead of silently
+under-counting calls; (2) PRICING_VERSION, a hand-maintained marker
+(mirrors app.backtest.BACKTEST_LOGIC_VERSION) stamped onto every
+llm_call_log row as `pricing_version` and surfaced back as
+`pricing_versions_present` in the summary, so a future change to the
+five TELEMETRY_*_COST_PER_MTOK/*_MULTIPLIER constants is visible in
+the data rather than silently blending two pricing regimes into one
+cost total; (3) pre-migration rows backfilled to pricing_version="1"
+(a real fact — these constants haven't changed since Tier 3.15, not a
+guess). See app/llm_telemetry.py's module docstring for full detail.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -896,6 +914,7 @@ from app.outcomes import (
     summarize_outcomes,
 )
 from app.coordinator_diagnostics import compute_coordinator_divergence_report
+from app.llm_telemetry import get_telemetry_health
 from app.paper_trades import (
     PROVENANCE_AUTO_POLICY,
     PROVENANCE_MANUAL_DASHBOARD,
@@ -1084,10 +1103,24 @@ def system_llm_usage(
     Console billing access to verify actual charges. Useful for
     relative comparison and trend-watching (which agent costs the
     most, is cost trending up), not as an authoritative invoice.
+
+    Tier 3.25 (fifth external review — "cost telemetry health", item
+    #5): a telemetry write failure has always been deliberately
+    swallowed (correct — a logging problem must never break a real
+    agent call) but was previously invisible. `telemetry_health` now
+    reports THIS PROCESS's attempted/written/failed counters since
+    `telemetry_started_at` (process start — resets on redeploy), so a
+    degraded write rate is visible instead of just silently under-
+    counting calls. `pricing_versions_present` in the summary above
+    reports which pricing regime(s) (see PRICING_VERSION in
+    app/llm_telemetry.py) the queried window's estimated_cost_usd
+    figures were computed under — more than one value means the window
+    spans a pricing change and the cost total blends two regimes.
+
     Entirely read-only — does not affect any agent's behavior."""
     summary = get_llm_call_summary(since=since)
     recent = get_recent_llm_calls(limit=recent_limit, agent=recent_agent)
-    return {**summary, "recent_calls": recent}
+    return {**summary, "recent_calls": recent, "telemetry_health": get_telemetry_health()}
 
 
 @app.post("/admin/wipe-all-data")
