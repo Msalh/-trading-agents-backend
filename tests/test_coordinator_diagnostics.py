@@ -20,6 +20,9 @@ from app.coordinator import MIN_AVAILABLE_WEIGHT, WEIGHTS, _score_opinions
 from app.coordinator_diagnostics import (
     _classify_ablation_change,
     compute_coordinator_divergence_report,
+    compute_news_urgent_analysis,
+    compute_news_urgent_decomposition,
+    compute_news_urgent_prevalence,
     compute_threshold_crossing_deep_dive,
 )
 
@@ -620,3 +623,184 @@ def test_deep_dive_urgent_flag_counted_for_news_not_forced_for_macro(fresh_env):
     assert macro_result["cases_considered"] == 1
     assert macro_result["cases"][0]["side"] == "agent_enabled_trade"
     assert macro_result["summary"]["urgent_flag_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# compute_news_urgent_prevalence / compute_news_urgent_decomposition — Tier 3.27
+#
+# No DB needed (unlike the Tier 3.26 tests above) -- neither function
+# calls outcomes.py, so the plain top-of-file _candidate()/_opinion()
+# helpers and live coordinator._score_opinions() are enough. Parameter
+# combinations below were found by brute-force search over the real live
+# WEIGHTS/DECISION_THRESHOLD/MIN_AVAILABLE_WEIGHT math (not hand-derived)
+# to hit each of the four attribution categories -- see the Tier 3.27
+# module docstring in app/coordinator_diagnostics.py for what each
+# category means.
+# ---------------------------------------------------------------------------
+
+def _flagged_opinion(direction, confidence, flags):
+    return {"direction": direction, "confidence": confidence, "timestamp": "2026-08-16T14:00:00Z", "flags": flags}
+
+
+def test_urgent_prevalence_candidate_and_distinct_levels():
+    # 3 candidates: 2 share the SAME reused urgent News opinion
+    # (timestamp "t1"), 1 has a distinct non-urgent News opinion --
+    # candidate-level should count all 3, distinct-opinion-level should
+    # count only 2 (the reuse collapses to one).
+    urgent_opinion = {"direction": "bullish", "confidence": 70, "timestamp": "t1", "flags": ["urgent"]}
+    calm_opinion = {"direction": "bearish", "confidence": 40, "timestamp": "t2", "flags": []}
+    c1 = _candidate(analysis=_opinion("bullish", 50), news=urgent_opinion, macro=_opinion("bullish", 50))
+    c2 = _candidate(analysis=_opinion("bullish", 50), news=urgent_opinion, macro=_opinion("bullish", 50))
+    c3 = _candidate(analysis=_opinion("bullish", 50), news=calm_opinion, macro=_opinion("bullish", 50))
+
+    result = compute_news_urgent_prevalence([c1, c2, c3])
+    assert result["candidate_level"] == {
+        "news_present_candidates": 3, "urgent_candidates": 2, "urgent_rate": round(2 / 3, 3),
+    }
+    assert result["distinct_opinion_level"] == {
+        "distinct_news_opinions": 2, "distinct_urgent_opinions": 1, "urgent_rate": 0.5,
+    }
+
+
+def test_urgent_prevalence_ignores_candidates_without_news():
+    c = _candidate(analysis=_opinion("bullish", 50), macro=_opinion("bullish", 50))  # no news
+    result = compute_news_urgent_prevalence([c])
+    assert result["candidate_level"]["news_present_candidates"] == 0
+    assert result["candidate_level"]["urgent_rate"] is None
+    assert result["distinct_opinion_level"]["urgent_rate"] is None
+
+
+def test_decomposition_attributes_urgent_dampen_alone():
+    # analysis=bullish30, news=bullish80(urgent), macro=bullish20 --
+    # original stays no_trade (urgent-dampened); removing ONLY News's
+    # directional contribution (keeping the dampen) still no_trade;
+    # removing ONLY the urgent flag (keeping News's real bullish read)
+    # crosses to enter_long -- the dampen alone is what mattered.
+    candidate = _candidate(
+        analysis=_opinion("bullish", 30),
+        news=_flagged_opinion("bullish", 80, ["urgent"]),
+        macro=_opinion("bullish", 20),
+        min_available_weight=MIN_AVAILABLE_WEIGHT,
+    )
+    assert candidate["decision"]["decision"] == "no_trade"
+
+    result = compute_news_urgent_decomposition([candidate])
+    assert result["cases_considered"] == 1
+    case = result["cases"][0]
+    assert case["attribution"] == "urgent_dampen_alone"
+    assert case["full_removal"]["changed"] is True
+    assert case["full_removal"]["category"] == "threshold_crossing"
+    assert case["direction_only_removed"]["changed"] is False
+    assert case["urgent_only_removed"]["changed"] is True
+    assert result["summary"]["by_attribution"] == {"urgent_dampen_alone": 1}
+    assert result["distinct_opinion_timestamps"] == 1
+
+
+def test_decomposition_attributes_only_combination_sufficient():
+    # analysis=bullish40, news=bearish20(urgent) opposing, macro=bullish10
+    # -- neither partial variant alone reproduces the full-removal
+    # crossing; only removing BOTH News's opposing direction AND its
+    # dampen together does.
+    candidate = _candidate(
+        analysis=_opinion("bullish", 40),
+        news=_flagged_opinion("bearish", 20, ["urgent"]),
+        macro=_opinion("bullish", 10),
+        min_available_weight=MIN_AVAILABLE_WEIGHT,
+    )
+    assert candidate["decision"]["decision"] == "no_trade"
+
+    result = compute_news_urgent_decomposition([candidate])
+    assert result["cases_considered"] == 1
+    case = result["cases"][0]
+    assert case["attribution"] == "only_combination_sufficient"
+    assert case["direction_only_removed"]["changed"] is False
+    assert case["urgent_only_removed"]["changed"] is False
+
+
+def test_decomposition_attributes_direction_alone():
+    # analysis=bullish70, news=bearish90(urgent) opposing, macro=bullish90
+    # -- removing ONLY News's opposing direction (keeping the dampen)
+    # crosses to enter_long; removing ONLY the urgent flag (keeping
+    # News's strong bearish opposition) does NOT -- the directional
+    # opposition alone is what held the original at no_trade.
+    candidate = _candidate(
+        analysis=_opinion("bullish", 70),
+        news=_flagged_opinion("bearish", 90, ["urgent"]),
+        macro=_opinion("bullish", 90),
+        min_available_weight=MIN_AVAILABLE_WEIGHT,
+    )
+    assert candidate["decision"]["decision"] == "no_trade"
+
+    result = compute_news_urgent_decomposition([candidate])
+    assert result["cases_considered"] == 1
+    case = result["cases"][0]
+    assert case["attribution"] == "direction_alone"
+    assert case["direction_only_removed"]["changed"] is True
+    assert case["urgent_only_removed"]["changed"] is False
+
+
+def test_decomposition_attributes_both_independently_sufficient():
+    # analysis=bullish70, news=bearish10(urgent, weak opposition),
+    # macro=bullish90 -- BOTH partial variants alone already reproduce
+    # the crossing (News's small opposing contribution and its dampen
+    # are each independently enough).
+    candidate = _candidate(
+        analysis=_opinion("bullish", 70),
+        news=_flagged_opinion("bearish", 10, ["urgent"]),
+        macro=_opinion("bullish", 90),
+        min_available_weight=MIN_AVAILABLE_WEIGHT,
+    )
+    assert candidate["decision"]["decision"] == "no_trade"
+
+    result = compute_news_urgent_decomposition([candidate])
+    assert result["cases_considered"] == 1
+    case = result["cases"][0]
+    assert case["attribution"] == "both_independently_sufficient"
+    assert case["direction_only_removed"]["changed"] is True
+    assert case["urgent_only_removed"]["changed"] is True
+
+
+def test_decomposition_skips_cases_without_urgent_flag():
+    # Same shape as the urgent_dampen_alone scenario, minus the urgent
+    # flag -- decomposition is meaningless without it (direction-only-
+    # removed would just be full removal), so this candidate must be
+    # excluded even though its full ablation IS threshold_crossing.
+    candidate = _candidate(
+        analysis=_opinion("bullish", 30),
+        news=_opinion("bullish", 80),  # no urgent flag
+        macro=_opinion("bullish", 20),
+        min_available_weight=MIN_AVAILABLE_WEIGHT,
+    )
+    result = compute_news_urgent_decomposition([candidate])
+    assert result["cases_considered"] == 0
+    assert result["cases"] == []
+
+
+def test_decomposition_skips_non_threshold_crossing_full_removal():
+    # News present and urgent, but removing it entirely drops the
+    # candidate to insufficient_data (a quorum effect), not
+    # threshold_crossing -- must be excluded from the decomposition,
+    # same subset restriction Tier 3.26's deep dive already applies.
+    candidate = _candidate(
+        analysis=_opinion("bullish", 90),
+        news=_flagged_opinion("bullish", 90, ["urgent"]),
+        min_available_weight=MIN_AVAILABLE_WEIGHT,  # only analysis+news present
+    )
+    full_check = compute_threshold_crossing_deep_dive([candidate], agent="news")
+    assert full_check["cases_considered"] == 0  # confirms this candidate is NOT threshold_crossing
+
+    result = compute_news_urgent_decomposition([candidate])
+    assert result["cases_considered"] == 0
+
+
+def test_news_urgent_analysis_combines_prevalence_and_decomposition():
+    candidate = _candidate(
+        analysis=_opinion("bullish", 30),
+        news=_flagged_opinion("bullish", 80, ["urgent"]),
+        macro=_opinion("bullish", 20),
+        min_available_weight=MIN_AVAILABLE_WEIGHT,
+    )
+    result = compute_news_urgent_analysis([candidate])
+    assert set(result.keys()) == {"prevalence", "decomposition"}
+    assert result["prevalence"]["candidate_level"]["news_present_candidates"] == 1
+    assert result["decomposition"]["cases_considered"] == 1

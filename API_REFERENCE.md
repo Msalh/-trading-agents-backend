@@ -1443,7 +1443,7 @@ output in any way.
 
 ---
 
-## Coordinator/Analysis divergence + ablation (Tier 3.16, corrected Tier 3.17, reclassified Tier 3.21, threshold-crossing deep dive added Tier 3.26)
+## Coordinator/Analysis divergence + ablation (Tier 3.16, corrected Tier 3.17, reclassified Tier 3.21, threshold-crossing deep dive added Tier 3.26, News urgent-vs-directional decomposition added Tier 3.27)
 
 Every backtest-lite/paired/grid result since Tier 3.10 has shown
 Coordinator's own blended decision performing at or below Analysis
@@ -1807,6 +1807,82 @@ Entirely offline for the ablation/replay step (no LLM calls,
 `COORDINATOR_THRESHOLD`/`WEIGHTS` untouched, no candidate mutated);
 the `agent_enabled_trade` real-outcome lookup reads trade rows the
 same way every other outcome-aware endpoint in this project does.
+
+### `GET /candidates/history/news-urgent-decomposition?symbol=MNQ1!&timeframe=5m&limit=300&horizons=15,30,60`
+
+Tier 3.27 (sixth external review). Real Tier 3.26 production numbers
+(News: 107 `threshold_crossing` cases, ~80% carrying News's `"urgent"`
+flag) surfaced a real measurement gap the reviewer named directly:
+`"urgent"` independently halves the blended score in
+`app/coordinator.py`'s own scoring math regardless of direction or
+agreement with Analysis, and the ablation behind `threshold-crossing-
+deep-dive` removes News's opinion entirely — conflating that dampen
+with News's genuine directional contribution into one "changed" number.
+This endpoint decomposes the two without touching live scoring at all:
+
+```json
+{
+  "symbol": "MNQ1!",
+  "timeframe": "5m",
+  "prevalence": {
+    "candidate_level": {"news_present_candidates": 399, "urgent_candidates": 210, "urgent_rate": 0.526},
+    "distinct_opinion_level": {"distinct_news_opinions": 48, "distinct_urgent_opinions": 9, "urgent_rate": 0.188}
+  },
+  "decomposition": {
+    "cases_considered": 1,
+    "distinct_opinion_timestamps": 1,
+    "cases": [
+      {
+        "candidate_id": "cand-1",
+        "attribution": "urgent_dampen_alone",
+        "full_removal": {"changed": true, "category": "threshold_crossing", "score_delta": 5.39},
+        "direction_only_removed": {"changed": false, "category": null, "score_delta": -12.5},
+        "urgent_only_removed": {"changed": true, "category": "threshold_crossing", "score_delta": 21.87}
+      }
+    ],
+    "summary": {"by_attribution": {"urgent_dampen_alone": 1}}
+  }
+}
+```
+
+(Illustrative shape from fixture-scale data for `decomposition`; the
+`prevalence` numbers are a plausible full-history illustration, not a
+production pull.)
+
+**`prevalence`** answers the reviewer's second correction directly: the
+86/107 figure from Tier 3.26 is *not* News's overall urgent rate — it's
+the rate *within* a sample already pre-selected by `threshold_crossing`,
+and `"urgent"` itself helps pull a candidate into that sample by
+depressing its score toward the boundary. This instead reports
+`"urgent"`'s unconditional share at the candidate level (every News-
+present candidate) and, separately, at the distinct-opinion level (one
+urgent LLM call can be reused across many candidates while fresh, per
+Tier 3.6's reuse concern) — the honest base rate to compare 86/107
+against.
+
+**`decomposition`** answers the first correction: for each urgent-tagged
+`threshold_crossing` case (same subset `threshold-crossing-deep-dive?
+agent=news` would show), two additional partial-modification replays are
+run against the frozen `opinions_used` snapshot — News present but
+direction forced to `"neutral"` (zero weighted contribution;
+`_DIRECTION_VALUE["neutral"]` is `0`; `"urgent"` stays in its flags, so
+the dampen still applies — isolates the dampen ALONE), and News present
+with its real direction/confidence but `"urgent"` stripped from its
+flags (isolates the directional contribution ALONE). `attribution` is
+one of: `"direction_alone"` (only the directional-only variant
+reproduces the original full-removal's changed classification),
+`"urgent_dampen_alone"` (only the urgent-only variant does),
+`"both_independently_sufficient"` (either alone would have), or
+`"only_combination_sufficient"` (a genuine interaction — neither alone
+reproduces it, only removing both together does, the same thing the
+existing ablation measures). Scoped to News only — Macro's flag
+vocabulary (`risk_off`/`conflicting_signals`/`stale_data`) has no
+`"urgent"` concept.
+
+Entirely offline (no LLM calls, no candidate mutated,
+`COORDINATOR_THRESHOLD`/`WEIGHTS`/`ANALYSIS_REQUIRED` untouched) — every
+variant is a throwaway per-candidate copy used for one replay each, same
+guarantee the rest of this diagnostic family gives.
 
 ---
 

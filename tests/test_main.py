@@ -1006,6 +1006,61 @@ def test_threshold_crossing_deep_dive_endpoint_empty_history(client):
 
 
 # ---------------------------------------------------------------------------
+# Tier 3.27: News urgent-vs-directional decomposition
+# ---------------------------------------------------------------------------
+
+def test_news_urgent_decomposition_endpoint_returns_shape(client):
+    import app.storage as storage
+
+    anchor = "2026-08-11T14:00:00Z"
+    bar = {"event_id": "evt-nud-1", "symbol": "MNQ1!", "timeframe": "5m", "timestamp": anchor}
+    # Same urgent_dampen_alone scenario verified in test_coordinator_diagnostics.py:
+    # analysis=bullish30, news=bullish80(urgent), macro=bullish20 -> no_trade;
+    # removing News entirely crosses to enter_long, and it's the urgent
+    # dampen alone (not the directional contribution) that's responsible.
+    decision = {
+        "decision": "no_trade",
+        "score": 21.88,
+        "threshold": 25.0,
+        "opinions_used": {
+            "analysis": {"direction": "bullish", "confidence": 30, "timestamp": anchor, "flags": []},
+            "news": {"direction": "bullish", "confidence": 80, "timestamp": anchor, "flags": ["urgent"]},
+            "macro": {"direction": "bullish", "confidence": 20, "timestamp": anchor, "flags": []},
+        },
+        "missing_agents": [],
+        "stale_agents": [],
+        "contributions": {},
+        "conflict_flags": [],
+        "timestamp": anchor,
+    }
+    storage.save_candidate(candidate_id="cand-nud-1", symbol="MNQ1!", timeframe="5m", bar=bar, decision=decision)
+
+    r = client.get(
+        "/candidates/history/news-urgent-decomposition",
+        params={"symbol": "MNQ1!", "timeframe": "5m"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["symbol"] == "MNQ1!"
+    assert "prevalence" in body
+    assert "decomposition" in body
+    assert body["prevalence"]["candidate_level"]["news_present_candidates"] == 1
+    assert body["decomposition"]["cases_considered"] == 1
+    assert body["decomposition"]["cases"][0]["attribution"] == "urgent_dampen_alone"
+
+
+def test_news_urgent_decomposition_endpoint_empty_history(client):
+    r = client.get(
+        "/candidates/history/news-urgent-decomposition",
+        params={"symbol": "NOSUCH", "timeframe": "5m"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["prevalence"]["candidate_level"]["news_present_candidates"] == 0
+    assert body["decomposition"]["cases_considered"] == 0
+
+
+# ---------------------------------------------------------------------------
 # Tier 3.18: day/session reporting
 # ---------------------------------------------------------------------------
 

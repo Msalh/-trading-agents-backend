@@ -877,6 +877,28 @@ untouched, no candidate mutated); the agent_enabled_trade real-outcome
 lookup reads trade rows the same way every other outcome-aware
 endpoint in this project already does.
 
+Tier 3.27 (News urgent-vs-directional decomposition, sixth external
+review, 2026-08-23): real Tier 3.26 production numbers (News: 107
+threshold_crossing cases, ~80% carrying News's "urgent" flag) surfaced
+a real measurement gap — "urgent" independently halves the blended
+score in app/coordinator.py's own scoring math regardless of direction
+or agreement with Analysis, and Tier 3.26's ablation removes News's
+opinion entirely, conflating that dampen with News's genuine
+directional contribution into one "changed" number. New app/
+coordinator_diagnostics.compute_news_urgent_analysis() and GET
+/candidates/history/news-urgent-decomposition, without touching live
+scoring at all: `prevalence` reports urgent's honest unconditional rate
+(candidate-level and distinct-opinion-level) instead of the rate within
+the pre-filtered threshold_crossing sample; `decomposition` replays two
+partial-modification variants per urgent-tagged threshold_crossing case
+(direction forced to neutral with urgent's flag kept, vs. urgent
+stripped with the real direction/confidence kept) and attributes each
+case to direction_alone / urgent_dampen_alone / both_independently_
+sufficient / only_combination_sufficient. Scoped to News only — Macro's
+flag vocabulary has no "urgent" concept. Entirely offline, no LLM
+calls, no candidate mutated, COORDINATOR_THRESHOLD/WEIGHTS/
+ANALYSIS_REQUIRED untouched.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -942,6 +964,7 @@ from app.outcomes import (
 )
 from app.coordinator_diagnostics import (
     compute_coordinator_divergence_report,
+    compute_news_urgent_analysis,
     compute_threshold_crossing_deep_dive,
 )
 from app.llm_telemetry import get_telemetry_health
@@ -2185,6 +2208,63 @@ def candidates_history_threshold_crossing_deep_dive(
             agent=agent,
             horizons=_parse_replay_horizons(horizons),
         ),
+    }
+
+
+@app.get("/candidates/history/news-urgent-decomposition")
+def candidates_history_news_urgent_decomposition(
+    symbol: str = Query(...),
+    timeframe: str = Query(...),
+    limit: int = Query(default=300, le=1000),
+    horizons: str = Query(default="15,30,60"),
+) -> dict:
+    """Tier 3.27 (sixth external review): pulling real Tier 3.26 numbers
+    (News: 107 threshold_crossing cases, ~80% carrying News's "urgent"
+    flag) surfaced a real measurement gap the reviewer named directly —
+    News's "urgent" flag independently halves the blended score in
+    app/coordinator.py's own scoring math, regardless of direction or
+    agreement with Analysis, and Tier 3.26's ablation removes News's
+    opinion (and therefore BOTH the directional contribution AND the
+    urgent dampen) in one step. A threshold_crossing case caused entirely
+    by the 0.5x dampen — no real directional disagreement at all — looked
+    identical to one caused by News's own bullish/bearish read, so
+    reporting the count as "News's directional influence" overstated what
+    was actually measured.
+
+    Two sections, neither touching live scoring:
+
+    `prevalence` — the reviewer's second correction: 86/107 is NOT News's
+    overall urgent rate, it's the rate WITHIN a sample already pre-
+    selected by threshold_crossing (and urgent itself helps pull a
+    candidate into that sample by depressing its score). Reports urgent's
+    unconditional share across every News-present candidate, and
+    separately across every DISTINCT News opinion (one urgent LLM call
+    can be reused across many candidates while fresh) — the honest base
+    rate to compare 86/107 against.
+
+    `decomposition` — for each urgent-tagged threshold_crossing case
+    (same subset GET .../threshold-crossing-deep-dive?agent=news would
+    show), additionally replays two partial-modification variants of the
+    frozen opinions snapshot: News present but direction forced to
+    "neutral" (zero weighted contribution, urgent's dampen still applies
+    — isolates the dampen ALONE) and News present with its real
+    direction/confidence but "urgent" stripped from its flags (isolates
+    the directional contribution ALONE). Each case's `attribution` is
+    `"direction_alone"`, `"urgent_dampen_alone"`, `"both_independently_
+    sufficient"`, or `"only_combination_sufficient"` (a genuine
+    interaction — neither alone reproduces the original full-removal's
+    changed classification, only the combination does).
+
+    Entirely offline (no LLM calls, no candidate mutated,
+    COORDINATOR_THRESHOLD/WEIGHTS/ANALYSIS_REQUIRED untouched) — every
+    variant is a throwaway per-candidate copy used for one replay each,
+    same guarantee the rest of this diagnostic family gives. Scoped to
+    News only: Macro's flag vocabulary has no "urgent" concept."""
+    candidates = get_candidate_history(symbol=symbol, timeframe=timeframe, limit=limit)
+    return {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        **compute_news_urgent_analysis(candidates, horizons=_parse_replay_horizons(horizons)),
     }
 
 

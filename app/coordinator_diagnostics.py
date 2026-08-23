@@ -197,6 +197,231 @@ _PREVENTED_OUTCOME_LABEL = {
     "no_data": "no_data",
 }
 
+# ---------------------------------------------------------------------------
+# News urgent-vs-directional decomposition — Tier 3.27
+#
+# Sixth external review, responding to real Tier 3.26 production numbers
+# (News: 107 threshold_crossing cases, 86 of them — ~80% — carrying
+# News's "urgent" flag): the review's central correctness point is that
+# Tier 3.26's threshold_crossing measurement CONFLATES two mechanically
+# separate effects whenever "urgent" is set. app/coordinator.py's
+# _score_opinions() does two different things with a present News
+# opinion: (1) folds its direction*confidence*weight into the weighted
+# score sum (the genuine "directional influence" the reviewer wants
+# measured), and (2) independently multiplies the WHOLE score by 0.5
+# whenever "urgent" is in News's flags, regardless of direction or
+# agreement with Analysis (a scoring-mechanic side effect, not a
+# directional read). _ablate_agent() (Tier 3.17/3.26) removes News's
+# opinion entirely, which removes BOTH effects at once — so a
+# threshold_crossing case caused ENTIRELY by the 0.5x dampen (no real
+# directional disagreement at all) looks identical, from that one
+# measurement, to one caused entirely by News's own bullish/bearish read
+# outweighing the others. Reported as "News's directional influence,"
+# that overstates what was actually shown, exactly as the review argues.
+#
+# The fix doesn't need to touch coordinator.py's live scoring at all —
+# it only needs two NEW partial-modification variants of a candidate's
+# frozen opinions_used, replayed the same offline way _ablate_agent()
+# already is:
+#   - _news_direction_only_removed(): keeps News's opinion present (so
+#     its flags, including "urgent", still apply the dampen) but forces
+#     direction to "neutral" — _DIRECTION_VALUE["neutral"] is 0, so its
+#     weighted contribution to the score becomes exactly zero while
+#     everything else about its presence (quorum availability, the
+#     urgent dampen) is untouched. Isolates the dampen's effect ALONE.
+#   - _news_urgent_flag_only_removed(): keeps News's real direction and
+#     confidence (so its weighted contribution is unchanged) but strips
+#     "urgent" out of its flags list, so the 0.5x dampen no longer fires.
+#     Isolates the directional contribution's effect ALONE.
+# Comparing which of these two variants alone reproduces the original
+# full-removal's category-changing effect (compute_news_urgent_
+# decomposition()'s "attribution" field: "direction_alone" /
+# "urgent_dampen_alone" / "both_independently_sufficient" /
+# "only_combination_sufficient" for a genuine interaction) answers the
+# review's exact three-way ask ("removal of direction alone" / "removal
+# of urgent alone" / "removal of both, the existing measurement") without
+# any change to live scoring — both variants are throwaway per-candidate
+# copies for one offline replay each, same guarantee _ablate_agent() and
+# every other function in this module already give.
+#
+# compute_news_urgent_prevalence() answers the review's second, equally
+# important correction: 86/107 is NOT News's overall "urgent rate" — it's
+# the rate WITHIN a sample that's already pre-selected by threshold_
+# crossing, and urgent itself helps pull a candidate INTO that sample (by
+# depressing its score toward the boundary). This instead reports urgent's
+# unconditional share across every News-present candidate (how often a
+# webhook-triggered decision saw an urgent News opinion) and, separately,
+# across every DISTINCT News opinion (the honest denominator — one urgent
+# LLM call can be reused across many candidates while fresh, per Tier
+# 3.6/3.26's reuse concern), so the 86/107 figure can be read against the
+# real base rate instead of the pre-filtered one.
+#
+# Scoped to News only — Macro's flag vocabulary (risk_off/conflicting_
+# signals/stale_data, confirmed via app/macro_agent.py) has no "urgent"
+# concept at all, so this decomposition has nothing to isolate there.
+# Read-only, offline, no LLM calls, no candidate mutated, coordinator.py
+# untouched — same guarantee as the rest of this module.
+# ---------------------------------------------------------------------------
+
+def _news_direction_only_removed(candidate: dict) -> dict:
+    decision = candidate["decision"]
+    opinions_used = dict(decision.get("opinions_used") or {})
+    news_opinion = opinions_used.get("news")
+    if news_opinion is None:
+        return candidate  # no-op: caller only invokes this when news is present
+    opinions_used["news"] = {**news_opinion, "direction": "neutral"}
+    return {**candidate, "decision": {**decision, "opinions_used": opinions_used}}
+
+
+def _news_urgent_flag_only_removed(candidate: dict) -> dict:
+    decision = candidate["decision"]
+    opinions_used = dict(decision.get("opinions_used") or {})
+    news_opinion = opinions_used.get("news")
+    if news_opinion is None:
+        return candidate
+    stripped_flags = [f for f in (news_opinion.get("flags") or []) if f != "urgent"]
+    opinions_used["news"] = {**news_opinion, "flags": stripped_flags}
+    return {**candidate, "decision": {**decision, "opinions_used": opinions_used}}
+
+
+def _attribute_urgent_vs_direction(direction_only_changed: bool, urgent_only_changed: bool) -> str:
+    if direction_only_changed and not urgent_only_changed:
+        return "direction_alone"
+    if urgent_only_changed and not direction_only_changed:
+        return "urgent_dampen_alone"
+    if direction_only_changed and urgent_only_changed:
+        return "both_independently_sufficient"
+    return "only_combination_sufficient"
+
+
+def compute_news_urgent_prevalence(candidates: list[dict]) -> dict:
+    """Reviewer correction (sixth external review) — see module docstring
+    section above. Returns urgent's unconditional share at both the
+    candidate level and the distinct-News-opinion level, across every
+    News-present candidate in the input (not just a threshold_crossing
+    subset)."""
+    candidate_total = 0
+    candidate_urgent = 0
+    opinion_is_urgent: dict[str, bool] = {}
+
+    for candidate in candidates:
+        decision = candidate.get("decision") or {}
+        opinions_used = decision.get("opinions_used") or {}
+        news_opinion = opinions_used.get("news")
+        if not news_opinion:
+            continue
+        candidate_total += 1
+        is_urgent = "urgent" in (news_opinion.get("flags") or [])
+        if is_urgent:
+            candidate_urgent += 1
+        timestamp = news_opinion.get("timestamp")
+        if timestamp:
+            opinion_is_urgent[timestamp] = opinion_is_urgent.get(timestamp, False) or is_urgent
+
+    distinct_total = len(opinion_is_urgent)
+    distinct_urgent = sum(1 for v in opinion_is_urgent.values() if v)
+
+    return {
+        "candidate_level": {
+            "news_present_candidates": candidate_total,
+            "urgent_candidates": candidate_urgent,
+            "urgent_rate": round(candidate_urgent / candidate_total, 3) if candidate_total else None,
+        },
+        "distinct_opinion_level": {
+            "distinct_news_opinions": distinct_total,
+            "distinct_urgent_opinions": distinct_urgent,
+            "urgent_rate": round(distinct_urgent / distinct_total, 3) if distinct_total else None,
+        },
+    }
+
+
+def compute_news_urgent_decomposition(candidates: list[dict], horizons: list[int] = None) -> dict:
+    """Tier 3.27 — see module docstring section above for the full
+    rationale. Walks the same threshold_crossing subset Tier 3.26's
+    compute_threshold_crossing_deep_dive(agent="news") would (full
+    _ablate_agent removal, classified via _classify_ablation_change),
+    filtered further to cases where News's opinion actually carried the
+    "urgent" flag (decomposition is meaningless otherwise — without
+    urgent, direction-only-removed IS full removal). For each, additionally
+    replays the two partial-modification variants and reports which one
+    alone reproduces the original full-removal's changed classification —
+    the causal attribution the review asked for."""
+    horizons = horizons or HORIZON_MINUTES_DEFAULT
+    cases = []
+    distinct_opinion_timestamps: set[str] = set()
+
+    for candidate in candidates:
+        decision = candidate.get("decision") or {}
+        opinions_used = decision.get("opinions_used") or {}
+        news_opinion = opinions_used.get("news")
+        if not news_opinion:
+            continue
+        if "urgent" not in (news_opinion.get("flags") or []):
+            continue
+
+        conflict_flags = decision.get("conflict_flags") or []
+
+        full_removed = replay_candidate(_ablate_agent(candidate, "news"), weights=WEIGHTS)
+        full_classified = _classify_ablation_change(conflict_flags, full_removed)
+        if full_classified["category"] != "threshold_crossing":
+            continue
+
+        direction_only = replay_candidate(_news_direction_only_removed(candidate), weights=WEIGHTS)
+        direction_only_classified = _classify_ablation_change(conflict_flags, direction_only)
+
+        urgent_only = replay_candidate(_news_urgent_flag_only_removed(candidate), weights=WEIGHTS)
+        urgent_only_classified = _classify_ablation_change(conflict_flags, urgent_only)
+
+        attribution = _attribute_urgent_vs_direction(
+            direction_only_classified["changed"], urgent_only_classified["changed"],
+        )
+
+        opinion_timestamp = news_opinion.get("timestamp")
+        if opinion_timestamp:
+            distinct_opinion_timestamps.add(opinion_timestamp)
+
+        cases.append({
+            "candidate_id": candidate.get("candidate_id"),
+            "attribution": attribution,
+            "full_removal": {
+                "changed": full_classified["changed"],
+                "category": full_classified["category"],
+                "score_delta": full_classified["score_delta"],
+            },
+            "direction_only_removed": {
+                "changed": direction_only_classified["changed"],
+                "category": direction_only_classified["category"],
+                "score_delta": direction_only_classified["score_delta"],
+            },
+            "urgent_only_removed": {
+                "changed": urgent_only_classified["changed"],
+                "category": urgent_only_classified["category"],
+                "score_delta": urgent_only_classified["score_delta"],
+            },
+        })
+
+    attribution_counts: dict[str, int] = {}
+    for case in cases:
+        attribution_counts[case["attribution"]] = attribution_counts.get(case["attribution"], 0) + 1
+
+    return {
+        "cases_considered": len(cases),
+        "distinct_opinion_timestamps": len(distinct_opinion_timestamps),
+        "cases": cases,
+        "summary": {"by_attribution": attribution_counts},
+    }
+
+
+def compute_news_urgent_analysis(candidates: list[dict], horizons: list[int] = None) -> dict:
+    """Tier 3.27 combined entry point: prevalence (the honest, un-pre-
+    filtered urgent base rate) alongside the causal decomposition (which
+    of direction/urgent-dampen/both actually drove each urgent-tagged
+    threshold_crossing case) — see module docstring section above."""
+    return {
+        "prevalence": compute_news_urgent_prevalence(candidates),
+        "decomposition": compute_news_urgent_decomposition(candidates, horizons=horizons),
+    }
+
 
 def _analysis_bucket(opinions_used: dict, missing_agents: list[str], stale_agents: list[str]) -> str:
     """Three-way bucket for what Analysis contributed to this specific
