@@ -322,6 +322,99 @@ def test_unknown_direction_source_raises(fresh_env):
 
 
 # ---------------------------------------------------------------------------
+# analysis_risk_filtered source -- Tier 3.30
+# ---------------------------------------------------------------------------
+
+def _add_opinion(candidate, agent, direction, flags):
+    """Injects a News/Macro opinion into a candidate built by the plain
+    _candidate() helper above, which only sets up "analysis" -- these
+    tests need News/Macro flags too, and extending the shared fixture
+    risks changing what every other test in this file already asserts
+    about opinions_used's exact shape."""
+    candidate["decision"]["opinions_used"][agent] = {
+        "direction": direction, "timestamp": candidate["bar"]["timestamp"], "flags": flags,
+    }
+    return candidate
+
+
+def test_analysis_risk_filtered_matches_analysis_when_no_news_or_macro():
+    """No News/Macro opinion at all -- an agent that never ran can't
+    veto anything, so this source's direction call is identical to the
+    plain "analysis" source's."""
+    from app import backtest
+    anchor = datetime(2026, 8, 11, 14, 0, 0, tzinfo=timezone.utc)
+    candidate = _candidate("c1", "TEST", "5m", anchor, atr=2.0, decision="no_trade", analysis_direction="bullish")
+    direction, ts = backtest._direction_for_source("analysis_risk_filtered", candidate)
+    assert direction == "bullish"
+    assert ts is not None
+
+
+def test_analysis_risk_filtered_vetoes_on_news_urgent(fresh_env):
+    storage, backtest = fresh_env
+    anchor = datetime(2026, 8, 11, 14, 0, 0, tzinfo=timezone.utc)
+    candidate = _candidate("c1", "TEST", "5m", anchor, atr=2.0, decision="no_trade", analysis_direction="bullish")
+    _add_opinion(candidate, "news", "bullish", ["urgent"])
+    _save_bar(storage, "TEST", "5m", anchor + timedelta(minutes=5), open_=100.0, high=106.0, low=99.5, close=105.5)
+
+    summary = backtest.run_barrier_backtest([candidate], direction_source="analysis_risk_filtered")
+    assert summary["trades_taken"] == 0
+    # The plain "analysis" source (no veto concept) still takes it.
+    analysis_summary = backtest.run_barrier_backtest([candidate], direction_source="analysis")
+    assert analysis_summary["trades_taken"] == 1
+
+
+def test_analysis_risk_filtered_vetoes_on_macro_risk_off(fresh_env):
+    storage, backtest = fresh_env
+    anchor = datetime(2026, 8, 11, 14, 0, 0, tzinfo=timezone.utc)
+    candidate = _candidate("c1", "TEST", "5m", anchor, atr=2.0, decision="no_trade", analysis_direction="bullish")
+    _add_opinion(candidate, "macro", "neutral", ["risk_off"])
+    _save_bar(storage, "TEST", "5m", anchor + timedelta(minutes=5), open_=100.0, high=106.0, low=99.5, close=105.5)
+
+    summary = backtest.run_barrier_backtest([candidate], direction_source="analysis_risk_filtered")
+    assert summary["trades_taken"] == 0
+
+
+def test_analysis_risk_filtered_does_not_veto_on_other_news_flags(fresh_env):
+    # "low_data"/"stale_data" are about data quality, not risk -- the
+    # project-owner-confirmed veto scope is "urgent" only for News.
+    storage, backtest = fresh_env
+    anchor = datetime(2026, 8, 11, 14, 0, 0, tzinfo=timezone.utc)
+    candidate = _candidate("c1", "TEST", "5m", anchor, atr=2.0, decision="no_trade", analysis_direction="bullish")
+    _add_opinion(candidate, "news", "bullish", ["low_data", "stale_data"])
+    _save_bar(storage, "TEST", "5m", anchor + timedelta(minutes=5), open_=100.0, high=106.0, low=99.5, close=105.5)
+
+    summary = backtest.run_barrier_backtest([candidate], direction_source="analysis_risk_filtered")
+    assert summary["trades_taken"] == 1
+
+
+def test_analysis_risk_filtered_does_not_veto_on_other_macro_flags(fresh_env):
+    # "conflicting_signals"/"stale_data" are not the confirmed veto flag
+    # ("risk_off" only) for Macro.
+    storage, backtest = fresh_env
+    anchor = datetime(2026, 8, 11, 14, 0, 0, tzinfo=timezone.utc)
+    candidate = _candidate("c1", "TEST", "5m", anchor, atr=2.0, decision="no_trade", analysis_direction="bullish")
+    _add_opinion(candidate, "macro", "neutral", ["conflicting_signals", "stale_data"])
+    _save_bar(storage, "TEST", "5m", anchor + timedelta(minutes=5), open_=100.0, high=106.0, low=99.5, close=105.5)
+
+    summary = backtest.run_barrier_backtest([candidate], direction_source="analysis_risk_filtered")
+    assert summary["trades_taken"] == 1
+
+
+def test_analysis_risk_filtered_requires_analysis_directional():
+    from app import backtest
+    anchor = datetime(2026, 8, 11, 14, 0, 0, tzinfo=timezone.utc)
+    candidate = _candidate("c1", "TEST", "5m", anchor, atr=2.0, decision="no_trade", analysis_direction="neutral")
+    direction, ts = backtest._direction_for_source("analysis_risk_filtered", candidate)
+    assert direction is None
+    assert ts is None
+
+
+def test_analysis_risk_filtered_is_in_direction_sources():
+    from app import backtest
+    assert "analysis_risk_filtered" in backtest.DIRECTION_SOURCES
+
+
+# ---------------------------------------------------------------------------
 # compute_backtest_comparison
 # ---------------------------------------------------------------------------
 

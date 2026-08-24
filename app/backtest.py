@@ -208,6 +208,47 @@ integrity, deliberately kept separate from day-session-report rather
 than merged into it: this is a forensic/validation tool (its mismatch_
 examples payload can be large) with a different purpose than the day/
 session summary it's meant to double-check.
+
+Tier 3.30 ("analysis_risk_filtered" shadow policy, sixth external
+review, ranked backlog item #4, 2026-08-24): the reviewer asked for a
+parallel policy — Analysis alone decides direction, News/Macro act only
+as risk filters — run alongside the live system without touching it.
+Every diagnostic tier before this one has answered a "what if" question
+by re-walking already-stored candidate history offline, never by
+standing up a new live-running process; this is the same pattern, not
+an exception. "analysis_risk_filtered" is simply a new entry in
+DIRECTION_SOURCES: same direction call as the existing "analysis"
+source (Analysis's own opinion, independent of Coordinator's blended
+decision), but the candidate is skipped entirely (both are direction
+sources are None/None) if News's opinion carries the "urgent" flag or
+Macro's opinion carries the "risk_off" flag — News/Macro can only VETO
+a trade Analysis wanted to take, never supply or shift its direction,
+matching "risk filter" as the reviewer meant it. Confirmed with the
+project owner (2026-08-24) which two flags actually count as a risk
+veto out of News's full urgent/low_data/stale_data vocabulary and
+Macro's full risk_off/conflicting_signals/stale_data vocabulary — only
+"urgent" and "risk_off" are genuinely ABOUT elevated risk; the rest are
+about data quality or ambiguity, a different concern this filter has no
+mandate to act on (see _RISK_FILTER_NEWS_VETO_FLAGS/_RISK_FILTER_
+MACRO_VETO_FLAGS below). An agent that never ran for a given candidate
+can't veto it — absence of a risk signal is not itself a risk signal.
+
+Because DIRECTION_SOURCES is consumed generically everywhere in this
+module (compute_backtest_comparison's default source list,
+run_paired_barrier_backtest, run_sensitivity_grid, compute_champion_
+challenger_report, and their validation), adding this one entry means
+every existing backtest-lite/paired/grid/champion-challenger endpoint
+picks it up automatically, with the full existing win_rate/profit_
+factor/CI95/median_pnl/max_drawdown/day-session reporting machinery
+applied to it for free — no new endpoint, no new simulation logic, no
+duplicated statistics code. Directly comparable against "analysis" (the
+same direction calls, MINUS the veto) and "coordinator" (the live
+blended policy) side by side in the same by_source report, which is
+exactly the comparison the reviewer's request was for. Entirely
+offline, no LLM calls, no new trades, COORDINATOR_THRESHOLD/WEIGHTS/
+AUTO_EXECUTE_ENABLED untouched — this changes what a BACKTEST simulates
+for one more hypothetical source, nothing about the live Coordinator or
+Risk/Execution pipeline.
 """
 
 import math
@@ -267,7 +308,21 @@ DIRECTION_SOURCES = (
     "always_bullish",
     "always_bearish",
     "vwap",
+    "analysis_risk_filtered",
 )
+
+# Tier 3.30 — the exact two flags "analysis_risk_filtered" treats as a
+# veto. Deliberately narrow: News's full vocabulary is "urgent"/
+# "low_data"/"stale_data" and Macro's is "risk_off"/"conflicting_
+# signals"/"stale_data" (see app/news_agent.py, app/macro_agent.py), but
+# only "urgent" and "risk_off" are actually ABOUT elevated risk/
+# volatility — "low_data"/"stale_data"/"conflicting_signals" are about
+# data quality or ambiguity, a different concern a risk-FILTER has no
+# stated mandate to act on. Project-owner decision (not a default this
+# module invented on its own), confirmed against this exact vocabulary
+# before building.
+_RISK_FILTER_NEWS_VETO_FLAGS = frozenset({"urgent"})
+_RISK_FILTER_MACRO_VETO_FLAGS = frozenset({"risk_off"})
 
 _FLIP = {"bullish": "bearish", "bearish": "bullish"}
 
@@ -435,6 +490,27 @@ def _direction_for_source(source: str, candidate: dict) -> tuple[str | None, str
         if not vwap_distance:
             return None, None
         return ("bullish" if vwap_distance > 0 else "bearish"), _candidate_anchor_timestamp(candidate)
+
+    if source == "analysis_risk_filtered":
+        # Sixth external review, ranked backlog item #4: "a shadow
+        # policy where Analysis alone decides direction and News/Macro
+        # act only as risk filters" (i.e. they can VETO a trade, never
+        # supply or shift its direction — no blending, no score). Same
+        # direction call as the "analysis" source above; the only
+        # difference is the veto below. An agent that never ran for
+        # this candidate (missing/stale, no opinion at all) can't veto
+        # anything — absence of a risk signal is not itself a risk
+        # signal, so the trade proceeds exactly as "analysis" would.
+        if not analysis_opinion or analysis_opinion.get("direction") not in ("bullish", "bearish"):
+            return None, None
+        news_opinion = opinions_used.get("news")
+        if news_opinion and _RISK_FILTER_NEWS_VETO_FLAGS & set(news_opinion.get("flags") or []):
+            return None, None
+        macro_opinion = opinions_used.get("macro")
+        if macro_opinion and _RISK_FILTER_MACRO_VETO_FLAGS & set(macro_opinion.get("flags") or []):
+            return None, None
+        anchor = _resolve_anchor_timestamp("analysis", candidate, analysis_opinion, decision)
+        return analysis_opinion.get("direction"), anchor
 
     raise ValueError(f"unknown direction_source {source!r} — must be one of {DIRECTION_SOURCES}")
 

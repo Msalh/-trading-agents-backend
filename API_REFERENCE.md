@@ -699,7 +699,7 @@ was never actually filled/sized/executed, so there's no real P&L to
 attribute to it. 400 if `thresholds` doesn't parse as comma-separated
 numbers.
 
-### `GET /candidates/history/backtest-lite?symbol=MNQ1!&timeframe=5m&limit=200&sources=analysis,coordinator,always_bullish,always_bearish,vwap,inverse_analysis&atr_stop_mult=1.5&atr_target_mult=2.5&expiry_bars=24&non_overlapping=true`
+### `GET /candidates/history/backtest-lite?symbol=MNQ1!&timeframe=5m&limit=200&sources=analysis,coordinator,always_bullish,always_bearish,vwap,inverse_analysis,analysis_risk_filtered&atr_stop_mult=1.5&atr_target_mult=2.5&expiry_bars=24&non_overlapping=true`
 Tier 3.10 (ATR-barrier benchmark) — every accuracy number through Tier
 3.9 uses the "price higher/lower N minutes later" proxy, never an
 actual entry/stop/target trade simulation. This endpoint runs the
@@ -718,10 +718,20 @@ Execution would have picked.
 mechanics side by side: `analysis` (Analysis's own opinion), `coordinator`
 (the blended decision), `always_bullish` / `always_bearish` / `vwap`
 (trivial baselines — `vwap` is bullish when the anchor bar's own
-`distance_from_vwap_points` is positive), and `inverse_analysis`
+`distance_from_vwap_points` is positive), `inverse_analysis`
 (Analysis's calls flipped — diagnostic only, never acted on, same
 framing as the `inverse_of_analysis` baseline in
-`baseline-comparison` above). Omit `sources` for all six.
+`baseline-comparison` above), and `analysis_risk_filtered` (Tier 3.30 —
+same direction call as `analysis`, but the candidate is skipped
+entirely if News's opinion carries the `"urgent"` flag or Macro's
+opinion carries the `"risk_off"` flag; an agent that never ran for that
+candidate can't veto it. Sixth external review's "Analysis alone
+decides direction, News/Macro as risk filters only" shadow policy —
+News/Macro can only remove a trade Analysis wanted to take, never
+supply or shift its direction. See `app/backtest.py`'s module docstring
+for exactly why those two flags, out of News's and Macro's full
+vocabularies, were the ones confirmed for the veto). Omit `sources` for
+all seven.
 
 **Tier 3.12 correction:** this is a POLICY comparison, not a paired
 one — each source independently applies `non_overlapping` against its
@@ -765,7 +775,8 @@ constraint.
     "always_bearish": { "...": "same shape" },
     "vwap": { "...": "same shape" },
     "inverse_analysis": { "...": "same shape" },
-    "coordinator": { "...": "same shape" }
+    "coordinator": { "...": "same shape" },
+    "analysis_risk_filtered": { "...": "same shape" }
   }
 }
 ```
@@ -806,7 +817,7 @@ were actually taken — "how bad did it get along the way," not just the
 ending total. All three are `null`/absent-equivalent under the same
 "nothing decided yet" conditions as `win_rate`/`avg_pnl_usd`.
 
-### `GET /candidates/history/backtest-lite/champion-challenger?symbol=MNQ1!&timeframe=5m&limit=300&champion=coordinator&challengers=analysis,inverse_analysis,always_bullish,always_bearish,vwap&holdout_fraction=0.3&atr_stop_mult=1.5&atr_target_mult=2.5&expiry_bars=24&non_overlapping=true`
+### `GET /candidates/history/backtest-lite/champion-challenger?symbol=MNQ1!&timeframe=5m&limit=300&champion=coordinator&challengers=analysis,inverse_analysis,always_bullish,always_bearish,vwap,analysis_risk_filtered&holdout_fraction=0.3&atr_stop_mult=1.5&atr_target_mult=2.5&expiry_bars=24&non_overlapping=true`
 Tier 3.11 (champion/challenger, out-of-sample). The endpoint above's
 first real production run found `inverse_analysis` as the only source
 with `profit_factor > 1` — exactly the kind of finding the external
@@ -830,7 +841,7 @@ calibration window and the held-out validation window, separately.
     "purged_at_boundary": 5
   },
   "champion": "coordinator",
-  "challengers": ["analysis", "inverse_analysis", "always_bullish", "always_bearish", "vwap"],
+  "challengers": ["analysis", "inverse_analysis", "always_bullish", "always_bearish", "vwap", "analysis_risk_filtered"],
   "by_source": {
     "coordinator": {"calibration": { "...": "same shape as backtest-lite's per-source summary" }, "validation": { "...": "same shape" }},
     "inverse_analysis": {"calibration": { "...": "..." }, "validation": { "...": "..." }},

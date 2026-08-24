@@ -950,6 +950,29 @@ unmodified. Entirely offline, pure post-processing over each
 diagnostic's own already-computed cases list, no new replays, no LLM
 calls, no mutation of anything stored.
 
+Tier 3.30 ("analysis_risk_filtered" shadow policy, sixth external
+review, ranked backlog item #4, 2026-08-24): the reviewer's last ranked
+item — a parallel policy where Analysis alone decides direction and
+News/Macro act only as risk filters, run alongside the live system
+without touching it. New app.backtest.DIRECTION_SOURCES entry
+"analysis_risk_filtered": same direction call as the existing
+"analysis" source, but the candidate is skipped entirely if News's
+opinion carries the "urgent" flag or Macro's opinion carries the
+"risk_off" flag (project-owner-confirmed veto scope, out of each
+agent's full flag vocabulary) — News/Macro can only veto a trade
+Analysis wanted to take, never supply or shift its direction. Because
+DIRECTION_SOURCES is consumed generically throughout app/backtest.py,
+every existing backtest-lite/paired/grid/champion-challenger endpoint
+picks this up automatically with the full existing win_rate/profit_
+factor/CI95/median_pnl/max_drawdown/day-session reporting machinery
+applied for free — no new endpoint, no new simulation logic. Same
+pattern as every diagnostic tier before it: entirely offline, re-walks
+already-stored candidate history, no LLM calls, no live-running
+process, COORDINATOR_THRESHOLD/WEIGHTS/AUTO_EXECUTE_ENABLED untouched.
+This closes out the sixth external review's full ranked backlog
+(items #1-4); what remains is time/data accumulation toward the
+15-day/50-trade interim checkpoint.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
