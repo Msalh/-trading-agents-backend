@@ -19,6 +19,7 @@ import pytest
 from app.coordinator import MIN_AVAILABLE_WEIGHT, WEIGHTS, _score_opinions
 from app.coordinator_diagnostics import (
     _classify_ablation_change,
+    _opinion_level_day_blocked_summary,
     compute_coordinator_divergence_report,
     compute_news_urgent_analysis,
     compute_news_urgent_decomposition,
@@ -973,3 +974,170 @@ def test_calendar_blackout_real_trade_outcome(fresh_env):
     assert case["quadrant"] == "calendar_blackout_only"
     assert case["outcome"] == {"kind": "real_trade", "status": "closed", "outcome": "win", "pnl_usd": 160.0}
     assert result["outcomes_by_quadrant"]["calendar_blackout_only"]["real_trade"] == {"win": 1}
+
+
+# ---------------------------------------------------------------------------
+# Opinion-level, day-blocked re-aggregation -- Tier 3.29
+# ---------------------------------------------------------------------------
+
+def test_opinion_level_day_blocked_basic_weighting():
+    # Two cases share (d1, o1) with different categories -- each
+    # contributes weight 0.5 to its own category, summing to 1 total
+    # for that opinion. A third case is a distinct opinion (o2) within
+    # the same day, contributing its full weight of 1.
+    cases = [
+        {"cat": "A", "day": "d1", "op": "o1"},
+        {"cat": "B", "day": "d1", "op": "o1"},
+        {"cat": "A", "day": "d1", "op": "o2"},
+    ]
+    result = _opinion_level_day_blocked_summary(cases, category_field="cat", opinion_field="op", day_field="day")
+    assert result["days_considered"] == 1
+    assert result["distinct_opinions_total"] == 2
+    assert result["uncategorized_count"] == 0
+    assert result["candidate_level_totals"] == {"A": 2, "B": 1}
+    assert result["opinion_weighted_totals"] == {"A": 1.5, "B": 0.5}
+    day = result["by_day"]["d1"]
+    assert day["candidates_considered"] == 3
+    assert day["distinct_opinions"] == 2
+    assert day["category_counts_candidate_level"] == {"A": 2, "B": 1}
+    assert day["category_counts_opinion_weighted"] == {"A": 1.5, "B": 0.5}
+
+
+def test_opinion_level_day_blocked_splits_by_day():
+    cases = [
+        {"cat": "X", "day": "d1", "op": "o1"},
+        {"cat": "Y", "day": "d2", "op": "o2"},
+    ]
+    result = _opinion_level_day_blocked_summary(cases, category_field="cat", opinion_field="op", day_field="day")
+    assert result["days_considered"] == 2
+    assert result["distinct_opinions_total"] == 2
+    assert set(result["by_day"].keys()) == {"d1", "d2"}
+    assert result["by_day"]["d1"]["category_counts_opinion_weighted"] == {"X": 1.0}
+    assert result["by_day"]["d2"]["category_counts_opinion_weighted"] == {"Y": 1.0}
+    assert result["opinion_weighted_totals"] == {"X": 1.0, "Y": 1.0}
+
+
+def test_opinion_level_day_blocked_same_opinion_spanning_two_days():
+    # An opinion reused right at a trading-day boundary genuinely
+    # appears in both days -- distinct_opinions_total counts it ONCE
+    # globally (1), even though it contributes to two separate by_day
+    # entries (each with its own distinct_opinions=1) and a combined
+    # per-day distinct-count sum of 2. Both numbers are correct, not a
+    # contradiction: the module docstring calls this out explicitly.
+    cases = [
+        {"cat": "X", "day": "d1", "op": "o_shared"},
+        {"cat": "Y", "day": "d2", "op": "o_shared"},
+    ]
+    result = _opinion_level_day_blocked_summary(cases, category_field="cat", opinion_field="op", day_field="day")
+    assert result["distinct_opinions_total"] == 1
+    assert result["by_day"]["d1"]["distinct_opinions"] == 1
+    assert result["by_day"]["d2"]["distinct_opinions"] == 1
+    assert result["opinion_weighted_totals"] == {"X": 1.0, "Y": 1.0}
+
+
+def test_opinion_level_day_blocked_uncategorized_cases():
+    cases = [
+        {"cat": "X", "day": "d1", "op": "o1"},       # counted
+        {"cat": "Y", "day": None, "op": "o2"},        # missing day
+        {"cat": "Z", "day": "d1", "op": None},        # missing opinion
+        {"cat": None, "day": "d1", "op": "o3"},       # missing category
+    ]
+    result = _opinion_level_day_blocked_summary(cases, category_field="cat", opinion_field="op", day_field="day")
+    assert result["uncategorized_count"] == 3
+    assert result["candidate_level_totals"] == {"X": 1}
+    assert result["distinct_opinions_total"] == 1
+    assert result["by_day"]["d1"]["candidates_considered"] == 1
+
+
+def test_opinion_level_day_blocked_rounds_fractional_weights():
+    cases = [
+        {"cat": "A", "day": "d1", "op": "o1"},
+        {"cat": "B", "day": "d1", "op": "o1"},
+        {"cat": "C", "day": "d1", "op": "o1"},
+    ]
+    result = _opinion_level_day_blocked_summary(cases, category_field="cat", opinion_field="op", day_field="day")
+    assert result["opinion_weighted_totals"] == {"A": 0.333, "B": 0.333, "C": 0.333}
+    assert result["by_day"]["d1"]["category_counts_opinion_weighted"] == {"A": 0.333, "B": 0.333, "C": 0.333}
+
+
+def test_opinion_level_day_blocked_empty_cases():
+    result = _opinion_level_day_blocked_summary([], category_field="cat", opinion_field="op", day_field="day")
+    assert result == {
+        "days_considered": 0,
+        "distinct_opinions_total": 0,
+        "uncategorized_count": 0,
+        "by_day": {},
+        "candidate_level_totals": {},
+        "opinion_weighted_totals": {},
+    }
+
+
+def test_deep_dive_opinion_level_day_blocked_wiring():
+    # Same News-is-the-deciding-factor fixture as
+    # test_ablation_reports_a_changed_decision_when_removing_the_
+    # deciding_agent above -- a clean single agent_enabled_trade,
+    # threshold_crossing case, now checked for the new key's wiring.
+    candidate = _candidate(
+        analysis=_opinion("bearish", 10),
+        news=_opinion("bullish", 95),
+        macro=_opinion("bullish", 20),
+    )
+    candidate["bar"] = {"trading_date": "2026-08-16"}
+    result = compute_threshold_crossing_deep_dive([candidate], agent="news")
+    assert result["cases_considered"] == 1
+    olb = result["opinion_level_day_blocked"]
+    assert olb["days_considered"] == 1
+    assert olb["distinct_opinions_total"] == 1
+    assert olb["uncategorized_count"] == 0
+    assert olb["candidate_level_totals"] == {"agent_enabled_trade": 1}
+    assert olb["opinion_weighted_totals"] == {"agent_enabled_trade": 1.0}
+    assert olb["by_day"]["2026-08-16"]["candidates_considered"] == 1
+
+
+def test_deep_dive_opinion_level_day_blocked_uncategorized_without_bar():
+    # No "bar" key at all (the plain _candidate() helper doesn't add
+    # one) -- trading_date can't be determined, so the case is
+    # uncategorized rather than silently guessed into a day.
+    candidate = _candidate(
+        analysis=_opinion("bearish", 10),
+        news=_opinion("bullish", 95),
+        macro=_opinion("bullish", 20),
+    )
+    result = compute_threshold_crossing_deep_dive([candidate], agent="news")
+    olb = result["opinion_level_day_blocked"]
+    assert olb["uncategorized_count"] == 1
+    assert olb["days_considered"] == 0
+    assert olb["by_day"] == {}
+
+
+def test_decomposition_opinion_level_day_blocked_wiring():
+    candidate = _candidate(
+        analysis=_opinion("bullish", 30),
+        news=_flagged_opinion("bullish", 80, ["urgent"]),
+        macro=_opinion("bullish", 20),
+        min_available_weight=MIN_AVAILABLE_WEIGHT,
+    )
+    candidate["bar"] = {"trading_date": "2026-08-16"}
+    result = compute_news_urgent_decomposition([candidate])
+    assert result["cases_considered"] == 1
+    assert result["cases"][0]["opinion_timestamp"] == "2026-08-16T14:00:00Z"
+    assert result["cases"][0]["trading_date"] == "2026-08-16"
+    olb = result["opinion_level_day_blocked"]
+    assert olb["candidate_level_totals"] == {"urgent_dampen_alone": 1}
+    assert olb["opinion_weighted_totals"] == {"urgent_dampen_alone": 1.0}
+    assert olb["by_day"]["2026-08-16"]["distinct_opinions"] == 1
+
+
+def test_calendar_blackout_opinion_level_day_blocked_wiring():
+    candidate = _candidate(news=_flagged_opinion("bullish", 10, ["urgent"]))
+    candidate["bar"] = {"timestamp": _CAL_INSIDE_BLACKOUT, "trading_date": "2026-08-12"}
+    result = compute_news_urgent_vs_calendar_blackout([candidate])
+    assert result["news_present_candidates"] == 1
+    case = result["cases"][0]
+    assert case["quadrant"] == "both_flagged"
+    assert case["news_opinion_timestamp"] == "2026-08-16T14:00:00Z"
+    assert case["trading_date"] == "2026-08-12"
+    olb = result["opinion_level_day_blocked"]
+    assert olb["candidate_level_totals"] == {"both_flagged": 1}
+    assert olb["opinion_weighted_totals"] == {"both_flagged": 1.0}
+    assert olb["by_day"]["2026-08-12"]["candidates_considered"] == 1

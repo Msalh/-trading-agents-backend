@@ -927,6 +927,29 @@ gains real statistical power automatically as the data window reaches
 in the registry. Entirely offline, no LLM calls, no candidate mutated,
 COORDINATOR_THRESHOLD/WEIGHTS untouched.
 
+Tier 3.29 (opinion-level, day-blocked re-aggregation, sixth external
+review, ranked backlog item #3, 2026-08-24): Tiers 3.26/3.27/3.28 each
+report one clean categorical split (side / attribution / quadrant)
+pooled across every CANDIDATE in their subset — which conflates how
+many genuinely INDEPENDENT LLM opinions actually drove the split
+(News/Macro's slow cadence means one opinion is often reused across
+many consecutive candidates while fresh) with whether the split holds
+across many TRADING DAYS or is one volatile day dominating the pool.
+New app.coordinator_diagnostics._opinion_level_day_blocked_summary(),
+a single shared aggregator wired into all three existing endpoints
+(threshold-crossing-deep-dive, news-urgent-decomposition, news-urgent-
+vs-calendar-blackout) as a new additive `opinion_level_day_blocked` key
+— reports each day's own candidate-level AND opinion-weighted counts
+(a reused opinion's weight always sums to exactly 1 for that day, split
+fractionally across whichever categories its candidates actually
+landed in), plus the same pooled-but-opinion-weighted totals alongside
+the existing raw candidate-level totals for direct comparison. No new
+endpoints, no change to any existing field's meaning — every prior
+consumer of these three endpoints' response shape keeps working
+unmodified. Entirely offline, pure post-processing over each
+diagnostic's own already-computed cases list, no new replays, no LLM
+calls, no mutation of anything stored.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -2221,6 +2244,17 @@ def candidates_history_threshold_crossing_deep_dive(
     raised for per-agent accuracy, surfaced here too so a small case
     count isn't mistaken for that many independent data points.
 
+    `opinion_level_day_blocked` (Tier 3.29, sixth external review item
+    #3): the fields above pool every case as if it were an independent
+    candidate. This re-tabulates `side` two ways per trading day — the
+    existing raw candidate count, and an opinion-weighted count where a
+    reused agent opinion's total weight always sums to exactly 1 for
+    that day, split fractionally if it landed in more than one side —
+    so a reader can see whether the split reflects many independent LLM
+    opinions across many days, or a handful reused heavily within one
+    or two days. See app.coordinator_diagnostics._opinion_level_day_
+    blocked_summary()'s own docstring for the full field shape.
+
     Entirely offline for the ablation/replay step (no LLM calls, no
     mutation of any stored candidate, COORDINATOR_THRESHOLD/WEIGHTS
     untouched); the agent_enabled_trade side does read real trade rows
@@ -2284,6 +2318,13 @@ def candidates_history_news_urgent_decomposition(
     interaction — neither alone reproduces the original full-removal's
     changed classification, only the combination does).
 
+    `opinion_level_day_blocked` (Tier 3.29, sixth external review item
+    #3): re-tabulates `attribution` opinion-weighted and day-blocked,
+    same shared aggregator threshold-crossing-deep-dive's own
+    opinion_level_day_blocked uses — see that endpoint's docstring or
+    app.coordinator_diagnostics._opinion_level_day_blocked_summary()'s
+    own docstring for the full field shape.
+
     Entirely offline (no LLM calls, no candidate mutated,
     COORDINATOR_THRESHOLD/WEIGHTS/ANALYSIS_REQUIRED untouched) — every
     variant is a throwaway per-candidate copy used for one replay each,
@@ -2342,6 +2383,16 @@ def candidates_history_news_urgent_vs_calendar_blackout(
     `window_hours` defaults to 2.0, matching News's own prompt language
     about flagging events expected in "the next 2-3 hours" — tune it to
     see how sensitive the comparison is to the blackout's width.
+
+    `opinion_level_day_blocked` (Tier 3.29, sixth external review item
+    #3): re-tabulates `quadrant` opinion-weighted and day-blocked, same
+    shared aggregator the other two diagnostics in this family use —
+    see app.coordinator_diagnostics._opinion_level_day_blocked_
+    summary()'s own docstring for the full field shape. Particularly
+    relevant here since calendar_coverage already flags this endpoint's
+    current sample as thin (one real event) — opinion_level_day_blocked
+    shows directly whether even that thin sample is one distinct News
+    opinion reused many times or several genuinely independent ones.
 
     Entirely offline (no LLM calls, no candidate mutated,
     COORDINATOR_THRESHOLD/WEIGHTS untouched); the outcome lookup reads

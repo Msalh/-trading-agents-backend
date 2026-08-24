@@ -384,6 +384,8 @@ def compute_news_urgent_decomposition(candidates: list[dict], horizons: list[int
         cases.append({
             "candidate_id": candidate.get("candidate_id"),
             "attribution": attribution,
+            "opinion_timestamp": opinion_timestamp,
+            "trading_date": (candidate.get("bar") or {}).get("trading_date"),
             "full_removal": {
                 "changed": full_classified["changed"],
                 "category": full_classified["category"],
@@ -410,6 +412,9 @@ def compute_news_urgent_decomposition(candidates: list[dict], horizons: list[int
         "distinct_opinion_timestamps": len(distinct_opinion_timestamps),
         "cases": cases,
         "summary": {"by_attribution": attribution_counts},
+        "opinion_level_day_blocked": _opinion_level_day_blocked_summary(
+            cases, category_field="attribution", opinion_field="opinion_timestamp", day_field="trading_date",
+        ),
     }
 
 
@@ -846,6 +851,7 @@ def compute_threshold_crossing_deep_dive(candidates: list[dict], agent: str, hor
             "agreement_with_analysis": agreement,
             "agent_flags": agent_opinion.get("flags") or [],
             "agent_opinion_timestamp": opinion_timestamp,
+            "trading_date": (candidate.get("bar") or {}).get("trading_date"),
             "outcome": outcome,
         })
 
@@ -855,6 +861,9 @@ def compute_threshold_crossing_deep_dive(candidates: list[dict], agent: str, hor
         "distinct_opinion_timestamps": len(distinct_opinion_timestamps),
         "cases": cases,
         "summary": _summarize_deep_dive(cases, horizons),
+        "opinion_level_day_blocked": _opinion_level_day_blocked_summary(
+            cases, category_field="side", opinion_field="agent_opinion_timestamp", day_field="trading_date",
+        ),
     }
 
 
@@ -982,6 +991,8 @@ def compute_news_urgent_vs_calendar_blackout(
         cases.append({
             "candidate_id": candidate.get("candidate_id"),
             "bar_timestamp": bar_timestamp,
+            "news_opinion_timestamp": news_opinion.get("timestamp"),
+            "trading_date": (candidate.get("bar") or {}).get("trading_date"),
             "decision": decision.get("decision"),
             "quadrant": quadrant,
             "news_urgent": news_urgent,
@@ -1034,4 +1045,135 @@ def compute_news_urgent_vs_calendar_blackout(
         "agreement_rate": agreement_rate,
         "outcomes_by_quadrant": outcomes_by_quadrant,
         "cases": cases,
+        "opinion_level_day_blocked": _opinion_level_day_blocked_summary(
+            cases, category_field="quadrant", opinion_field="news_opinion_timestamp", day_field="trading_date",
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Opinion-level, day-blocked re-aggregation — Tier 3.29
+# ---------------------------------------------------------------------------
+#
+# Sixth external review, ranked backlog item #3 (relayed verbatim): the
+# reviewer asked to redo Tier 3.26/3.27's headline aggregation at the
+# opinion level and day-blocked, instead of pooling every CANDIDATE as
+# if it were an independent data point. The same concern applies to
+# Tier 3.28's cross_tab, built after the review was written but with an
+# identical shape.
+#
+# Every one of those three diagnostics already reports one clean
+# categorical label per case (side / attribution / quadrant) and pools
+# it across however many candidates landed in its subset. That pooled
+# count conflates two things worth separating:
+#
+#   1. How many genuinely INDEPENDENT LLM opinions actually drove the
+#      split. News/Macro run on a slow cadence (NEWS_INTERVAL_MINUTES/
+#      MACRO_INTERVAL_MINUTES, default 60, reusable up to
+#      NEWS_MACRO_MAX_AGE_MINUTES, default 90) and get reused across
+#      many consecutive candidates while fresh — the same duplication
+#      concern Tier 3.6 first raised for per-agent accuracy, and Tier
+#      3.27's own `prevalence` section already answered for urgent's
+#      base rate specifically. This generalizes that fix to any
+#      categorical split these diagnostics report.
+#   2. Whether the split is a broad pattern across many TRADING DAYS or
+#      an artifact of one unusually active or volatile day dominating
+#      the pool.
+#
+# _opinion_level_day_blocked_summary() below is a single shared
+# aggregator, wired into all three diagnostics' return dicts as a new
+# "opinion_level_day_blocked" key — additive, not a replacement for the
+# existing candidate-level cross_tab/summary/by_attribution fields those
+# functions already return, so nothing that already depended on their
+# shape breaks. It is read-only, pure post-processing over each
+# diagnostic's own already-computed `cases` list — no new replays, no
+# LLM calls, no mutation of anything stored.
+
+
+def _opinion_level_day_blocked_summary(
+    cases: list[dict], category_field: str, opinion_field: str = "opinion_timestamp", day_field: str = "trading_date",
+) -> dict:
+    """Groups `cases` by (day_field, opinion_field) and re-tabulates
+    `category_field` two ways per day: `category_counts_candidate_level`
+    (the existing raw per-candidate count, kept for direct comparison)
+    and `category_counts_opinion_weighted` (each case weighted
+    1 / how-many-cases-share-its-exact-(day, opinion)-pair, so a reused
+    opinion's total weight within a day always sums to exactly 1 —
+    split fractionally across whichever categories its various
+    candidates actually landed in, if a reused opinion combined with
+    different Analysis/Macro context to different effect on different
+    candidates, rather than silently excluded or double-counted as N
+    independent data points).
+
+    `opinion_weighted_totals` / `candidate_level_totals` are the same
+    breakdown pooled across every day, so the honest (opinion-weighted)
+    figure sits right next to the existing raw candidate-pooled one for
+    direct comparison. `distinct_opinions_total` counts unique
+    opinion_field values across ALL cases (not the sum of each day's own
+    distinct count) — the two can differ by a handful when an opinion
+    reused near a trading-day boundary genuinely appears in both days,
+    which is correct, not a bug: that opinion really was used on both
+    days.
+
+    A case missing `day_field`, `opinion_field`, or `category_field`
+    entirely is counted in `uncategorized_count` and excluded from
+    `by_day` and both weighted totals — never silently dropped without a
+    trace, never guessed into a bucket."""
+    by_day: dict[str, dict] = {}
+    all_opinions: set[str] = set()
+    candidate_level_totals: dict[str, int] = {}
+    opinion_weighted_totals: dict[str, float] = {}
+    uncategorized_count = 0
+
+    day_opinion_case_counts: dict[tuple, int] = {}
+    for case in cases:
+        day = case.get(day_field)
+        opinion = case.get(opinion_field)
+        if not day or not opinion:
+            continue
+        key = (day, opinion)
+        day_opinion_case_counts[key] = day_opinion_case_counts.get(key, 0) + 1
+
+    for case in cases:
+        category = case.get(category_field)
+        day = case.get(day_field)
+        opinion = case.get(opinion_field)
+        if not day or not opinion or category is None:
+            uncategorized_count += 1
+            continue
+
+        all_opinions.add(opinion)
+        candidate_level_totals[category] = candidate_level_totals.get(category, 0) + 1
+
+        day_bucket = by_day.setdefault(day, {
+            "candidates_considered": 0,
+            "distinct_opinions": set(),
+            "category_counts_candidate_level": {},
+            "category_counts_opinion_weighted": {},
+        })
+        day_bucket["candidates_considered"] += 1
+        day_bucket["distinct_opinions"].add(opinion)
+        day_bucket["category_counts_candidate_level"][category] = (
+            day_bucket["category_counts_candidate_level"].get(category, 0) + 1
+        )
+
+        weight = 1.0 / day_opinion_case_counts[(day, opinion)]
+        day_bucket["category_counts_opinion_weighted"][category] = (
+            day_bucket["category_counts_opinion_weighted"].get(category, 0.0) + weight
+        )
+        opinion_weighted_totals[category] = opinion_weighted_totals.get(category, 0.0) + weight
+
+    for day_bucket in by_day.values():
+        day_bucket["distinct_opinions"] = len(day_bucket["distinct_opinions"])
+        day_bucket["category_counts_opinion_weighted"] = {
+            k: round(v, 3) for k, v in day_bucket["category_counts_opinion_weighted"].items()
+        }
+
+    return {
+        "days_considered": len(by_day),
+        "distinct_opinions_total": len(all_opinions),
+        "uncategorized_count": uncategorized_count,
+        "by_day": by_day,
+        "candidate_level_totals": candidate_level_totals,
+        "opinion_weighted_totals": {k: round(v, 3) for k, v in opinion_weighted_totals.items()},
     }

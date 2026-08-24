@@ -949,7 +949,10 @@ def test_threshold_crossing_deep_dive_endpoint_returns_case_shape(client):
     import app.storage as storage
 
     anchor = "2026-08-11T14:00:00Z"
-    bar = {"event_id": "evt-tcd-1", "symbol": "MNQ1!", "timeframe": "5m", "timestamp": anchor}
+    bar = {
+        "event_id": "evt-tcd-1", "symbol": "MNQ1!", "timeframe": "5m", "timestamp": anchor,
+        "trading_date": "2026-08-11",
+    }
     # analysis=20/news=70/macro=10 bullish, live WEIGHTS -- News alone crosses
     # the threshold (enter_long); ablating News alone (analysis+macro only)
     # falls back to no_trade -- a clean agent_enabled_trade threshold_crossing
@@ -983,7 +986,12 @@ def test_threshold_crossing_deep_dive_endpoint_returns_case_shape(client):
     case = body["cases"][0]
     assert case["side"] == "agent_enabled_trade"
     assert case["agreement_with_analysis"] == "agree"
+    assert case["trading_date"] == "2026-08-11"
     assert "summary" in body
+    olb = body["opinion_level_day_blocked"]
+    assert olb["candidate_level_totals"] == {"agent_enabled_trade": 1}
+    assert olb["opinion_weighted_totals"] == {"agent_enabled_trade": 1.0}
+    assert olb["by_day"]["2026-08-11"]["distinct_opinions"] == 1
 
 
 def test_threshold_crossing_deep_dive_endpoint_rejects_unknown_agent(client):
@@ -1013,7 +1021,10 @@ def test_news_urgent_decomposition_endpoint_returns_shape(client):
     import app.storage as storage
 
     anchor = "2026-08-11T14:00:00Z"
-    bar = {"event_id": "evt-nud-1", "symbol": "MNQ1!", "timeframe": "5m", "timestamp": anchor}
+    bar = {
+        "event_id": "evt-nud-1", "symbol": "MNQ1!", "timeframe": "5m", "timestamp": anchor,
+        "trading_date": "2026-08-11",
+    }
     # Same urgent_dampen_alone scenario verified in test_coordinator_diagnostics.py:
     # analysis=bullish30, news=bullish80(urgent), macro=bullish20 -> no_trade;
     # removing News entirely crosses to enter_long, and it's the urgent
@@ -1047,6 +1058,10 @@ def test_news_urgent_decomposition_endpoint_returns_shape(client):
     assert body["prevalence"]["candidate_level"]["news_present_candidates"] == 1
     assert body["decomposition"]["cases_considered"] == 1
     assert body["decomposition"]["cases"][0]["attribution"] == "urgent_dampen_alone"
+    assert body["decomposition"]["cases"][0]["trading_date"] == "2026-08-11"
+    olb = body["decomposition"]["opinion_level_day_blocked"]
+    assert olb["candidate_level_totals"] == {"urgent_dampen_alone": 1}
+    assert olb["by_day"]["2026-08-11"]["distinct_opinions"] == 1
 
 
 def test_news_urgent_decomposition_endpoint_empty_history(client):
@@ -1072,7 +1087,10 @@ def test_news_urgent_vs_calendar_blackout_endpoint_returns_shape(client):
     # the default 2-hour blackout window. News is also flagged urgent,
     # so this candidate is a clean "both_flagged" case.
     anchor = "2026-08-12T13:00:00Z"
-    bar = {"event_id": "evt-nucb-1", "symbol": "MNQ1!", "timeframe": "5m", "timestamp": anchor}
+    bar = {
+        "event_id": "evt-nucb-1", "symbol": "MNQ1!", "timeframe": "5m", "timestamp": anchor,
+        "trading_date": "2026-08-12",
+    }
     decision = {
         "decision": "no_trade",
         "score": 5.0,
@@ -1100,8 +1118,12 @@ def test_news_urgent_vs_calendar_blackout_endpoint_returns_shape(client):
     case = body["cases"][0]
     assert case["quadrant"] == "both_flagged"
     assert case["nearest_event"]["date"] == "2026-08-12"
+    assert case["trading_date"] == "2026-08-12"
     assert body["cross_tab"] == {"both_flagged": 1}
     assert body["calendar_coverage"]["event_count"] == 1
+    olb = body["opinion_level_day_blocked"]
+    assert olb["candidate_level_totals"] == {"both_flagged": 1}
+    assert olb["by_day"]["2026-08-12"]["distinct_opinions"] == 1
 
 
 def test_news_urgent_vs_calendar_blackout_endpoint_empty_history(client):

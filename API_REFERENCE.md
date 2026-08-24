@@ -1443,7 +1443,7 @@ output in any way.
 
 ---
 
-## Coordinator/Analysis divergence + ablation (Tier 3.16, corrected Tier 3.17, reclassified Tier 3.21, threshold-crossing deep dive added Tier 3.26, News urgent-vs-directional decomposition added Tier 3.27, News urgent vs. calendar blackout added Tier 3.28)
+## Coordinator/Analysis divergence + ablation (Tier 3.16, corrected Tier 3.17, reclassified Tier 3.21, threshold-crossing deep dive added Tier 3.26, News urgent-vs-directional decomposition added Tier 3.27, News urgent vs. calendar blackout added Tier 3.28, opinion-level/day-blocked re-aggregation added to all three Tier 3.29)
 
 Every backtest-lite/paired/grid result since Tier 3.10 has shown
 Coordinator's own blended decision performing at or below Analysis
@@ -1987,6 +1987,84 @@ Entirely offline (no LLM calls, no candidate mutated,
 `COORDINATOR_THRESHOLD`/`WEIGHTS` untouched); the outcome lookup reads
 real trade rows the same way every other outcome-aware endpoint in this
 project already does.
+
+---
+
+### `opinion_level_day_blocked` (Tier 3.29 — present in all three endpoints above)
+
+Sixth external review, ranked backlog item #3. Every field documented
+above pools its cases as if each were an independent CANDIDATE — which
+conflates two things: how many genuinely INDEPENDENT LLM opinions
+actually drove the split (News/Macro run on a slow cadence and get
+reused across many consecutive candidates while fresh), and whether the
+split holds across many TRADING DAYS or is one unusually active/
+volatile day dominating the pool. `threshold-crossing-deep-dive`,
+`news-urgent-decomposition`, and `news-urgent-vs-calendar-blackout` each
+gained this same additive key — nothing about their existing fields
+(`cross_tab`, `summary`, `by_attribution`, etc.) changed shape or
+meaning, so any prior consumer of these three endpoints keeps working
+unmodified.
+
+```json
+{
+  "opinion_level_day_blocked": {
+    "days_considered": 2,
+    "distinct_opinions_total": 3,
+    "uncategorized_count": 0,
+    "by_day": {
+      "2026-08-12": {
+        "candidates_considered": 6,
+        "distinct_opinions": 1,
+        "category_counts_candidate_level": {"both_flagged": 6},
+        "category_counts_opinion_weighted": {"both_flagged": 1.0}
+      },
+      "2026-08-16": {
+        "candidates_considered": 4,
+        "distinct_opinions": 2,
+        "category_counts_candidate_level": {"news_urgent_only": 3, "neither_flagged": 1},
+        "category_counts_opinion_weighted": {"news_urgent_only": 1.5, "neither_flagged": 0.5}
+      }
+    },
+    "candidate_level_totals": {"both_flagged": 6, "news_urgent_only": 3, "neither_flagged": 1},
+    "opinion_weighted_totals": {"both_flagged": 1.0, "news_urgent_only": 1.5, "neither_flagged": 0.5}
+  }
+}
+```
+
+(Illustrative shape; not a production pull. The category field itself
+differs per endpoint — `side` for threshold-crossing-deep-dive,
+`attribution` for news-urgent-decomposition, `quadrant` for
+news-urgent-vs-calendar-blackout.)
+
+**`category_counts_opinion_weighted`** is the honest number to read
+first: each case is weighted `1 / (how many cases share its exact
+(day, opinion) pair)`, so a single News/Macro opinion reused across
+several consecutive candidates in the same day always contributes
+exactly **1** total — split fractionally across whichever categories
+its various candidates actually landed in (if the same reused opinion
+combined with different Analysis/Macro context to different effect on
+different candidates, that shows up as a fractional split, not a
+silent exclusion or a 6x overcount). `category_counts_candidate_level`
+is the existing raw per-candidate count kept right alongside it, so the
+two can be compared directly — the worked example above (Aug 12: 6
+candidates but only 1 distinct opinion) is exactly the illustrative
+case Tier 3.28's own production pull showed in practice: `both_flagged`
+looked like a 6-candidate result but was really one LLM judgment.
+
+**`by_day`** lets a reader see whether a pooled split is broad across
+many trading days or concentrated in one. **`distinct_opinions_total`**
+counts unique opinion identities across the ENTIRE case set, not the
+sum of each day's own distinct count — the two can differ by a handful
+when an opinion reused right at a trading-day boundary genuinely
+appears in both days (correct, not a bug: it really was used on both).
+**`uncategorized_count`** counts cases where the day, opinion, or
+category couldn't be determined (e.g. no `trading_date` was ever stored
+for that bar) — excluded from every other field here rather than
+silently dropped or guessed into a bucket.
+
+Entirely offline: pure post-processing over each diagnostic's own
+already-computed `cases` list — no new replays, no LLM calls, no
+mutation of anything stored.
 
 ---
 
