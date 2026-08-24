@@ -23,6 +23,7 @@ from app.coordinator_diagnostics import (
     compute_news_urgent_analysis,
     compute_news_urgent_decomposition,
     compute_news_urgent_prevalence,
+    compute_news_urgent_vs_calendar_blackout,
     compute_threshold_crossing_deep_dive,
 )
 
@@ -804,3 +805,171 @@ def test_news_urgent_analysis_combines_prevalence_and_decomposition():
     assert set(result.keys()) == {"prevalence", "decomposition"}
     assert result["prevalence"]["candidate_level"]["news_present_candidates"] == 1
     assert result["decomposition"]["cases_considered"] == 1
+
+
+# ---------------------------------------------------------------------------
+# News urgent vs. deterministic economic-calendar blackout -- Tier 3.28
+# ---------------------------------------------------------------------------
+#
+# Fixed real reference points from app.economic_calendar's registry:
+# the 2026-08-12 CPI release is at 2026-08-12T12:30:00Z. "Inside" below
+# is 30 minutes after that (well within the default 2-hour window);
+# "far" is the same calendar day but 7.5 hours later, which is not
+# within 2 hours of that or any other registry event.
+_CAL_INSIDE_BLACKOUT = "2026-08-12T13:00:00Z"
+_CAL_FAR_FROM_EVENTS = "2026-08-12T20:00:00Z"
+
+
+def _cal_candidate(news_direction, news_confidence, news_flags, bar_timestamp, with_bar=True):
+    """A weak-confidence, news-only candidate (score stays well under
+    DECISION_THRESHOLD -> "no_trade", never directional) so these
+    quadrant/cross-tab tests never trigger compute_outcome_for_candidate
+    -- which would otherwise hit real storage -- keeping them as fast
+    and isolated as compute_news_urgent_prevalence/_decomposition's own
+    tests above. with_bar=False omits the "bar" key entirely, to test
+    the skip-on-missing-timestamp path."""
+    candidate = _candidate(news=_flagged_opinion(news_direction, news_confidence, news_flags))
+    assert candidate["decision"]["decision"] not in ("enter_long", "enter_short")
+    if with_bar:
+        candidate["bar"] = {"timestamp": bar_timestamp}
+    return candidate
+
+
+def test_calendar_blackout_both_flagged():
+    candidate = _cal_candidate("bullish", 10, ["urgent"], _CAL_INSIDE_BLACKOUT)
+    result = compute_news_urgent_vs_calendar_blackout([candidate])
+    assert result["news_present_candidates"] == 1
+    case = result["cases"][0]
+    assert case["quadrant"] == "both_flagged"
+    assert case["news_urgent"] is True
+    assert case["calendar_blackout"] is True
+    assert case["nearest_event"] == {"event": "CPI", "date": "2026-08-12", "timestamp_utc": "2026-08-12T12:30:00Z"}
+    assert result["cross_tab"] == {"both_flagged": 1}
+
+
+def test_calendar_blackout_news_urgent_only():
+    candidate = _cal_candidate("bullish", 10, ["urgent"], _CAL_FAR_FROM_EVENTS)
+    result = compute_news_urgent_vs_calendar_blackout([candidate])
+    case = result["cases"][0]
+    assert case["quadrant"] == "news_urgent_only"
+    assert case["news_urgent"] is True
+    assert case["calendar_blackout"] is False
+
+
+def test_calendar_blackout_calendar_only():
+    candidate = _cal_candidate("bullish", 10, [], _CAL_INSIDE_BLACKOUT)
+    result = compute_news_urgent_vs_calendar_blackout([candidate])
+    case = result["cases"][0]
+    assert case["quadrant"] == "calendar_blackout_only"
+    assert case["news_urgent"] is False
+    assert case["calendar_blackout"] is True
+
+
+def test_calendar_blackout_neither_flagged():
+    candidate = _cal_candidate("bullish", 10, [], _CAL_FAR_FROM_EVENTS)
+    result = compute_news_urgent_vs_calendar_blackout([candidate])
+    case = result["cases"][0]
+    assert case["quadrant"] == "neither_flagged"
+    assert case["news_urgent"] is False
+    assert case["calendar_blackout"] is False
+
+
+def test_calendar_blackout_ignores_candidates_without_news():
+    candidate = _candidate(analysis=_opinion("bullish", 50))  # no news opinion at all
+    result = compute_news_urgent_vs_calendar_blackout([candidate])
+    assert result["news_present_candidates"] == 0
+    assert result["cases"] == []
+    assert result["cross_tab"] == {}
+    assert result["agreement_rate"] is None
+
+
+def test_calendar_blackout_ignores_candidates_without_bar_timestamp():
+    candidate = _cal_candidate("bullish", 10, ["urgent"], bar_timestamp=None, with_bar=False)
+    assert "bar" not in candidate
+    result = compute_news_urgent_vs_calendar_blackout([candidate])
+    assert result["news_present_candidates"] == 0
+    assert result["cases"] == []
+
+
+def test_calendar_blackout_agreement_rate_and_cross_tab():
+    candidates = [
+        _cal_candidate("bullish", 10, ["urgent"], _CAL_INSIDE_BLACKOUT),   # both_flagged
+        _cal_candidate("bullish", 10, ["urgent"], _CAL_INSIDE_BLACKOUT),   # both_flagged
+        _cal_candidate("bullish", 10, ["urgent"], _CAL_FAR_FROM_EVENTS),   # news_urgent_only
+        _cal_candidate("bullish", 10, [], _CAL_FAR_FROM_EVENTS),           # neither_flagged
+    ]
+    result = compute_news_urgent_vs_calendar_blackout(candidates)
+    assert result["cross_tab"] == {"both_flagged": 2, "news_urgent_only": 1, "neither_flagged": 1}
+    assert result["agreement_rate"] == 0.75  # (2 both_flagged + 1 neither_flagged) / 4
+
+
+def test_calendar_blackout_coverage_reports_overlapping_events():
+    candidates = [
+        _cal_candidate("bullish", 10, [], _CAL_INSIDE_BLACKOUT),
+        _cal_candidate("bullish", 10, [], _CAL_FAR_FROM_EVENTS),
+    ]
+    result = compute_news_urgent_vs_calendar_blackout(candidates)
+    assert result["data_range"] == {"start": _CAL_INSIDE_BLACKOUT, "end": _CAL_FAR_FROM_EVENTS}
+    # min()/max() on ISO8601 "Z" strings is chronological because the
+    # format is fixed-width -- "13:00" < "20:00" lexicographically too,
+    # so start/end land correctly without parsing back to datetimes.
+    assert result["calendar_coverage"]["event_count"] == 1
+    assert result["calendar_coverage"]["events_overlapping_data_range"][0]["date"] == "2026-08-12"
+
+
+def test_calendar_blackout_coverage_empty_when_no_event_nearby():
+    candidates = [_cal_candidate("bullish", 10, [], _CAL_FAR_FROM_EVENTS)]
+    result = compute_news_urgent_vs_calendar_blackout(candidates)
+    assert result["calendar_coverage"] == {"events_overlapping_data_range": [], "event_count": 0}
+
+
+def test_calendar_blackout_hypothetical_outcome_directional_decision(fresh_env):
+    storage, coordinator, outcomes, replay, coordinator_diagnostics = fresh_env
+    decision_time = datetime.now(timezone.utc) - timedelta(hours=2)
+    horizon_time = decision_time + timedelta(minutes=15)
+    _dd_save_bar(storage, "TEST", "5m", decision_time, 100.0)
+    _dd_save_bar(storage, "TEST", "5m", horizon_time, 105.0)
+
+    candidate = _dd_candidate(
+        coordinator, "c1", "TEST", "5m", _dd_iso(decision_time),
+        analysis=_dd_opinion("bullish", 80, _dd_iso(decision_time)),
+        news=_dd_opinion("bullish", 50, _dd_iso(decision_time), flags=["urgent"]),
+        macro=_dd_opinion("neutral", 50, _dd_iso(decision_time)),
+    )
+    assert candidate["decision"]["decision"] == "enter_long"
+    candidate["bar"] = {"timestamp": _CAL_FAR_FROM_EVENTS}
+
+    result = coordinator_diagnostics.compute_news_urgent_vs_calendar_blackout([candidate], horizons=[15])
+    assert result["news_present_candidates"] == 1
+    case = result["cases"][0]
+    assert case["quadrant"] == "news_urgent_only"
+    assert case["outcome"]["kind"] == "hypothetical"
+    assert case["outcome"]["by_horizon"][15] == "correct"  # bullish call, price rose
+    assert result["outcomes_by_quadrant"]["news_urgent_only"]["hypothetical_by_horizon"][15] == {"correct": 1}
+
+
+def test_calendar_blackout_real_trade_outcome(fresh_env):
+    storage, coordinator, outcomes, replay, coordinator_diagnostics = fresh_env
+    decision_time = datetime.now(timezone.utc) - timedelta(hours=2)
+
+    candidate = _dd_candidate(
+        coordinator, "c1", "TEST", "5m", _dd_iso(decision_time),
+        analysis=_dd_opinion("bullish", 80, _dd_iso(decision_time)),
+        news=_dd_opinion("bullish", 50, _dd_iso(decision_time)),  # not urgent
+        macro=_dd_opinion("neutral", 50, _dd_iso(decision_time)),
+    )
+    assert candidate["decision"]["decision"] == "enter_long"
+    candidate["bar"] = {"timestamp": _CAL_INSIDE_BLACKOUT}
+
+    trade = _dd_trade("c1", "TEST", "5m", "bullish", 20020.0, _dd_iso(decision_time))
+    storage.save_paper_trade(trade)
+    storage.close_trade(
+        trade["trade_id"], exit_price=20100.0, exit_reason="target_hit",
+        pnl_usd=160.0, closed_at=_dd_iso(datetime.now(timezone.utc)),
+    )
+
+    result = coordinator_diagnostics.compute_news_urgent_vs_calendar_blackout([candidate])
+    case = result["cases"][0]
+    assert case["quadrant"] == "calendar_blackout_only"
+    assert case["outcome"] == {"kind": "real_trade", "status": "closed", "outcome": "win", "pnl_usd": 160.0}
+    assert result["outcomes_by_quadrant"]["calendar_blackout_only"]["real_trade"] == {"win": 1}

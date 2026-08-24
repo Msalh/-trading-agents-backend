@@ -1443,7 +1443,7 @@ output in any way.
 
 ---
 
-## Coordinator/Analysis divergence + ablation (Tier 3.16, corrected Tier 3.17, reclassified Tier 3.21, threshold-crossing deep dive added Tier 3.26, News urgent-vs-directional decomposition added Tier 3.27)
+## Coordinator/Analysis divergence + ablation (Tier 3.16, corrected Tier 3.17, reclassified Tier 3.21, threshold-crossing deep dive added Tier 3.26, News urgent-vs-directional decomposition added Tier 3.27, News urgent vs. calendar blackout added Tier 3.28)
 
 Every backtest-lite/paired/grid result since Tier 3.10 has shown
 Coordinator's own blended decision performing at or below Analysis
@@ -1883,6 +1883,110 @@ Entirely offline (no LLM calls, no candidate mutated,
 `COORDINATOR_THRESHOLD`/`WEIGHTS`/`ANALYSIS_REQUIRED` untouched) — every
 variant is a throwaway per-candidate copy used for one replay each, same
 guarantee the rest of this diagnostic family gives.
+
+---
+
+### `GET /candidates/history/news-urgent-vs-calendar-blackout?symbol=MNQ1!&timeframe=5m&limit=300&window_hours=2.0&horizons=15,30,60`
+
+Tier 3.28 (sixth external review, ranked backlog item #2). The
+reviewer's exact ask, relayed verbatim: "قارنه بحظر بسيط مبني على تقويم
+اقتصادي موثوق: امتنع قبل/بعد CPI/FOMC/NFP. إذا كان LLM لا يتفوق على
+blackout ثابت، فلا يوجد سبب لدفع تكلفته أو الاعتماد على تصنيفه الحر."
+(Compare News's `"urgent"` flag against a simple blackout built on a
+trustworthy economic calendar: abstain before/after CPI/FOMC/NFP. If
+the LLM doesn't outperform a fixed blackout, there's no reason to pay
+its cost or rely on its free-text classification.)
+
+New `app/economic_calendar.py` is a hardcoded, source-cited registry of
+every real 2026 CPI/NFP/FOMC release timestamp — CPI and the Employment
+Situation report (NFP) from the official BLS release schedule and the
+White House's CY2026 PFEI schedule PDF, FOMC from the Federal Reserve's
+own 2026 meeting calendar (full citations, DST handling, and the exact
+sourcing reasoning are in that module's docstring). Its
+`is_within_blackout_window()` check has zero access to News's opinion,
+reasoning, or flags — it only compares a candidate's own bar timestamp
+against that hardcoded registry. This endpoint tags every News-present
+candidate with both signals independently and cross-tabulates them:
+
+```json
+{
+  "symbol": "MNQ1!",
+  "timeframe": "5m",
+  "window_hours": 2.0,
+  "news_present_candidates": 4,
+  "data_range": {"start": "2026-08-12T11:00:00Z", "end": "2026-08-24T07:40:05Z"},
+  "calendar_coverage": {
+    "events_overlapping_data_range": [
+      {"event": "CPI", "date": "2026-08-12", "timestamp_utc": "2026-08-12T12:30:00Z"}
+    ],
+    "event_count": 1
+  },
+  "cross_tab": {"both_flagged": 1, "news_urgent_only": 2, "neither_flagged": 1},
+  "agreement_rate": 0.5,
+  "outcomes_by_quadrant": {
+    "news_urgent_only": {
+      "real_trade": {},
+      "hypothetical_by_horizon": {"15": {"correct": 2}, "30": {}, "60": {}}
+    }
+  },
+  "cases": [
+    {
+      "candidate_id": "cand-1",
+      "bar_timestamp": "2026-08-12T13:00:00Z",
+      "decision": "no_trade",
+      "quadrant": "both_flagged",
+      "news_urgent": true,
+      "calendar_blackout": true,
+      "nearest_event": {"event": "CPI", "date": "2026-08-12", "timestamp_utc": "2026-08-12T12:30:00Z"},
+      "distance_hours": 0.5,
+      "outcome": null
+    }
+  ]
+}
+```
+
+(Illustrative shape; not a production pull.)
+
+**`cross_tab`** buckets every News-present candidate into exactly one of
+four quadrants: `"both_flagged"` (News said urgent AND it's within
+`window_hours` of a real event), `"news_urgent_only"` (News said urgent
+but no real event is nearby — the case the reviewer's question is
+really about), `"calendar_blackout_only"` (a real event is nearby but
+News didn't flag urgent), or `"neither_flagged"`. `agreement_rate` is
+`(both_flagged + neither_flagged) / news_present_candidates`.
+
+**`outcomes_by_quadrant`** attaches an outcome to every candidate that
+reached a directional decision (`enter_long`/`enter_short`) — real
+closed-trade result when one exists (same preference as every other
+outcome-aware endpoint in this project), the existing per-horizon
+hypothetical estimate otherwise — bucketed per quadrant, so it's
+possible to see which signal (News's judgment, or the fixed calendar)
+actually correlated with worse outcomes on the cases where they
+disagreed, not just how often they agreed.
+
+**`calendar_coverage`** reports, honestly, how many real CPI/NFP/FOMC
+events from the registry could even have produced an `in_blackout:
+true` result somewhere in this specific `limit`-bounded history pull —
+read this before treating `cross_tab` as a confident result. At this
+tier's build time (2026-08-24), the live 9-trading-day production
+window (`2026-08-12` through `2026-08-24`) contained exactly **one**
+such event: the `2026-08-12` CPI release, which is also the very first
+day of that window. No FOMC meeting fell in August 2026, and the
+nearest NFP release (`2026-08-07`) predates the window entirely. This
+means any single run of this endpoint against current production data
+is a very thin sample — not yet a confirmatory comparison — and that
+improves automatically as more weeks of data accumulate:
+`2026-09-04` (NFP), `2026-09-11` (CPI), and `2026-09-15`/`16` (FOMC) are
+already in the registry, waiting for the trading window to reach them.
+
+`window_hours` defaults to `2.0`, matching News's own prompt language
+about flagging events expected in "the next 2-3 hours" — tune it to see
+how sensitive the comparison is to the blackout's width.
+
+Entirely offline (no LLM calls, no candidate mutated,
+`COORDINATOR_THRESHOLD`/`WEIGHTS` untouched); the outcome lookup reads
+real trade rows the same way every other outcome-aware endpoint in this
+project already does.
 
 ---
 

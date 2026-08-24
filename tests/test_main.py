@@ -1061,6 +1061,63 @@ def test_news_urgent_decomposition_endpoint_empty_history(client):
 
 
 # ---------------------------------------------------------------------------
+# Tier 3.28: News urgent vs. deterministic economic-calendar blackout
+# ---------------------------------------------------------------------------
+
+def test_news_urgent_vs_calendar_blackout_endpoint_returns_shape(client):
+    import app.storage as storage
+
+    # 2026-08-12T13:00:00Z is 30 minutes after the real 2026-08-12 CPI
+    # release (2026-08-12T12:30:00Z, app/economic_calendar.py) -- inside
+    # the default 2-hour blackout window. News is also flagged urgent,
+    # so this candidate is a clean "both_flagged" case.
+    anchor = "2026-08-12T13:00:00Z"
+    bar = {"event_id": "evt-nucb-1", "symbol": "MNQ1!", "timeframe": "5m", "timestamp": anchor}
+    decision = {
+        "decision": "no_trade",
+        "score": 5.0,
+        "threshold": 25.0,
+        "opinions_used": {
+            "analysis": {"direction": "bullish", "confidence": 10, "timestamp": anchor, "flags": []},
+            "news": {"direction": "bullish", "confidence": 10, "timestamp": anchor, "flags": ["urgent"]},
+        },
+        "missing_agents": [],
+        "stale_agents": [],
+        "contributions": {},
+        "conflict_flags": [],
+        "timestamp": anchor,
+    }
+    storage.save_candidate(candidate_id="cand-nucb-1", symbol="MNQ1!", timeframe="5m", bar=bar, decision=decision)
+
+    r = client.get(
+        "/candidates/history/news-urgent-vs-calendar-blackout",
+        params={"symbol": "MNQ1!", "timeframe": "5m"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["symbol"] == "MNQ1!"
+    assert body["news_present_candidates"] == 1
+    case = body["cases"][0]
+    assert case["quadrant"] == "both_flagged"
+    assert case["nearest_event"]["date"] == "2026-08-12"
+    assert body["cross_tab"] == {"both_flagged": 1}
+    assert body["calendar_coverage"]["event_count"] == 1
+
+
+def test_news_urgent_vs_calendar_blackout_endpoint_empty_history(client):
+    r = client.get(
+        "/candidates/history/news-urgent-vs-calendar-blackout",
+        params={"symbol": "NOSUCH", "timeframe": "5m"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["news_present_candidates"] == 0
+    assert body["cases"] == []
+    assert body["cross_tab"] == {}
+    assert body["agreement_rate"] is None
+
+
+# ---------------------------------------------------------------------------
 # Tier 3.18: day/session reporting
 # ---------------------------------------------------------------------------
 

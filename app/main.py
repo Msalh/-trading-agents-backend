@@ -899,6 +899,34 @@ flag vocabulary has no "urgent" concept. Entirely offline, no LLM
 calls, no candidate mutated, COORDINATOR_THRESHOLD/WEIGHTS/
 ANALYSIS_REQUIRED untouched.
 
+Tier 3.28 (News urgent vs. deterministic economic-calendar blackout,
+sixth external review, ranked backlog item #2, 2026-08-24): the
+reviewer's exact ask — compare News's "urgent" flag against a simple
+blackout built on a trustworthy economic calendar (abstain before/after
+CPI/FOMC/NFP); if News doesn't outperform a fixed blackout, there is no
+reason to pay its cost or trust its free-text judgment. New app/
+economic_calendar.py is a hardcoded, source-cited registry of every
+real 2026 CPI/NFP/FOMC release timestamp (BLS + White House PFEI
+schedule for CPI/NFP, the Federal Reserve's own calendar for FOMC —
+full citations and DST handling in that module's docstring) with a
+deterministic is_within_blackout_window() check that has zero access to
+News's opinion or reasoning. New app/coordinator_diagnostics.
+compute_news_urgent_vs_calendar_blackout() and GET /candidates/history/
+news-urgent-vs-calendar-blackout tag every News-present candidate with
+both signals independently and cross-tabulate them, with outcomes
+(real trade result preferred, hypothetical fallback otherwise) bucketed
+per quadrant. Built and cross-checked against live production data
+before shipping: the current 9-trading-day window (2026-08-12 through
+2026-08-24) contains exactly ONE registry event (the 2026-08-12 CPI
+release, the very first day of that window) — no FOMC meeting fell in
+August 2026, and the nearest NFP release (2026-08-07) predates the
+window. calendar_coverage reports this honestly on every call rather
+than letting a thin sample read as a confident result; the comparison
+gains real statistical power automatically as the data window reaches
+2026-09-04 (NFP), 2026-09-11 (CPI), and 2026-09-15/16 (FOMC), already
+in the registry. Entirely offline, no LLM calls, no candidate mutated,
+COORDINATOR_THRESHOLD/WEIGHTS untouched.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -965,6 +993,7 @@ from app.outcomes import (
 from app.coordinator_diagnostics import (
     compute_coordinator_divergence_report,
     compute_news_urgent_analysis,
+    compute_news_urgent_vs_calendar_blackout,
     compute_threshold_crossing_deep_dive,
 )
 from app.llm_telemetry import get_telemetry_health
@@ -2265,6 +2294,68 @@ def candidates_history_news_urgent_decomposition(
         "symbol": symbol,
         "timeframe": timeframe,
         **compute_news_urgent_analysis(candidates, horizons=_parse_replay_horizons(horizons)),
+    }
+
+
+@app.get("/candidates/history/news-urgent-vs-calendar-blackout")
+def candidates_history_news_urgent_vs_calendar_blackout(
+    symbol: str = Query(...),
+    timeframe: str = Query(...),
+    limit: int = Query(default=300, le=1000),
+    window_hours: float = Query(
+        default=2.0,
+        description="hours before/after a real CPI/NFP/FOMC release counted as a deterministic blackout window",
+    ),
+    horizons: str = Query(default="15,30,60"),
+) -> dict:
+    """Tier 3.28 (sixth external review, ranked backlog item #2): tags
+    every News-present candidate with two INDEPENDENTLY-computed
+    signals — News's own self-reported "urgent" flag, and a
+    deterministic calendar_blackout flag (app.economic_calendar,
+    hardcoded/source-cited real 2026 CPI/NFP/FOMC release timestamps —
+    has zero access to News's opinion or reasoning) — and
+    cross-tabulates the two into both_flagged / news_urgent_only /
+    calendar_blackout_only / neither_flagged, with `agreement_rate`
+    (both_flagged + neither_flagged, as a share of all News-present
+    candidates).
+
+    For candidates that reached a directional decision, also attaches
+    an outcome (real closed-trade result when one exists, the existing
+    hypothetical per-horizon estimate otherwise), bucketed per quadrant
+    in `outcomes_by_quadrant` — so the two signals can be compared not
+    just on how often they agree, but on which one actually correlated
+    with worse outcomes when they disagreed.
+
+    `calendar_coverage` reports, honestly, how many real CPI/NFP/FOMC
+    events from the registry could even have produced an
+    in_blackout=True result somewhere in this specific `limit`-bounded
+    history pull — read this before treating `cross_tab` as a
+    confident result. At this tier's build time (2026-08-24), the live
+    9-trading-day production window contained exactly ONE such event
+    (the 2026-08-12 CPI release, the very first day of that window) —
+    see app/economic_calendar.py's module docstring for the full
+    reasoning and for why this improves automatically as more weeks of
+    data accumulate (2026-09-04 NFP, 2026-09-11 CPI, and 2026-09-15/16
+    FOMC are already in the registry, waiting for the trading window to
+    reach them).
+
+    `window_hours` defaults to 2.0, matching News's own prompt language
+    about flagging events expected in "the next 2-3 hours" — tune it to
+    see how sensitive the comparison is to the blackout's width.
+
+    Entirely offline (no LLM calls, no candidate mutated,
+    COORDINATOR_THRESHOLD/WEIGHTS untouched); the outcome lookup reads
+    real trade rows the same way every other outcome-aware endpoint in
+    this project already does."""
+    candidates = get_candidate_history(symbol=symbol, timeframe=timeframe, limit=limit)
+    return {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        **compute_news_urgent_vs_calendar_blackout(
+            candidates,
+            window_hours=window_hours,
+            horizons=_parse_replay_horizons(horizons),
+        ),
     }
 
 

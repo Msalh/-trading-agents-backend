@@ -184,6 +184,7 @@ guarantee as the rest of this module and app/replay.py.
 """
 
 from app.coordinator import DIRECTIONAL_AGENTS, WEIGHTS
+from app.economic_calendar import events_overlapping_range, is_within_blackout_window
 from app.outcomes import HORIZON_MINUTES_DEFAULT, compute_outcome_for_candidate
 from app.replay import replay_candidate
 
@@ -854,4 +855,183 @@ def compute_threshold_crossing_deep_dive(candidates: list[dict], agent: str, hor
         "distinct_opinion_timestamps": len(distinct_opinion_timestamps),
         "cases": cases,
         "summary": _summarize_deep_dive(cases, horizons),
+    }
+
+
+# ---------------------------------------------------------------------------
+# News urgent vs. deterministic economic-calendar blackout — Tier 3.28
+# ---------------------------------------------------------------------------
+#
+# Sixth external review, ranked backlog item #2 (relayed verbatim):
+# "قارنه بحظر بسيط مبني على تقويم اقتصادي موثوق: امتنع قبل/بعد
+# CPI/FOMC/NFP. إذا كان LLM لا يتفوق على blackout ثابت، فلا يوجد سبب
+# لدفع تكلفته أو الاعتماد على تصنيفه الحر." (Compare News's "urgent"
+# flag against a simple blackout built on a trustworthy economic
+# calendar: abstain before/after CPI/FOMC/NFP. If the LLM doesn't
+# outperform a fixed blackout, there's no reason to pay its cost or
+# rely on its free-text classification.)
+#
+# Tier 3.27 established that "urgent" independently dampens the
+# blended score regardless of WHY News called something urgent — News's
+# own reasoning has cited real CPI/NFP prints, but just as often cites
+# things a fixed CPI/FOMC/NFP calendar has no concept of at all
+# (earnings releases, Fed-official speeches, geopolitical headlines —
+# see the Aug 24 production example in app/economic_calendar.py's
+# docstring: News flagged "urgent" partly for a Treasury Secretary
+# press conference and an upcoming Jackson Hole speech, neither of
+# which is CPI/FOMC/NFP). Whether that broader judgment is adding real
+# value or just adding noise/cost relative to a free, deterministic
+# calendar check is exactly the reviewer's question — this function
+# answers it by tagging every News-present candidate with BOTH signals,
+# independently computed, and cross-tabulating them.
+#
+# app.economic_calendar.is_within_blackout_window() has zero access to
+# News's opinion, reasoning, or flags — it only ever looks at the
+# candidate's own bar timestamp against the hardcoded, source-cited
+# 2026 CPI/NFP/FOMC registry. Read-only, offline, no LLM calls, no
+# mutation of any stored candidate, COORDINATOR_THRESHOLD/WEIGHTS
+# untouched — same guarantee as the rest of this module.
+
+
+def compute_news_urgent_vs_calendar_blackout(
+    candidates: list[dict], window_hours: float = 2.0, horizons: list[int] = None,
+) -> dict:
+    """For every candidate with a News opinion present, tags it with two
+    INDEPENDENTLY-computed booleans — news_urgent (News's own
+    self-reported "urgent" flag) and calendar_blackout (whether the
+    candidate's bar timestamp falls within `window_hours` of the
+    nearest real CPI/NFP/FOMC release in app.economic_calendar's
+    registry) — and buckets every case into one of four quadrants:
+    both_flagged, news_urgent_only, calendar_blackout_only,
+    neither_flagged. `agreement_rate` is the share of cases where the
+    two signals agreed (both_flagged + neither_flagged).
+
+    For candidates that actually reached a directional decision
+    (enter_long/enter_short), also attaches an outcome — real
+    closed-trade result when one exists (app.outcomes.
+    compute_outcome_for_candidate(), same preference as every other
+    outcome-aware endpoint in this project), the existing per-horizon
+    hypothetical estimate otherwise — bucketed per quadrant in
+    outcomes_by_quadrant, so a reader can see whether trading through a
+    calendar-blackout window (regardless of what News said) actually
+    correlated with worse outcomes than News's own "urgent" judgment
+    did.
+
+    calendar_coverage reports, honestly, how many real events from the
+    registry could even have produced an in_blackout=True result
+    somewhere in this specific data pull (via app.economic_calendar.
+    events_overlapping_range on the observed candidates' own min/max
+    bar timestamps) — see app/economic_calendar.py's module docstring:
+    at this tier's build time the live 9-trading-day window contained
+    exactly one such event (2026-08-12 CPI), so any single run of this
+    endpoint against current production data should be read as a very
+    thin sample, not a confirmatory result. That coverage count is
+    exactly why this field exists instead of only reporting a
+    cross_tab that could otherwise be mistaken for a well-powered
+    comparison.
+
+    Entirely offline (no LLM calls, no candidate mutated,
+    COORDINATOR_THRESHOLD/WEIGHTS untouched); the outcome lookup reads
+    real trade rows the same way every other outcome-aware endpoint in
+    this project already does."""
+    horizons = horizons or HORIZON_MINUTES_DEFAULT
+    cases = []
+    bar_timestamps: list[str] = []
+
+    for candidate in candidates:
+        decision = candidate.get("decision") or {}
+        opinions_used = decision.get("opinions_used") or {}
+        news_opinion = opinions_used.get("news")
+        if not news_opinion:
+            continue
+        bar_timestamp = (candidate.get("bar") or {}).get("timestamp")
+        if not bar_timestamp:
+            continue
+        bar_timestamps.append(bar_timestamp)
+
+        blackout = is_within_blackout_window(bar_timestamp, window_hours=window_hours)
+        news_urgent = "urgent" in (news_opinion.get("flags") or [])
+        calendar_blackout = blackout["in_blackout"]
+        if news_urgent and calendar_blackout:
+            quadrant = "both_flagged"
+        elif news_urgent and not calendar_blackout:
+            quadrant = "news_urgent_only"
+        elif not news_urgent and calendar_blackout:
+            quadrant = "calendar_blackout_only"
+        else:
+            quadrant = "neither_flagged"
+
+        outcome = None
+        if decision.get("decision") in _DIRECTIONAL_DECISIONS:
+            outcome_result = compute_outcome_for_candidate(candidate, horizons=horizons)
+            if outcome_result is not None:
+                if outcome_result["source"] == "actual_trade":
+                    outcome = {
+                        "kind": "real_trade",
+                        "status": outcome_result["status"],
+                        "outcome": outcome_result["outcome"],
+                    }
+                    if "pnl_usd" in outcome_result:
+                        outcome["pnl_usd"] = outcome_result["pnl_usd"]
+                else:
+                    outcome = {
+                        "kind": "hypothetical",
+                        "by_horizon": {h: o["outcome"] for h, o in (outcome_result.get("horizons") or {}).items()},
+                    }
+
+        cases.append({
+            "candidate_id": candidate.get("candidate_id"),
+            "bar_timestamp": bar_timestamp,
+            "decision": decision.get("decision"),
+            "quadrant": quadrant,
+            "news_urgent": news_urgent,
+            "calendar_blackout": calendar_blackout,
+            "nearest_event": blackout["nearest_event"],
+            "distance_hours": blackout["distance_hours"],
+            "outcome": outcome,
+        })
+
+    cross_tab: dict[str, int] = {}
+    outcomes_by_quadrant: dict[str, dict] = {}
+    for case in cases:
+        quadrant = case["quadrant"]
+        cross_tab[quadrant] = cross_tab.get(quadrant, 0) + 1
+        outcome = case["outcome"]
+        if outcome is None:
+            continue
+        bucket = outcomes_by_quadrant.setdefault(
+            quadrant, {"real_trade": {}, "hypothetical_by_horizon": {h: {} for h in horizons}},
+        )
+        if outcome["kind"] == "real_trade":
+            key = outcome["outcome"]
+            bucket["real_trade"][key] = bucket["real_trade"].get(key, 0) + 1
+        else:
+            for h, o in outcome["by_horizon"].items():
+                horizon_bucket = bucket["hypothetical_by_horizon"].setdefault(h, {})
+                horizon_bucket[o] = horizon_bucket.get(o, 0) + 1
+
+    agreeing = cross_tab.get("both_flagged", 0) + cross_tab.get("neither_flagged", 0)
+    agreement_rate = round(agreeing / len(cases), 3) if cases else None
+
+    if bar_timestamps:
+        range_start = min(bar_timestamps)
+        range_end = max(bar_timestamps)
+        coverage_events = events_overlapping_range(range_start, range_end, window_hours=window_hours)
+    else:
+        range_start = None
+        range_end = None
+        coverage_events = []
+
+    return {
+        "window_hours": window_hours,
+        "news_present_candidates": len(cases),
+        "data_range": {"start": range_start, "end": range_end},
+        "calendar_coverage": {
+            "events_overlapping_data_range": coverage_events,
+            "event_count": len(coverage_events),
+        },
+        "cross_tab": cross_tab,
+        "agreement_rate": agreement_rate,
+        "outcomes_by_quadrant": outcomes_by_quadrant,
+        "cases": cases,
     }
