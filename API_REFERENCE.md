@@ -2003,19 +2003,29 @@ project already does.
 
 ### `GET /candidates/history/risk-filter-veto-attribution?symbol=MNQ1!&timeframe=5m&limit=300`
 
-Tier 3.31 (seventh external review). `app/backtest.py`'s
-`"analysis_risk_filtered"` direction source (Tier 3.30) bundles FOUR
-changes into one policy at once — removing News from the directional
-vote, removing Macro from the directional vote, removing the
-Coordinator's `MIN_AVAILABLE_WEIGHT` quorum gate, and removing Timing's
-session/liquidity gating entirely (that source never reads Timing at
-all) — so a trade-count difference against the live Coordinator can't
-yet be attributed specifically to "News/Macro became risk filters."
-This endpoint separates the four out with real numbers, reusing the
-exact gating logic already frozen on every stored candidate (Tier 2.1's
-`opinions_used`/`conflict_flags` snapshot — the real historical
-Coordinator decision already encodes whether Timing vetoed/dampened it)
-rather than any new replay.
+Tier 3.31 (seventh external review), corrected Tier 3.32 (eighth
+external review). `app/backtest.py`'s `"analysis_risk_filtered"`
+direction source (Tier 3.30) bundles FOUR changes into one policy at
+once — removing News from the directional vote, removing Macro from the
+directional vote, removing the Coordinator's `MIN_AVAILABLE_WEIGHT`
+quorum gate, and removing Timing's session/liquidity gating entirely
+(that source never reads Timing at all) — so a trade-count difference
+against the live Coordinator can't yet be attributed specifically to
+"News/Macro became risk filters." This endpoint separates the four out
+with real numbers, reusing the exact gating logic already frozen on
+every stored candidate (Tier 2.1's `opinions_used`/`conflict_flags`
+snapshot — the real historical Coordinator decision already encodes
+whether Timing vetoed/dampened it) rather than any new replay.
+
+**Scope correction (Tier 3.32):** the Timing finding below is proven
+only for the AUTO-GENERATED webhook candidate path —
+`should_run_analysis()` gates real-time Analysis runs to inside a kill
+zone, so a Timing veto/dampen flag can never co-occur with a directional
+Analysis opinion there. `POST /agents/analysis/run?ignore_timing_
+gate=true` is a real manual-testing path that breaks that guarantee —
+this is NOT a system-wide structural impossibility, just true for every
+candidate this endpoint sees in normal operation (real production
+history only ever contains auto-generated candidates).
 
 For every candidate with a directional (bullish/bearish) Analysis
 opinion, `summary` reports exactly one bucket per candidate:
@@ -2043,14 +2053,46 @@ opinion, `summary` reports exactly one bucket per candidate:
   `"timing_low_liquidity_dampened"` `conflict_flags`, set
   deterministically from Timing's own `market_closed`/`low_liquidity`
   flags — see `app/timing_agent.py`).
-- `news_macro_opposition_block` — neither veto fires, quorum was fine,
-  no Timing flag applied at all — the real Coordinator's blended score
-  simply didn't cross ±threshold, i.e. genuine News/Macro directional
-  disagreement or renormalization, not a gating mechanic.
+- `coordinator_score_below_threshold_other` — neither veto fires, quorum
+  was fine, no Timing flag applied at all — the real Coordinator's
+  blended score simply didn't cross ±threshold. **Tier 3.32 correction:**
+  this is a genuine RESIDUAL/catch-all, not proof of "News/Macro
+  opposition" by itself — see `score_below_threshold_breakdown` below,
+  which was added specifically because the original Tier 3.31 name for
+  this bucket (`news_macro_opposition_block`) claimed more than the code
+  actually established.
 
 `analysis_not_directional_excluded` counts candidates excluded before
 any bucket (Analysis itself missing or neutral) — both policies skip
 these identically, so they're not attributable to any veto or gate.
+
+**`score_below_threshold_breakdown`** (Tier 3.32) splits the residual
+bucket above, using only each present other agent's own stored
+direction — no new replay:
+
+- `directional_opposition` — News or Macro present with a direction that
+  OPPOSES Analysis's.
+- `neutral_dilution` — News or Macro present but direction `"neutral"` —
+  contributes 0 to the weighted sum, diluting the renormalized average
+  toward zero without actually opposing Analysis's direction.
+- `agreement_low_confidence` — every present other agent agrees with
+  Analysis's direction — the score fell short purely on confidence/
+  weighting, not disagreement.
+
+These three are exhaustive given at least one of News/Macro is
+guaranteed present in this bucket (quorum already passed by the time a
+case reaches it) — `"other"` is kept in the code as a defensive
+fallback, not because it's expected to ever appear.
+
+**`flag_prevalence`** (Tier 3.32) reports each veto flag's TRUE
+independent count, not just its bucketed count — the priority order
+above (News's `"urgent"` checked before Macro's `"risk_off"`) means
+`summary.macro_risk_off_veto` alone UNDERSTATES Macro's real prevalence
+whenever both flags fire on the same candidate (that case lands under
+`news_urgent_veto` instead). `news_urgent_total` and `macro_risk_off_
+total` count every case where that flag was set, regardless of which
+bucket it landed in; `both_flags_overlap` counts cases where both fired
+together.
 
 ```json
 {
@@ -2059,13 +2101,22 @@ these identically, so they're not attributable to any veto or gate.
   "candidates_considered": 300,
   "analysis_not_directional_excluded": 120,
   "analysis_directional_candidates": 180,
+  "flag_prevalence": {
+    "news_urgent_total": 25,
+    "macro_risk_off_total": 8,
+    "both_flags_overlap": 2
+  },
+  "score_below_threshold_breakdown": {
+    "directional_opposition": 2,
+    "neutral_dilution": 1
+  },
   "summary": {
     "coordinator_agrees": 90,
     "coordinator_quorum_block": 40,
     "news_urgent_veto": 25,
     "timing_low_liquidity_block": 15,
     "macro_risk_off_veto": 6,
-    "news_macro_opposition_block": 3,
+    "coordinator_score_below_threshold_other": 3,
     "timing_market_closed_block": 1
   },
   "cases": [
@@ -2079,20 +2130,24 @@ these identically, so they're not attributable to any veto or gate.
       "coordinator_direction": "bullish",
       "news_urgent": false,
       "macro_risk_off": false,
-      "attribution": "coordinator_agrees"
+      "attribution": "coordinator_agrees",
+      "score_below_threshold_reason": null
     }
   ],
   "opinion_level_day_blocked": { "...": "see below" }
 }
 ```
 
-(Illustrative shape; not a production pull.) `opinion_level_day_blocked`
-here uses the same shared aggregator as the other diagnostics in this
-family (see below), but keyed on Analysis's own `opinion_timestamp`
-rather than News/Macro's — this endpoint's subject is a whole-policy
-comparison per candidate, not one reused News/Macro opinion, so
-Analysis's opinion identity (the one field every case here is
-guaranteed to have) is the correct one to weight by.
+(Illustrative shape; not a production pull — note `macro_risk_off_total`
+8 vs `summary.macro_risk_off_veto` 6 above, an example of the overlap
+`flag_prevalence` exists to surface: 2 of Macro's 8 real `risk_off`
+cases co-occurred with News's `urgent` and got bucketed there instead.)
+`opinion_level_day_blocked` here uses the same shared aggregator as the
+other diagnostics in this family (see below), but keyed on Analysis's
+own `opinion_timestamp` rather than News/Macro's — this endpoint's
+subject is a whole-policy comparison per candidate, not one reused
+News/Macro opinion, so Analysis's opinion identity (the one field every
+case here is guaranteed to have) is the correct one to weight by.
 
 Entirely offline (no LLM calls, no candidate mutated,
 `COORDINATOR_THRESHOLD`/`WEIGHTS`/`analysis_risk_filtered`'s own veto

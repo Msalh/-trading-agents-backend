@@ -1179,6 +1179,8 @@ def test_risk_filter_veto_attribution_endpoint_returns_shape(client):
     assert body["candidates_considered"] == 1
     assert body["analysis_directional_candidates"] == 1
     assert body["summary"] == {"coordinator_agrees": 1}
+    assert body["flag_prevalence"] == {"news_urgent_total": 0, "macro_risk_off_total": 0, "both_flags_overlap": 0}
+    assert body["score_below_threshold_breakdown"] == {}
     case = body["cases"][0]
     assert case["attribution"] == "coordinator_agrees"
     assert case["trading_date"] == "2026-08-16"
@@ -1196,6 +1198,8 @@ def test_risk_filter_veto_attribution_endpoint_empty_history(client):
     assert body["candidates_considered"] == 0
     assert body["analysis_not_directional_excluded"] == 0
     assert body["summary"] == {}
+    assert body["flag_prevalence"] == {"news_urgent_total": 0, "macro_risk_off_total": 0, "both_flags_overlap": 0}
+    assert body["score_below_threshold_breakdown"] == {}
     assert body["cases"] == []
 
 

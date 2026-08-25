@@ -1000,6 +1000,28 @@ exploratory only. Entirely offline, no LLM calls, no candidate mutated,
 COORDINATOR_THRESHOLD/WEIGHTS/analysis_risk_filtered's own veto scope
 all untouched.
 
+Tier 3.32 (risk-filter veto attribution corrections, eighth external
+review, 2026-08-25): two real problems the reviewer found in Tier
+3.31's first shipment, both fixed without touching any live behavior.
+(1) The Timing finding was overstated as a general structural
+impossibility — it's proven only for the auto-generated webhook
+candidate path (should_run_analysis() gates real-time Analysis to
+inside a kill zone); POST /agents/analysis/run?ignore_timing_gate=true
+is a real manual-testing path that breaks that guarantee, so the module
+comment and endpoint docstring are now explicit about the scope. (2)
+The renamed `news_macro_opposition_block` -> `coordinator_score_below_
+threshold_other` bucket only ever proved "the blended score didn't
+cross threshold," not "News/Macro opposed Analysis" — new
+`score_below_threshold_breakdown` splits it into `directional_
+opposition` / `neutral_dilution` / `agreement_low_confidence` using
+each present agent's own stored direction, no new replay. Also new:
+`flag_prevalence` reports News urgent's and Macro risk_off's TRUE
+independent counts plus their overlap, since the bucket priority order
+alone understates Macro's prevalence whenever both flags co-occur on
+one candidate. Entirely offline, no LLM calls, no candidate mutated,
+COORDINATOR_THRESHOLD/WEIGHTS/analysis_risk_filtered's own veto scope
+all untouched.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -2467,32 +2489,60 @@ def candidates_history_risk_filter_veto_attribution(
     timeframe: str = Query(...),
     limit: int = Query(default=300, le=1000),
 ) -> dict:
-    """Tier 3.31 (seventh external review): app/backtest.py's
-    "analysis_risk_filtered" direction source (Tier 3.30) bundles FOUR
-    changes into one policy — removing News from the directional vote,
-    removing Macro from the directional vote, removing the Coordinator's
-    MIN_AVAILABLE_WEIGHT quorum gate, and removing Timing's session/
-    liquidity gating entirely (that source never reads Timing at all) —
-    so a trade-count difference against the live Coordinator can't yet
-    be attributed specifically to "News/Macro became risk filters." This
-    endpoint separates the four out with real numbers.
+    """Tier 3.31 (seventh external review), corrected Tier 3.32 (eighth
+    external review): app/backtest.py's "analysis_risk_filtered"
+    direction source (Tier 3.30) bundles FOUR changes into one policy —
+    removing News from the directional vote, removing Macro from the
+    directional vote, removing the Coordinator's MIN_AVAILABLE_WEIGHT
+    quorum gate, and removing Timing's session/liquidity gating entirely
+    (that source never reads Timing at all) — so a trade-count
+    difference against the live Coordinator can't yet be attributed
+    specifically to "News/Macro became risk filters." This endpoint
+    separates the four out with real numbers. NOTE (Tier 3.32): the
+    Timing-gating scope is proven only for the AUTO-GENERATED webhook
+    candidate path — should_run_analysis() gates real-time Analysis runs
+    to inside a kill zone, so a Timing veto/dampen flag can never
+    co-occur with a directional Analysis opinion THERE, but POST
+    /agents/analysis/run?ignore_timing_gate=true is a real manual-
+    testing path that can produce a candidate with both — not a
+    system-wide impossibility, just true for every candidate this
+    endpoint actually sees in normal operation.
 
     For every candidate with a directional (bullish/bearish) Analysis
     opinion, `summary` reports exactly one bucket per candidate:
     `news_urgent_veto` / `macro_risk_off_veto` (analysis_risk_filtered
-    itself would skip this candidate), `coordinator_agrees` (no veto
-    fires and the real Coordinator traded the same direction — no
-    blocking difference), `coordinator_opposite_direction` (rare/
+    itself would skip this candidate — checked in that priority order,
+    matching app.backtest._direction_for_source), `coordinator_agrees`
+    (no veto fires and the real Coordinator traded the same direction —
+    no blocking difference), `coordinator_opposite_direction` (rare/
     structurally unproven under live weights, see Tier 3.21),
     `coordinator_quorum_block` (News AND Macro both missing/stale),
     `timing_market_closed_block` / `timing_low_liquidity_block` (the
     real Coordinator decision's own conflict_flags show Timing vetoed
-    or dampened it), or `news_macro_opposition_block` (quorum was fine,
-    no Timing flag applied, the blended score simply didn't cross
-    +-threshold — genuine directional disagreement/renormalization, not
-    a gating mechanic). `analysis_not_directional_excluded` counts
+    or dampened it), or `coordinator_score_below_threshold_other`
+    (quorum was fine, no Timing flag applied, the blended score simply
+    didn't cross +-threshold — a genuine residual, NOT proof of
+    directional opposition by itself; see `score_below_threshold_
+    breakdown` below). `analysis_not_directional_excluded` counts
     candidates excluded before any bucket (Analysis itself missing/
     neutral — both policies skip these identically).
+
+    `score_below_threshold_breakdown` (Tier 3.32) splits the residual
+    bucket above into `directional_opposition` (News or Macro present
+    with a direction that OPPOSES Analysis's), `neutral_dilution` (News
+    or Macro present but direction "neutral" — dilutes the renormalized
+    average without opposing anything), or `agreement_low_confidence`
+    (every present other agent agrees with Analysis's direction — the
+    score fell short on confidence/weighting alone, not disagreement) —
+    exhaustive given at least one of News/Macro is guaranteed present in
+    this bucket (quorum already passed).
+
+    `flag_prevalence` (Tier 3.32) reports each veto flag's TRUE
+    independent count (`news_urgent_total`, `macro_risk_off_total`) plus
+    `both_flags_overlap` — the bucket priority order above (News checked
+    before Macro) means `summary.macro_risk_off_veto` alone understates
+    Macro's real prevalence whenever both flags co-occur on the same
+    candidate.
 
     Reads every field from each candidate's already-frozen decision
     snapshot (Tier 2.1) — no new replay, no LLM calls, no candidate

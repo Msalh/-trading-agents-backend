@@ -1269,13 +1269,56 @@ def test_veto_attribution_timing_low_liquidity_block():
     assert result["cases"][0]["coordinator_decision"] == "no_trade"
 
 
-def test_veto_attribution_news_macro_opposition_block():
+def test_veto_attribution_score_below_threshold_directional_opposition():
     # Quorum fine, no Timing flags at all, but News's strong opposing
-    # confidence keeps the blended score under threshold -- genuine
-    # directional disagreement, not a gating mechanic.
+    # direction keeps the blended score under threshold.
     candidate = _candidate(analysis=_opinion("bullish", 30), news=_opinion("bearish", 90))
     result = compute_risk_filter_veto_attribution([candidate])
-    assert result["summary"] == {"news_macro_opposition_block": 1}
+    assert result["summary"] == {"coordinator_score_below_threshold_other": 1}
+    assert result["score_below_threshold_breakdown"] == {"directional_opposition": 1}
+    assert result["cases"][0]["score_below_threshold_reason"] == "directional_opposition"
+
+
+def test_veto_attribution_score_below_threshold_neutral_dilution():
+    # News present but neutral -- contributes 0, diluting the
+    # renormalized average without opposing Analysis's direction.
+    # score = 0.4*30 / 0.65 = 18.46 < 25 -> no_trade.
+    candidate = _candidate(analysis=_opinion("bullish", 30), news=_opinion("neutral", 50))
+    result = compute_risk_filter_veto_attribution([candidate])
+    assert result["summary"] == {"coordinator_score_below_threshold_other": 1}
+    assert result["score_below_threshold_breakdown"] == {"neutral_dilution": 1}
+
+
+def test_veto_attribution_score_below_threshold_agreement_low_confidence():
+    # News agrees with Analysis's direction, but both confidences are
+    # low enough that the blended score still doesn't cross threshold.
+    # score = (0.4*20 + 0.25*20) / 0.65 = 20.0 < 25 -> no_trade.
+    candidate = _candidate(analysis=_opinion("bullish", 20), news=_opinion("bullish", 20))
+    result = compute_risk_filter_veto_attribution([candidate])
+    assert result["summary"] == {"coordinator_score_below_threshold_other": 1}
+    assert result["score_below_threshold_breakdown"] == {"agreement_low_confidence": 1}
+
+
+def test_veto_attribution_flag_prevalence_and_overlap():
+    # Both flags fire on the same candidate -- news_urgent_veto wins the
+    # bucket (priority order matches app.backtest._direction_for_source),
+    # but flag_prevalence must still show Macro's TRUE independent count
+    # and the overlap, not just the bucketed count.
+    both = _candidate(
+        analysis=_opinion("bullish", 90),
+        news=_flagged_opinion("bullish", 90, ["urgent"]),
+        macro=_flagged_opinion("bullish", 90, ["risk_off"]),
+    )
+    macro_only = _candidate(
+        analysis=_opinion("bearish", 90),
+        news=_opinion("bearish", 90),
+        macro=_flagged_opinion("bearish", 90, ["risk_off"]),
+    )
+    result = compute_risk_filter_veto_attribution([both, macro_only])
+    assert result["summary"] == {"news_urgent_veto": 1, "macro_risk_off_veto": 1}
+    assert result["flag_prevalence"] == {
+        "news_urgent_total": 1, "macro_risk_off_total": 2, "both_flags_overlap": 1,
+    }
 
 
 def test_veto_attribution_opinion_level_day_blocked_wiring():

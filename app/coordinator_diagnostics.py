@@ -1118,13 +1118,13 @@ def compute_news_urgent_vs_calendar_blackout(
 #                                  low_liquidity flag halved the real
 #                                  Coordinator's score enough to keep it
 #                                  under threshold
-#   news_macro_opposition_block -- neither veto fires, quorum was fine, no
-#                                  Timing flag applied at all -- the real
-#                                  Coordinator's blended score simply
-#                                  didn't cross +-threshold, i.e. genuine
-#                                  News/Macro directional
-#                                  disagreement/renormalization, not a
-#                                  gating mechanic
+#   coordinator_score_below_threshold_other -- neither veto fires, quorum
+#                                  was fine, no Timing flag applied at
+#                                  all -- the real Coordinator's blended
+#                                  score simply didn't cross +-threshold.
+#                                  See the Tier 3.32 note below: this is a
+#                                  genuine residual/catch-all, not proof
+#                                  of "News/Macro opposition" by itself.
 #
 # This is NOT wired into _opinion_level_day_blocked_summary using News or
 # Macro's own opinion identity, unlike the three Tier 3.26-3.28
@@ -1137,17 +1137,87 @@ def compute_news_urgent_vs_calendar_blackout(
 # Entirely offline: reads already-stored candidate.decision fields only,
 # no replay, no LLM calls, no candidate mutated. COORDINATOR_THRESHOLD/
 # WEIGHTS/analysis_risk_filtered's own veto scope are all untouched.
+#
+# Tier 3.32 correction (eighth external review): two real problems with
+# the original Tier 3.31 shipment.
+#
+# (1) The scoped Timing finding was overstated. Tier 3.31's comment
+# claimed Timing veto/dampen flags can NEVER co-occur with a directional
+# Analysis opinion -- true only for the AUTO-GENERATED webhook candidate
+# path (should_run_analysis() gates real-time Analysis runs to inside a
+# kill zone), not a general system-wide impossibility: POST
+# /agents/analysis/run?ignore_timing_gate=true is a real manual-testing
+# path that can produce a candidate with both a directional Analysis
+# opinion AND an outside-kill-zone Timing state. The finding stands for
+# every candidate this diagnostic actually sees in production (all
+# auto-generated), but the module comment above and this one are now
+# explicit about that scope rather than implying an unconditional proof.
+#
+# (2) `news_macro_opposition_block` (renamed `coordinator_score_below_
+# threshold_other` above) claimed more than the code proved. All that
+# bucket's precondition actually establishes is: no veto fired, quorum
+# passed, no Timing flag applied, decision == "no_trade" -- i.e. the
+# blended |score| simply didn't cross the threshold. That could be
+# genuine directional opposition, but could equally be every present
+# agent AGREEING with Analysis at collectively low confidence, or News/
+# Macro present but NEUTRAL (diluting the renormalized average toward
+# zero without opposing anything). `score_below_threshold_reason` below
+# splits this residual bucket, using only each present agent's own
+# stored direction (no new replay): "directional_opposition" (News or
+# Macro present with a direction that OPPOSES Analysis's), else
+# "neutral_dilution" (News or Macro present with direction "neutral"),
+# else "agreement_low_confidence" (every present other agent agrees with
+# Analysis's direction -- score fell short purely on confidence/
+# weighting, not disagreement). These three are exhaustive over every
+# present other agent's direction (bullish/bearish either opposes or
+# agrees; neutral is its own case) given at least one of News/Macro is
+# guaranteed present here (quorum already passed) -- "other" is kept as
+# a defensive fallback, not because it's expected to ever fire.
+#
+# Also added: `flag_prevalence` at the top level reports each veto
+# flag's TRUE independent count (`news_urgent_total`, `macro_risk_off_
+# total`) and `both_flags_overlap` -- the priority order above (News
+# checked before Macro, matching app.backtest._direction_for_source's
+# own check order) means `summary.macro_risk_off_veto` UNDERSTATES
+# Macro's real prevalence whenever both flags co-occur on the same
+# candidate (that case is bucketed under news_urgent_veto instead).
+# `flag_prevalence` makes the true prevalence of each flag, and their
+# overlap, visible independent of which bucket a co-occurring case
+# landed in.
+
+
+def _score_below_threshold_reason(analysis_direction: str, news_opinion: dict | None, macro_opinion: dict | None) -> str:
+    """Tier 3.32: splits the coordinator_score_below_threshold_other
+    bucket using only each present other agent's own stored direction —
+    see the Tier 3.32 module comment above for why these three are
+    exhaustive given at least one of news_opinion/macro_opinion is
+    guaranteed present (quorum already passed by the time this is
+    called)."""
+    others = [op for op in (news_opinion, macro_opinion) if op is not None]
+    if any(op.get("direction") in ("bullish", "bearish") and op.get("direction") != analysis_direction for op in others):
+        return "directional_opposition"
+    if any(op.get("direction") == "neutral" for op in others):
+        return "neutral_dilution"
+    if others and all(op.get("direction") == analysis_direction for op in others):
+        return "agreement_low_confidence"
+    return "other"  # defensive fallback; should be unreachable per the module comment's proof
 
 
 def compute_risk_filter_veto_attribution(candidates: list[dict]) -> dict:
-    """See the Tier 3.31 module comment above for the full bucket
+    """See the Tier 3.31/3.32 module comments above for the full bucket
     definitions and reasoning. Returns candidates_considered, the
     analysis_not_directional exclusion count, and — for the remaining
     analysis-directional subpopulation — a `summary` dict of bucket ->
-    count, the full per-candidate `cases` list, and `opinion_level_
-    day_blocked` (Analysis-opinion identity, day-blocked)."""
+    count, `flag_prevalence` (true independent News urgent / Macro
+    risk_off prevalence plus their overlap, since the bucket priority
+    order alone understates Macro's), the full per-candidate `cases`
+    list, and `opinion_level_day_blocked` (Analysis-opinion identity,
+    day-blocked)."""
     cases = []
     excluded_not_directional = 0
+    news_urgent_total = 0
+    macro_risk_off_total = 0
+    both_flags_overlap = 0
 
     for candidate in candidates:
         decision = candidate.get("decision") or {}
@@ -1166,11 +1236,18 @@ def compute_risk_filter_veto_attribution(candidates: list[dict]) -> dict:
         macro_risk_off = bool(
             macro_opinion and _RISK_FILTER_MACRO_VETO_FLAGS & set(macro_opinion.get("flags") or [])
         )
+        if news_urgent:
+            news_urgent_total += 1
+        if macro_risk_off:
+            macro_risk_off_total += 1
+        if news_urgent and macro_risk_off:
+            both_flags_overlap += 1
 
         coordinator_decision = decision.get("decision")
         coordinator_direction = decision.get("direction")
         conflict_flags = decision.get("conflict_flags") or []
 
+        score_below_threshold_reason = None
         if news_urgent:
             attribution = "news_urgent_veto"
         elif macro_risk_off:
@@ -1188,7 +1265,10 @@ def compute_risk_filter_veto_attribution(candidates: list[dict]) -> dict:
         elif _TIMING_DAMPEN_FLAG == "low_liquidity" and "timing_low_liquidity_dampened" in conflict_flags:
             attribution = "timing_low_liquidity_block"
         else:
-            attribution = "news_macro_opposition_block"
+            attribution = "coordinator_score_below_threshold_other"
+            score_below_threshold_reason = _score_below_threshold_reason(
+                analysis_direction, news_opinion, macro_opinion,
+            )
 
         cases.append({
             "candidate_id": candidate.get("candidate_id"),
@@ -1201,16 +1281,27 @@ def compute_risk_filter_veto_attribution(candidates: list[dict]) -> dict:
             "news_urgent": news_urgent,
             "macro_risk_off": macro_risk_off,
             "attribution": attribution,
+            "score_below_threshold_reason": score_below_threshold_reason,
         })
 
     summary: dict[str, int] = {}
+    score_below_threshold_breakdown: dict[str, int] = {}
     for case in cases:
         summary[case["attribution"]] = summary.get(case["attribution"], 0) + 1
+        if case["score_below_threshold_reason"] is not None:
+            reason = case["score_below_threshold_reason"]
+            score_below_threshold_breakdown[reason] = score_below_threshold_breakdown.get(reason, 0) + 1
 
     return {
         "candidates_considered": len(candidates),
         "analysis_not_directional_excluded": excluded_not_directional,
         "analysis_directional_candidates": len(cases),
+        "flag_prevalence": {
+            "news_urgent_total": news_urgent_total,
+            "macro_risk_off_total": macro_risk_off_total,
+            "both_flags_overlap": both_flags_overlap,
+        },
+        "score_below_threshold_breakdown": score_below_threshold_breakdown,
         "summary": summary,
         "cases": cases,
         "opinion_level_day_blocked": _opinion_level_day_blocked_summary(
