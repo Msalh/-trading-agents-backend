@@ -2196,7 +2196,127 @@ scope all untouched).
 
 ---
 
-### `opinion_level_day_blocked` (Tier 3.29 — present in all four endpoints above)
+### `GET /candidates/history/veto-decision-transitions?symbol=MNQ1!&timeframe=5m&limit=300`
+
+Tier 3.34 (ninth external review). The reviewer found that neither
+`risk-filter-veto-attribution` (Tier 3.31) nor the `coordinator_veto_
+filtered`/`coordinator_quorum_bypass` sources (Tier 3.33) directly
+answer "how many of the real Coordinator's own trade decisions would
+the urgent/risk_off veto have killed":
+
+- Tier 3.31's `news_urgent_veto`/`macro_risk_off_veto` buckets are
+  checked BEFORE looking at what the real Coordinator decision actually
+  was, so those candidates were never cross-tabulated against whether
+  Coordinator traded them or not — an earlier internal report
+  mislabeled that endpoint's residual `coordinator_score_below_
+  threshold_other` share (previously named `news_macro_opposition_
+  block`) as "the veto's share of the gap," which it never was; it's
+  the share of `analysis_risk_filtered`'s EXTRA trades attributable to
+  something other than quorum-bypass, an entirely different quantity.
+- Tier 3.33's `coordinator_veto_filtered` trade-count delta against
+  plain `coordinator` (e.g. 14 → 5 in one production pull) additionally
+  mixes in `non_overlapping`'s path-dependent scheduling — removing an
+  early veto'd trade can free schedule capacity for a later candidate
+  the original schedule would have skipped as overlapping — so that
+  delta conflates the veto's direct decision-level effect with a
+  portfolio-level scheduling effect. It remains valid for what it
+  actually measures (realized P&L under each policy's own schedule),
+  just not for "how many decisions did the veto kill" claims.
+
+This endpoint reads only already-frozen `candidate.decision` fields —
+no replay, no barrier-backtest simulation, no `non_overlapping`
+scheduling — and reports a direct 2×2 transition between the real
+historical Coordinator decision (traded vs. not) and the hypothetical
+post-hoc veto (would-skip vs. wouldn't), on the SAME analysis-directional
+population `risk-filter-veto-attribution` uses, for direct
+candidate-for-candidate comparability.
+
+`transition_summary` reports exactly one of four labels per candidate:
+
+- `coordinator_trade_veto_would_skip` — the veto's true direct
+  decision-level kill count: real Coordinator traded, but a veto flag
+  was present.
+- `coordinator_trade_veto_survives` — real Coordinator traded, no veto
+  flag present. This is what `coordinator_veto_filtered`'s
+  decision-level trade count should equal, before any barrier-sim/
+  `non_overlapping` path effects reshape the final backtest number.
+- `coordinator_skip_veto_would_also_skip` — Coordinator already skipped
+  (`no_trade` or `insufficient_data`) AND a veto flag was also present —
+  redundant, changed nothing.
+- `coordinator_skip_veto_irrelevant` — Coordinator skipped, no veto flag
+  present either.
+
+`flag_basis_by_transition` splits each transition by which flag(s) were
+actually responsible (`news_urgent_only` / `macro_risk_off_only` /
+`both` / `neither`) — the explicit urgent-vs-risk_off-vs-overlap
+visibility the reviewer asked for, at the transition level rather than
+folded into one priority-ordered bucket. `coordinator_skip_reason_by_
+transition` further splits the two non-trade transitions by the real
+historical reason (`no_trade` vs `insufficient_data`).
+
+**Structural note** (live-config-dependent, not a universal guarantee
+the way Tier 3.31's Timing zero-count proof is): under the current live
+`WEIGHTS`/`MIN_AVAILABLE_WEIGHT` (0.40/0.25/0.20/0.15, 60% floor),
+`coordinator_skip_veto_would_also_skip` can only ever carry a `no_trade`
+skip reason, never `insufficient_data` — in this Analysis-directional
+population, Analysis is always present, so `insufficient_data` can only
+occur when News AND Macro are BOTH absent (Analysis alone is
+0.40/0.80 = 50% < 60%; adding either agent alone already clears the
+floor), and a veto flag requires its agent to be present. Would need
+re-checking if `WEIGHTS`/`MIN_AVAILABLE_WEIGHT` ever change.
+
+```json
+{
+  "symbol": "MNQ1!",
+  "timeframe": "5m",
+  "candidates_considered": 300,
+  "analysis_not_directional_excluded": 120,
+  "analysis_directional_candidates": 180,
+  "transition_summary": {
+    "coordinator_trade_veto_survives": 90,
+    "coordinator_skip_veto_irrelevant": 61,
+    "coordinator_trade_veto_would_skip": 15,
+    "coordinator_skip_veto_would_also_skip": 14
+  },
+  "flag_basis_by_transition": {
+    "coordinator_trade_veto_survives": { "neither": 90 },
+    "coordinator_skip_veto_irrelevant": { "neither": 61 },
+    "coordinator_trade_veto_would_skip": { "news_urgent_only": 12, "macro_risk_off_only": 2, "both": 1 },
+    "coordinator_skip_veto_would_also_skip": { "news_urgent_only": 13, "macro_risk_off_only": 1 }
+  },
+  "coordinator_skip_reason_by_transition": {
+    "coordinator_skip_veto_irrelevant": { "no_trade": 40, "insufficient_data": 21 },
+    "coordinator_skip_veto_would_also_skip": { "no_trade": 14 }
+  },
+  "cases": [
+    {
+      "candidate_id": "abc123",
+      "bar_timestamp": "2026-08-16T14:00:00Z",
+      "trading_date": "2026-08-16",
+      "analysis_opinion_timestamp": "2026-08-16T14:00:00Z",
+      "analysis_direction": "bullish",
+      "coordinator_decision": "enter_long",
+      "news_urgent": false,
+      "macro_risk_off": false,
+      "flag_basis": "neither",
+      "transition": "coordinator_trade_veto_survives"
+    }
+  ],
+  "opinion_level_day_blocked": { "...": "see below" }
+}
+```
+
+(Illustrative shape; not a production pull.) `opinion_level_day_blocked`
+uses the same shared aggregator as the rest of this diagnostic family,
+keyed on Analysis's own `opinion_timestamp`.
+
+Entirely offline (no LLM calls, no candidate mutated,
+`COORDINATOR_THRESHOLD`/`WEIGHTS`/`MIN_AVAILABLE_WEIGHT`/`analysis_risk_
+filtered`'s own veto scope all untouched).
+
+---
+
+### `opinion_level_day_blocked` (Tier 3.29 — present in all five endpoints above)
 
 Sixth external review, ranked backlog item #3. Every field documented
 above pools its cases as if each were an independent CANDIDATE — which
@@ -2205,11 +2325,12 @@ actually drove the split (News/Macro run on a slow cadence and get
 reused across many consecutive candidates while fresh), and whether the
 split holds across many TRADING DAYS or is one unusually active/
 volatile day dominating the pool. `threshold-crossing-deep-dive`,
-`news-urgent-decomposition`, `news-urgent-vs-calendar-blackout`, and
-(Tier 3.31) `risk-filter-veto-attribution` each gained this same
-additive key — nothing about their existing fields (`cross_tab`,
-`summary`, `by_attribution`, etc.) changed shape or meaning, so any
-prior consumer of these endpoints keeps working unmodified.
+`news-urgent-decomposition`, `news-urgent-vs-calendar-blackout`,
+(Tier 3.31) `risk-filter-veto-attribution`, and (Tier 3.34)
+`veto-decision-transitions` each gained this same additive key —
+nothing about their existing fields (`cross_tab`, `summary`,
+`by_attribution`, `transition_summary`, etc.) changed shape or meaning,
+so any prior consumer of these endpoints keeps working unmodified.
 
 ```json
 {
@@ -2240,10 +2361,11 @@ prior consumer of these endpoints keeps working unmodified.
 (Illustrative shape; not a production pull. The category field itself
 differs per endpoint — `side` for threshold-crossing-deep-dive,
 `attribution` for news-urgent-decomposition, `quadrant` for
-news-urgent-vs-calendar-blackout, and (Tier 3.31) `attribution` again
-for risk-filter-veto-attribution — same field name as news-urgent-
+news-urgent-vs-calendar-blackout, (Tier 3.31) `attribution` again for
+risk-filter-veto-attribution — same field name as news-urgent-
 decomposition by coincidence, but a completely different bucket set and
-a different opinion identity, see that endpoint's own section above.)
+a different opinion identity, see that endpoint's own section above —
+and (Tier 3.34) `transition` for veto-decision-transitions.)
 
 **`category_counts_opinion_weighted`** is the honest number to read
 first: each case is weighted `1 / (how many cases share its exact

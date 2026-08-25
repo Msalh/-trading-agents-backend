@@ -1203,6 +1203,65 @@ def test_risk_filter_veto_attribution_endpoint_empty_history(client):
     assert body["cases"] == []
 
 
+def test_veto_decision_transitions_endpoint_returns_shape(client):
+    import app.storage as storage
+
+    anchor = "2026-08-16T14:00:00Z"
+    bar = {
+        "event_id": "evt-vdt-1", "symbol": "MNQ1!", "timeframe": "5m", "timestamp": anchor,
+        "trading_date": "2026-08-16",
+    }
+    decision = {
+        "decision": "enter_long",
+        "direction": "bullish",
+        "score": 90.0,
+        "threshold": 25.0,
+        "opinions_used": {
+            "analysis": {"direction": "bullish", "confidence": 90, "timestamp": anchor, "flags": []},
+            "news": {"direction": "bullish", "confidence": 90, "timestamp": anchor, "flags": []},
+        },
+        "missing_agents": [],
+        "stale_agents": [],
+        "contributions": {},
+        "conflict_flags": [],
+        "timestamp": anchor,
+    }
+    storage.save_candidate(candidate_id="cand-vdt-1", symbol="MNQ1!", timeframe="5m", bar=bar, decision=decision)
+
+    r = client.get(
+        "/candidates/history/veto-decision-transitions",
+        params={"symbol": "MNQ1!", "timeframe": "5m"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["symbol"] == "MNQ1!"
+    assert body["candidates_considered"] == 1
+    assert body["analysis_directional_candidates"] == 1
+    assert body["transition_summary"] == {"coordinator_trade_veto_survives": 1}
+    assert body["flag_basis_by_transition"] == {"coordinator_trade_veto_survives": {"neither": 1}}
+    assert body["coordinator_skip_reason_by_transition"] == {}
+    case = body["cases"][0]
+    assert case["transition"] == "coordinator_trade_veto_survives"
+    assert case["trading_date"] == "2026-08-16"
+    olb = body["opinion_level_day_blocked"]
+    assert olb["candidate_level_totals"] == {"coordinator_trade_veto_survives": 1}
+
+
+def test_veto_decision_transitions_endpoint_empty_history(client):
+    r = client.get(
+        "/candidates/history/veto-decision-transitions",
+        params={"symbol": "NOSUCH", "timeframe": "5m"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["candidates_considered"] == 0
+    assert body["analysis_not_directional_excluded"] == 0
+    assert body["transition_summary"] == {}
+    assert body["flag_basis_by_transition"] == {}
+    assert body["coordinator_skip_reason_by_transition"] == {}
+    assert body["cases"] == []
+
+
 # ---------------------------------------------------------------------------
 # Tier 3.18: day/session reporting
 # ---------------------------------------------------------------------------

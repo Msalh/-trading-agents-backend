@@ -27,6 +27,7 @@ from app.coordinator_diagnostics import (
     compute_news_urgent_vs_calendar_blackout,
     compute_risk_filter_veto_attribution,
     compute_threshold_crossing_deep_dive,
+    compute_veto_decision_transitions,
 )
 
 _candidate_ids = itertools.count(1)
@@ -1330,4 +1331,142 @@ def test_veto_attribution_opinion_level_day_blocked_wiring():
     olb = result["opinion_level_day_blocked"]
     assert olb["candidate_level_totals"] == {"coordinator_agrees": 1}
     assert olb["opinion_weighted_totals"] == {"coordinator_agrees": 1.0}
+    assert olb["by_day"]["2026-08-16"]["distinct_opinions"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Tier 3.34: decision-level veto transitions (ninth external review)
+# ---------------------------------------------------------------------------
+
+def test_veto_transitions_excludes_non_directional_analysis():
+    c1 = _candidate(analysis=_opinion("neutral", 50))
+    c2 = _candidate()  # analysis missing entirely
+    result = compute_veto_decision_transitions([c1, c2])
+    assert result["candidates_considered"] == 2
+    assert result["analysis_not_directional_excluded"] == 2
+    assert result["analysis_directional_candidates"] == 0
+    assert result["transition_summary"] == {}
+    assert result["cases"] == []
+
+
+def test_veto_transitions_trade_would_be_vetoed():
+    # Real Coordinator traded (all three agree bullish, well above
+    # threshold) but News carries "urgent" -- the veto's true direct
+    # decision-level kill count.
+    candidate = _candidate(
+        analysis=_opinion("bullish", 90),
+        news=_flagged_opinion("bullish", 90, ["urgent"]),
+        macro=_opinion("bullish", 90),
+    )
+    result = compute_veto_decision_transitions([candidate])
+    assert result["transition_summary"] == {"coordinator_trade_veto_would_skip": 1}
+    assert result["flag_basis_by_transition"] == {
+        "coordinator_trade_veto_would_skip": {"news_urgent_only": 1},
+    }
+    case = result["cases"][0]
+    assert case["coordinator_decision"] == "enter_long"
+    assert case["news_urgent"] is True
+    assert case["flag_basis"] == "news_urgent_only"
+
+
+def test_veto_transitions_trade_survives_veto():
+    candidate = _candidate(
+        analysis=_opinion("bullish", 90), news=_opinion("bullish", 90), macro=_opinion("bullish", 90),
+    )
+    result = compute_veto_decision_transitions([candidate])
+    assert result["transition_summary"] == {"coordinator_trade_veto_survives": 1}
+    assert result["flag_basis_by_transition"] == {
+        "coordinator_trade_veto_survives": {"neither": 1},
+    }
+
+
+def test_veto_transitions_quorum_block_can_never_carry_a_veto_flag():
+    # Structural fact specific to the LIVE WEIGHTS/MIN_AVAILABLE_WEIGHT
+    # configuration (0.40/0.25/0.20/0.15, 60% floor): in this
+    # analysis-directional population, Analysis is always present, so
+    # insufficient_data can only occur when News AND Macro are BOTH
+    # absent (Analysis alone is 0.40/0.80=50% < 60%; adding either News
+    # alone -- 0.65/0.80=81% -- or Macro alone -- 0.55/0.80=69% -- already
+    # clears the floor). A veto flag requires the flagged agent to be
+    # PRESENT, so "coordinator_skip_veto_would_also_skip" can never carry
+    # an insufficient_data skip reason here -- only "no_trade" (see the
+    # test below). This is a live-config-dependent finding, not a
+    # universal guarantee like Tier 3.31's Timing zero-count proof -- it
+    # would need re-checking if WEIGHTS/MIN_AVAILABLE_WEIGHT ever change.
+    candidate = _candidate(analysis=_opinion("bullish", 80), min_available_weight=MIN_AVAILABLE_WEIGHT)
+    result = compute_veto_decision_transitions([candidate])
+    assert result["cases"][0]["coordinator_decision"] == "insufficient_data"
+    assert result["transition_summary"] == {"coordinator_skip_veto_irrelevant": 1}
+    assert result["flag_basis_by_transition"] == {"coordinator_skip_veto_irrelevant": {"neither": 1}}
+    assert result["coordinator_skip_reason_by_transition"] == {
+        "coordinator_skip_veto_irrelevant": {"insufficient_data": 1},
+    }
+
+
+def test_veto_transitions_skip_veto_would_also_skip_below_threshold_reason():
+    # Quorum is fine but the blended score doesn't cross threshold
+    # (no_trade) -- Macro also carries risk_off. Redundant veto, but a
+    # DIFFERENT skip reason than the quorum case above.
+    candidate = _candidate(analysis=_opinion("bullish", 20), macro=_flagged_opinion("neutral", 50, ["risk_off"]))
+    result = compute_veto_decision_transitions([candidate])
+    assert result["transition_summary"] == {"coordinator_skip_veto_would_also_skip": 1}
+    assert result["coordinator_skip_reason_by_transition"] == {
+        "coordinator_skip_veto_would_also_skip": {"no_trade": 1},
+    }
+
+
+def test_veto_transitions_skip_veto_irrelevant():
+    # Real Coordinator's score doesn't cross threshold, no veto flag
+    # present at all -- the veto plays no role here either way.
+    candidate = _candidate(analysis=_opinion("bullish", 20), news=_opinion("bullish", 20))
+    result = compute_veto_decision_transitions([candidate])
+    assert result["transition_summary"] == {"coordinator_skip_veto_irrelevant": 1}
+    assert result["coordinator_skip_reason_by_transition"] == {
+        "coordinator_skip_veto_irrelevant": {"no_trade": 1},
+    }
+
+
+def test_veto_transitions_both_flags_overlap_basis():
+    candidate = _candidate(
+        analysis=_opinion("bullish", 90),
+        news=_flagged_opinion("bullish", 90, ["urgent"]),
+        macro=_flagged_opinion("bullish", 90, ["risk_off"]),
+    )
+    result = compute_veto_decision_transitions([candidate])
+    assert result["transition_summary"] == {"coordinator_trade_veto_would_skip": 1}
+    assert result["flag_basis_by_transition"] == {
+        "coordinator_trade_veto_would_skip": {"both": 1},
+    }
+    case = result["cases"][0]
+    assert case["news_urgent"] is True
+    assert case["macro_risk_off"] is True
+    assert case["flag_basis"] == "both"
+
+
+def test_veto_transitions_same_population_as_risk_filter_veto_attribution():
+    # Same analysis-directional exclusion precondition -- built from the
+    # exact same candidate list, both endpoints must agree on how many
+    # candidates are in vs. excluded.
+    candidates = [
+        _candidate(analysis=_opinion("bullish", 90), news=_opinion("bullish", 90), macro=_opinion("bullish", 90)),
+        _candidate(analysis=_opinion("neutral", 50)),
+        _candidate(analysis=_opinion("bearish", 90), news=_flagged_opinion("bearish", 90, ["urgent"])),
+    ]
+    attribution = compute_risk_filter_veto_attribution(candidates)
+    transitions = compute_veto_decision_transitions(candidates)
+    assert transitions["candidates_considered"] == attribution["candidates_considered"]
+    assert transitions["analysis_not_directional_excluded"] == attribution["analysis_not_directional_excluded"]
+    assert transitions["analysis_directional_candidates"] == attribution["analysis_directional_candidates"]
+    assert sum(transitions["transition_summary"].values()) == transitions["analysis_directional_candidates"]
+
+
+def test_veto_transitions_opinion_level_day_blocked_wiring():
+    candidate = _candidate(
+        analysis=_opinion("bullish", 90), news=_opinion("bullish", 90), macro=_opinion("bullish", 90),
+    )
+    candidate["bar"] = {"timestamp": "2026-08-16T14:05:00Z", "trading_date": "2026-08-16"}
+    result = compute_veto_decision_transitions([candidate])
+    olb = result["opinion_level_day_blocked"]
+    assert olb["candidate_level_totals"] == {"coordinator_trade_veto_survives": 1}
+    assert olb["opinion_weighted_totals"] == {"coordinator_trade_veto_survives": 1.0}
     assert olb["by_day"]["2026-08-16"]["distinct_opinions"] == 1

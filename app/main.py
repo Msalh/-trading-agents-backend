@@ -1052,6 +1052,35 @@ them up automatically, no new endpoint. Entirely offline, no LLM
 calls, no candidate mutated, COORDINATOR_THRESHOLD/WEIGHTS/
 MIN_AVAILABLE_WEIGHT/AUTO_EXECUTE_ENABLED all untouched.
 
+Tier 3.34 (decision-level veto transitions, ninth external review,
+2026-08-25): the reviewer found that neither Tier 3.31 nor Tier 3.33
+directly answers "how many of the real Coordinator's own trade
+decisions would the urgent/risk_off veto have killed." Tier 3.31's
+veto buckets are checked before looking at what the real Coordinator
+decision actually was (never cross-tabulated against it); Tier 3.33's
+coordinator_veto_filtered trade-count delta against plain coordinator
+additionally mixes in non_overlapping's path-dependent scheduling
+(removing an early veto'd trade can free schedule capacity for a later
+candidate the original schedule skipped as overlapping), so neither
+number is a clean decision-level veto count. New
+app.coordinator_diagnostics.compute_veto_decision_transitions() and GET
+/candidates/history/veto-decision-transitions read only already-frozen
+candidate.decision fields — no replay, no barrier simulation, no
+non_overlapping scheduling — and report a direct 2x2 transition between
+the real historical Coordinator decision (traded vs. not) and the
+hypothetical post-hoc veto (would-skip vs. wouldn't), split explicitly
+by which flag was responsible (news_urgent_only/macro_risk_off_only/
+both/neither), on the SAME analysis-directional population Tier 3.31
+uses for direct candidate-for-candidate comparability. Also corrected a
+real mislabeling this same review caught: Tier 3.31's "10%" residual-
+bucket figure was described in an earlier ChatGPT package as "the
+veto's share of the gap" — it never was; it's the share of analysis_
+risk_filtered's extra trades attributable to something other than
+quorum-bypass, an entirely different quantity from this tier's veto
+kill-count. Entirely offline, no LLM calls, no candidate mutated,
+COORDINATOR_THRESHOLD/WEIGHTS/MIN_AVAILABLE_WEIGHT/analysis_risk_
+filtered's own veto scope all untouched.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -1121,6 +1150,7 @@ from app.coordinator_diagnostics import (
     compute_news_urgent_vs_calendar_blackout,
     compute_risk_filter_veto_attribution,
     compute_threshold_crossing_deep_dive,
+    compute_veto_decision_transitions,
 )
 from app.llm_telemetry import get_telemetry_health
 from app.paper_trades import (
@@ -2588,6 +2618,73 @@ def candidates_history_risk_filter_veto_attribution(
         "symbol": symbol,
         "timeframe": timeframe,
         **compute_risk_filter_veto_attribution(candidates),
+    }
+
+
+@app.get("/candidates/history/veto-decision-transitions")
+def candidates_history_veto_decision_transitions(
+    symbol: str = Query(...),
+    timeframe: str = Query(...),
+    limit: int = Query(default=300, le=1000),
+) -> dict:
+    """Tier 3.34 (ninth external review). Corrects a real gap the
+    reviewer found in how Package #9 compared Tier 3.31's and Tier
+    3.33's numbers: neither report directly counts "how many of the
+    real Coordinator's own trade decisions would the urgent/risk_off
+    veto have killed." Tier 3.31's `news_urgent_veto`/`macro_risk_off_
+    veto` buckets are checked BEFORE looking at what the real Coordinator
+    decision actually was, so those candidates were never cross-tabulated
+    against whether Coordinator traded them. Tier 3.33's `coordinator_
+    veto_filtered` trade-count delta against plain `coordinator` (e.g.
+    14 -> 5 in one production pull) additionally mixes in
+    `non_overlapping`'s path-dependent scheduling (removing an early
+    veto'd trade can free schedule capacity for a later candidate the
+    original schedule would have skipped as overlapping) — so that delta
+    isn't a clean decision-level veto count either.
+
+    This endpoint reads only already-frozen candidate.decision fields —
+    no replay, no barrier-backtest simulation, no non_overlapping
+    scheduling — and reports a direct 2x2 transition between the real
+    historical Coordinator decision (traded vs. not) and the
+    hypothetical post-hoc veto (would-skip vs. wouldn't), on the SAME
+    analysis-directional population `risk-filter-veto-attribution` (Tier
+    3.31) uses, for direct candidate-for-candidate comparability:
+
+    `transition_summary` reports exactly one of four labels per
+    candidate: `coordinator_trade_veto_would_skip` (the veto's true
+    direct decision-level kill count — real Coordinator traded, but a
+    veto flag was present), `coordinator_trade_veto_survives` (real
+    Coordinator traded, no veto flag — what `coordinator_veto_filtered`'s
+    decision-level trade count should equal before any barrier-sim/
+    non_overlapping path effects reshape it), `coordinator_skip_veto_
+    would_also_skip` (Coordinator already skipped for its own reason AND
+    a veto flag was also present — redundant, changed nothing), or
+    `coordinator_skip_veto_irrelevant` (Coordinator skipped, no veto flag
+    present either).
+
+    `flag_basis_by_transition` splits each transition by which flag(s)
+    were responsible (`news_urgent_only` / `macro_risk_off_only` /
+    `both` / `neither`) — the explicit urgent-vs-risk_off-vs-overlap
+    visibility the reviewer asked for, at the transition level.
+    `coordinator_skip_reason_by_transition` further splits the two
+    non-trade transitions by the real historical reason (`no_trade` vs
+    `insufficient_data`), since a redundant veto means something
+    different depending on why Coordinator was already skipping.
+
+    `analysis_not_directional_excluded` counts candidates excluded
+    before any transition (Analysis itself missing/neutral — matches
+    `risk-filter-veto-attribution`'s own exclusion exactly, since both
+    endpoints share the same precondition). `opinion_level_day_blocked`
+    (same shared aggregator as the rest of this diagnostic family)
+    re-tabulates by Analysis's own opinion identity, day-blocked.
+
+    Entirely offline. COORDINATOR_THRESHOLD/WEIGHTS/MIN_AVAILABLE_WEIGHT/
+    analysis_risk_filtered's own veto scope are all untouched."""
+    candidates = get_candidate_history(symbol=symbol, timeframe=timeframe, limit=limit)
+    return {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        **compute_veto_decision_transitions(candidates),
     }
 
 

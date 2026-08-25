@@ -1311,6 +1311,204 @@ def compute_risk_filter_veto_attribution(candidates: list[dict]) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Decision-level veto transitions — Tier 3.34 (ninth external review)
+# ---------------------------------------------------------------------------
+#
+# The reviewer's core correction to Package #9: Tier 3.33's
+# "coordinator_veto_filtered" trade-count delta against plain
+# "coordinator" (e.g. 14 -> 5 in one production pull) is NOT a clean
+# decision-level count of "how many real trades did the veto kill." Two
+# separate problems, both real:
+#
+#   1. app.backtest.run_barrier_backtest applies `non_overlapping`
+#      scheduling INDEPENDENTLY per source (each source walks its own
+#      resolved-direction candidates and skips one whose anchor falls
+#      before its own previous simulated trade resolved, mirroring the
+#      live MAX_OPEN_POSITIONS=1 constraint). Removing an early veto'd
+#      trade can free schedule capacity for a LATER candidate the
+#      original (un-vetoed) schedule would have skipped as overlapping
+#      — so a raw trades_taken delta conflates the veto's direct,
+#      per-decision effect with this portfolio-level, path-dependent
+#      rescheduling effect. Tier 3.33's backtest-lite numbers remain
+#      valid for what they actually measure — realized P&L under each
+#      policy's own trade schedule — just not for "how many decisions
+#      did the veto attribute to itself" claims.
+#   2. Tier 3.31's own "10%" figure (`news_macro_opposition_block`, now
+#      `coordinator_score_below_threshold_other`) was separately
+#      mislabeled in Package #9 as "the veto's share of the gap" — it
+#      never was. It's the share of analysis_risk_filtered's EXTRA
+#      trades (beyond what the real Coordinator did) attributable to
+#      something other than quorum-bypass; Tier 3.31's bucket priority
+#      order sends every news_urgent_veto/macro_risk_off_veto candidate
+#      straight to its own bucket BEFORE checking what the real
+#      Coordinator decision actually was, so those 239+64 veto-bucketed
+#      candidates were never cross-tabulated against whether Coordinator
+#      traded them or not. That cross-tabulation is exactly this
+#      diagnostic's job.
+#
+# compute_veto_decision_transitions() answers the reviewer's literal
+# request directly: for the SAME analysis-directional population Tier
+# 3.31 used (so the two reports are comparable candidate-for-candidate,
+# not just headline-number-for-headline-number), a plain 2x2 transition
+# between the real historical Coordinator decision (traded vs. not) and
+# the hypothetical post-hoc urgent/risk_off veto (would-skip vs.
+# wouldn't) — reading only already-frozen candidate.decision fields, no
+# replay, no barrier simulation, no non_overlapping scheduling:
+#
+#   coordinator_trade_veto_would_skip    -- real Coordinator traded, but
+#                                            News urgent or Macro risk_off
+#                                            was present -- the veto's
+#                                            true direct decision-level
+#                                            kill count
+#   coordinator_trade_veto_survives      -- real Coordinator traded, no
+#                                            veto flag present -- what
+#                                            coordinator_veto_filtered's
+#                                            decision-level trade count
+#                                            should equal (before any
+#                                            barrier-sim/non_overlapping
+#                                            path effects reshape it)
+#   coordinator_skip_veto_would_also_skip -- real Coordinator did NOT
+#                                            trade (no_trade or
+#                                            insufficient_data) AND a
+#                                            veto flag was ALSO present
+#                                            -- the veto was redundant
+#                                            here, changed nothing
+#   coordinator_skip_veto_irrelevant     -- real Coordinator did NOT
+#                                            trade and no veto flag was
+#                                            present either -- the veto
+#                                            plays no role in this case
+#
+# `flag_basis_by_transition` splits each transition by which flag(s)
+# were actually responsible (`news_urgent_only` / `macro_risk_off_only`
+# / `both` / `neither`), giving the explicit urgent-vs-risk_off-vs-
+# overlap visibility the reviewer asked for, at the transition level
+# rather than folded into one priority-ordered bucket.
+# `coordinator_skip_reason_by_transition` further splits the two
+# "Coordinator did not trade" transitions by the real historical reason
+# (`no_trade` vs `insufficient_data`), since "the veto was redundant"
+# means something different depending on whether Coordinator was already
+# going to skip for a quorum reason vs. a below-threshold-score reason.
+#
+# Structural note specific to the LIVE WEIGHTS/MIN_AVAILABLE_WEIGHT
+# configuration (0.40/0.25/0.20/0.15, 60% floor) — NOT a universal
+# guarantee the way Tier 3.31's Timing zero-count proof is, and would
+# need re-checking if those constants ever change: in this
+# analysis-directional population Analysis is always present, so
+# `insufficient_data` can only occur when News AND Macro are BOTH
+# absent (Analysis alone is 0.40/0.80=50% < 60%; adding either agent
+# alone already clears the floor — 0.65/0.80=81% with News, 0.55/0.80=
+# 69% with Macro). A veto flag requires its agent to be PRESENT, so
+# `coordinator_skip_veto_would_also_skip` can never carry an
+# `insufficient_data` reason today — only `no_trade`. See the test
+# suite for the explicit proof this doesn't silently happen.
+#
+# Entirely offline: reads already-stored candidate.decision fields only,
+# no replay, no LLM calls, no candidate mutated, no barrier-backtest
+# simulation involved at all. COORDINATOR_THRESHOLD/WEIGHTS/
+# MIN_AVAILABLE_WEIGHT/analysis_risk_filtered's own veto scope all
+# untouched.
+
+
+def compute_veto_decision_transitions(candidates: list[dict]) -> dict:
+    """See the Tier 3.34 module comment above. Same analysis-directional
+    population scope as compute_risk_filter_veto_attribution (Tier
+    3.31), for direct candidate-for-candidate comparability. Returns
+    candidates_considered, the analysis_not_directional exclusion count,
+    `transition_summary` (the 2x2 transition -> count), `flag_basis_by_
+    transition` (transition -> {news_urgent_only/macro_risk_off_only/
+    both/neither -> count}), `coordinator_skip_reason_by_transition`
+    (the two non-trade transitions split by no_trade vs
+    insufficient_data), the full per-candidate `cases` list, and
+    `opinion_level_day_blocked` (Analysis-opinion identity, day-blocked,
+    same convention as Tier 3.31's own report)."""
+    cases = []
+    excluded_not_directional = 0
+
+    for candidate in candidates:
+        decision = candidate.get("decision") or {}
+        opinions_used = decision.get("opinions_used") or {}
+        analysis_opinion = opinions_used.get("analysis")
+        analysis_direction = (analysis_opinion or {}).get("direction")
+        if not analysis_opinion or analysis_direction not in ("bullish", "bearish"):
+            excluded_not_directional += 1
+            continue
+
+        news_opinion = opinions_used.get("news")
+        macro_opinion = opinions_used.get("macro")
+        news_urgent = bool(
+            news_opinion and _RISK_FILTER_NEWS_VETO_FLAGS & set(news_opinion.get("flags") or [])
+        )
+        macro_risk_off = bool(
+            macro_opinion and _RISK_FILTER_MACRO_VETO_FLAGS & set(macro_opinion.get("flags") or [])
+        )
+        veto_would_apply = news_urgent or macro_risk_off
+        if news_urgent and macro_risk_off:
+            flag_basis = "both"
+        elif news_urgent:
+            flag_basis = "news_urgent_only"
+        elif macro_risk_off:
+            flag_basis = "macro_risk_off_only"
+        else:
+            flag_basis = "neither"
+
+        coordinator_decision = decision.get("decision")
+        coordinator_traded = coordinator_decision in _DIRECTIONAL_DECISIONS
+
+        if coordinator_traded and veto_would_apply:
+            transition = "coordinator_trade_veto_would_skip"
+        elif coordinator_traded and not veto_would_apply:
+            transition = "coordinator_trade_veto_survives"
+        elif not coordinator_traded and veto_would_apply:
+            transition = "coordinator_skip_veto_would_also_skip"
+        else:
+            transition = "coordinator_skip_veto_irrelevant"
+
+        cases.append({
+            "candidate_id": candidate.get("candidate_id"),
+            "bar_timestamp": (candidate.get("bar") or {}).get("timestamp"),
+            "trading_date": (candidate.get("bar") or {}).get("trading_date"),
+            "analysis_opinion_timestamp": analysis_opinion.get("timestamp"),
+            "analysis_direction": analysis_direction,
+            "coordinator_decision": coordinator_decision,
+            "news_urgent": news_urgent,
+            "macro_risk_off": macro_risk_off,
+            "flag_basis": flag_basis,
+            "transition": transition,
+        })
+
+    transition_summary: dict[str, int] = {}
+    flag_basis_by_transition: dict[str, dict[str, int]] = {}
+    coordinator_skip_reason_by_transition: dict[str, dict[str, int]] = {}
+    for case in cases:
+        t = case["transition"]
+        transition_summary[t] = transition_summary.get(t, 0) + 1
+
+        fb = case["flag_basis"]
+        flag_basis_by_transition.setdefault(t, {})
+        flag_basis_by_transition[t][fb] = flag_basis_by_transition[t].get(fb, 0) + 1
+
+        if t in ("coordinator_skip_veto_would_also_skip", "coordinator_skip_veto_irrelevant"):
+            reason = case["coordinator_decision"]  # "no_trade" or "insufficient_data"
+            coordinator_skip_reason_by_transition.setdefault(t, {})
+            coordinator_skip_reason_by_transition[t][reason] = (
+                coordinator_skip_reason_by_transition[t].get(reason, 0) + 1
+            )
+
+    return {
+        "candidates_considered": len(candidates),
+        "analysis_not_directional_excluded": excluded_not_directional,
+        "analysis_directional_candidates": len(cases),
+        "transition_summary": transition_summary,
+        "flag_basis_by_transition": flag_basis_by_transition,
+        "coordinator_skip_reason_by_transition": coordinator_skip_reason_by_transition,
+        "cases": cases,
+        "opinion_level_day_blocked": _opinion_level_day_blocked_summary(
+            cases, category_field="transition", opinion_field="analysis_opinion_timestamp", day_field="trading_date",
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Opinion-level, day-blocked re-aggregation — Tier 3.29
 # ---------------------------------------------------------------------------
 #
