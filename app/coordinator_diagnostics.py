@@ -183,7 +183,8 @@ Read-only, offline, no LLM calls, no new candidates or trades — same
 guarantee as the rest of this module and app/replay.py.
 """
 
-from app.coordinator import DIRECTIONAL_AGENTS, WEIGHTS
+from app.backtest import _RISK_FILTER_MACRO_VETO_FLAGS, _RISK_FILTER_NEWS_VETO_FLAGS
+from app.coordinator import DIRECTIONAL_AGENTS, WEIGHTS, _TIMING_DAMPEN_FLAG, _TIMING_VETO_FLAG
 from app.economic_calendar import events_overlapping_range, is_within_blackout_window
 from app.outcomes import HORIZON_MINUTES_DEFAULT, compute_outcome_for_candidate
 from app.replay import replay_candidate
@@ -1047,6 +1048,173 @@ def compute_news_urgent_vs_calendar_blackout(
         "cases": cases,
         "opinion_level_day_blocked": _opinion_level_day_blocked_summary(
             cases, category_field="quadrant", opinion_field="news_opinion_timestamp", day_field="trading_date",
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Risk-filter veto attribution — Tier 3.31
+# ---------------------------------------------------------------------------
+#
+# Seventh external review, reacting to Tier 3.30's analysis_risk_filtered
+# backtest source: that source bundles FOUR changes into one policy at
+# once — removing News from the directional vote, removing Macro from the
+# directional vote, removing the MIN_AVAILABLE_WEIGHT quorum gate, and
+# removing Timing's session/liquidity gating entirely (app/backtest.py's
+# _direction_for_source("analysis_risk_filtered", ...) never even reads
+# Timing) — so a trade-count difference against the live Coordinator can't
+# yet be attributed specifically to "News/Macro became risk filters." This
+# diagnostic separates the four out with real numbers, reusing the exact
+# gating logic already computed and FROZEN on every stored candidate
+# (Tier 2.1's opinions_used/conflict_flags snapshot) rather than a new
+# replay — the real historical Coordinator decision already encodes
+# whether Timing vetoed/dampened it (app.coordinator._score_opinions'
+# "timing_market_closed"/"timing_low_liquidity_dampened" conflict_flags,
+# set deterministically from Timing's own flags — see app/timing_agent.py)
+# and whether the quorum gate fired (decision == "insufficient_data" is
+# only possible in this function's subpopulation, where Analysis is
+# already confirmed present and directional, when News AND Macro are BOTH
+# missing/stale: Analysis alone is 0.40/0.80 = 50% of DIRECTIONAL_AGENTS'
+# combined weight, below MIN_AVAILABLE_WEIGHT's live 60% floor either way
+# — analysis_required is trivially satisfied by this function's own
+# precondition, so it can't be the cause of an insufficient_data case
+# here).
+#
+# For every candidate with a directional (bullish/bearish) Analysis
+# opinion, each case is attributed to exactly one bucket, in the same
+# priority order app.backtest._direction_for_source checks them:
+#
+#   analysis_not_directional   -- Analysis missing/neutral (excluded from
+#                                  every bucket below; both policies skip
+#                                  these identically, not attributable to
+#                                  any veto)
+#   news_urgent_veto           -- News present with the "urgent" flag
+#                                  (_RISK_FILTER_NEWS_VETO_FLAGS) --
+#                                  analysis_risk_filtered skips this
+#   macro_risk_off_veto        -- Macro present with the "risk_off" flag
+#                                  (_RISK_FILTER_MACRO_VETO_FLAGS), News
+#                                  didn't already veto -- analysis_risk_
+#                                  filtered skips this
+#   coordinator_agrees         -- neither veto fires (analysis_risk_
+#                                  filtered WOULD trade this candidate's
+#                                  Analysis direction) AND the real
+#                                  Coordinator also traded the same
+#                                  direction -- no blocking difference
+#   coordinator_opposite_direction -- neither veto fires, but the real
+#                                  Coordinator traded the OPPOSITE
+#                                  direction (structurally rare/unproven
+#                                  absent under live weights per Tier
+#                                  3.21's direction_flipped proof, but not
+#                                  assumed impossible here)
+#   coordinator_quorum_block   -- neither veto fires, Coordinator's real
+#                                  decision was insufficient_data (News
+#                                  AND Macro both missing/stale)
+#   timing_market_closed_block -- neither veto fires, quorum was fine,
+#                                  but Timing's own market_closed flag
+#                                  forced the real Coordinator's score to
+#                                  zero
+#   timing_low_liquidity_block -- neither veto fires, quorum was fine, no
+#                                  market_closed veto, but Timing's own
+#                                  low_liquidity flag halved the real
+#                                  Coordinator's score enough to keep it
+#                                  under threshold
+#   news_macro_opposition_block -- neither veto fires, quorum was fine, no
+#                                  Timing flag applied at all -- the real
+#                                  Coordinator's blended score simply
+#                                  didn't cross +-threshold, i.e. genuine
+#                                  News/Macro directional
+#                                  disagreement/renormalization, not a
+#                                  gating mechanic
+#
+# This is NOT wired into _opinion_level_day_blocked_summary using News or
+# Macro's own opinion identity, unlike the three Tier 3.26-3.28
+# diagnostics above -- this diagnostic's subject is the CANDIDATE-level
+# comparison between two whole policies, not one reused agent's opinion,
+# so Analysis's own opinion_timestamp (the one field every case here is
+# guaranteed to have, by construction) is the correct identity to weight
+# by instead.
+#
+# Entirely offline: reads already-stored candidate.decision fields only,
+# no replay, no LLM calls, no candidate mutated. COORDINATOR_THRESHOLD/
+# WEIGHTS/analysis_risk_filtered's own veto scope are all untouched.
+
+
+def compute_risk_filter_veto_attribution(candidates: list[dict]) -> dict:
+    """See the Tier 3.31 module comment above for the full bucket
+    definitions and reasoning. Returns candidates_considered, the
+    analysis_not_directional exclusion count, and — for the remaining
+    analysis-directional subpopulation — a `summary` dict of bucket ->
+    count, the full per-candidate `cases` list, and `opinion_level_
+    day_blocked` (Analysis-opinion identity, day-blocked)."""
+    cases = []
+    excluded_not_directional = 0
+
+    for candidate in candidates:
+        decision = candidate.get("decision") or {}
+        opinions_used = decision.get("opinions_used") or {}
+        analysis_opinion = opinions_used.get("analysis")
+        analysis_direction = (analysis_opinion or {}).get("direction")
+        if not analysis_opinion or analysis_direction not in ("bullish", "bearish"):
+            excluded_not_directional += 1
+            continue
+
+        news_opinion = opinions_used.get("news")
+        macro_opinion = opinions_used.get("macro")
+        news_urgent = bool(
+            news_opinion and _RISK_FILTER_NEWS_VETO_FLAGS & set(news_opinion.get("flags") or [])
+        )
+        macro_risk_off = bool(
+            macro_opinion and _RISK_FILTER_MACRO_VETO_FLAGS & set(macro_opinion.get("flags") or [])
+        )
+
+        coordinator_decision = decision.get("decision")
+        coordinator_direction = decision.get("direction")
+        conflict_flags = decision.get("conflict_flags") or []
+
+        if news_urgent:
+            attribution = "news_urgent_veto"
+        elif macro_risk_off:
+            attribution = "macro_risk_off_veto"
+        elif coordinator_decision in _DIRECTIONAL_DECISIONS:
+            attribution = (
+                "coordinator_agrees"
+                if coordinator_direction == analysis_direction
+                else "coordinator_opposite_direction"
+            )
+        elif coordinator_decision == "insufficient_data":
+            attribution = "coordinator_quorum_block"
+        elif _TIMING_VETO_FLAG == "market_closed" and "timing_market_closed" in conflict_flags:
+            attribution = "timing_market_closed_block"
+        elif _TIMING_DAMPEN_FLAG == "low_liquidity" and "timing_low_liquidity_dampened" in conflict_flags:
+            attribution = "timing_low_liquidity_block"
+        else:
+            attribution = "news_macro_opposition_block"
+
+        cases.append({
+            "candidate_id": candidate.get("candidate_id"),
+            "bar_timestamp": (candidate.get("bar") or {}).get("timestamp"),
+            "trading_date": (candidate.get("bar") or {}).get("trading_date"),
+            "analysis_opinion_timestamp": analysis_opinion.get("timestamp"),
+            "analysis_direction": analysis_direction,
+            "coordinator_decision": coordinator_decision,
+            "coordinator_direction": coordinator_direction,
+            "news_urgent": news_urgent,
+            "macro_risk_off": macro_risk_off,
+            "attribution": attribution,
+        })
+
+    summary: dict[str, int] = {}
+    for case in cases:
+        summary[case["attribution"]] = summary.get(case["attribution"], 0) + 1
+
+    return {
+        "candidates_considered": len(candidates),
+        "analysis_not_directional_excluded": excluded_not_directional,
+        "analysis_directional_candidates": len(cases),
+        "summary": summary,
+        "cases": cases,
+        "opinion_level_day_blocked": _opinion_level_day_blocked_summary(
+            cases, category_field="attribution", opinion_field="analysis_opinion_timestamp", day_field="trading_date",
         ),
     }
 

@@ -1454,7 +1454,7 @@ output in any way.
 
 ---
 
-## Coordinator/Analysis divergence + ablation (Tier 3.16, corrected Tier 3.17, reclassified Tier 3.21, threshold-crossing deep dive added Tier 3.26, News urgent-vs-directional decomposition added Tier 3.27, News urgent vs. calendar blackout added Tier 3.28, opinion-level/day-blocked re-aggregation added to all three Tier 3.29)
+## Coordinator/Analysis divergence + ablation (Tier 3.16, corrected Tier 3.17, reclassified Tier 3.21, threshold-crossing deep dive added Tier 3.26, News urgent-vs-directional decomposition added Tier 3.27, News urgent vs. calendar blackout added Tier 3.28, opinion-level/day-blocked re-aggregation added to all three Tier 3.29, risk-filter veto attribution added Tier 3.31)
 
 Every backtest-lite/paired/grid result since Tier 3.10 has shown
 Coordinator's own blended decision performing at or below Analysis
@@ -2001,7 +2001,106 @@ project already does.
 
 ---
 
-### `opinion_level_day_blocked` (Tier 3.29 — present in all three endpoints above)
+### `GET /candidates/history/risk-filter-veto-attribution?symbol=MNQ1!&timeframe=5m&limit=300`
+
+Tier 3.31 (seventh external review). `app/backtest.py`'s
+`"analysis_risk_filtered"` direction source (Tier 3.30) bundles FOUR
+changes into one policy at once — removing News from the directional
+vote, removing Macro from the directional vote, removing the
+Coordinator's `MIN_AVAILABLE_WEIGHT` quorum gate, and removing Timing's
+session/liquidity gating entirely (that source never reads Timing at
+all) — so a trade-count difference against the live Coordinator can't
+yet be attributed specifically to "News/Macro became risk filters."
+This endpoint separates the four out with real numbers, reusing the
+exact gating logic already frozen on every stored candidate (Tier 2.1's
+`opinions_used`/`conflict_flags` snapshot — the real historical
+Coordinator decision already encodes whether Timing vetoed/dampened it)
+rather than any new replay.
+
+For every candidate with a directional (bullish/bearish) Analysis
+opinion, `summary` reports exactly one bucket per candidate:
+
+- `news_urgent_veto` / `macro_risk_off_veto` — `analysis_risk_filtered`
+  itself would skip this candidate (News's `"urgent"` flag or Macro's
+  `"risk_off"` flag, checked in that priority order, matching
+  `app.backtest._direction_for_source`'s own checks).
+- `coordinator_agrees` — neither veto fires, and the real Coordinator
+  traded the same direction — no blocking difference at all.
+- `coordinator_opposite_direction` — neither veto fires, but the real
+  Coordinator traded the OPPOSITE direction (structurally rare/unproven
+  under live weights per Tier 3.21's `direction_flipped` proof, but not
+  assumed impossible here).
+- `coordinator_quorum_block` — neither veto fires, but the real
+  Coordinator's decision was `insufficient_data`. In this endpoint's
+  subpopulation (Analysis already confirmed present and directional)
+  this can only mean News AND Macro were BOTH missing/stale — Analysis
+  alone is 0.40/0.80 = 50% of `DIRECTIONAL_AGENTS`' combined weight,
+  below the live 60% `MIN_AVAILABLE_WEIGHT` floor either way.
+- `timing_market_closed_block` / `timing_low_liquidity_block` — neither
+  veto fires, quorum was fine, but Timing's own flags forced the real
+  Coordinator's score to zero or halved it below threshold
+  (`app.coordinator._score_opinions`' `"timing_market_closed"`/
+  `"timing_low_liquidity_dampened"` `conflict_flags`, set
+  deterministically from Timing's own `market_closed`/`low_liquidity`
+  flags — see `app/timing_agent.py`).
+- `news_macro_opposition_block` — neither veto fires, quorum was fine,
+  no Timing flag applied at all — the real Coordinator's blended score
+  simply didn't cross ±threshold, i.e. genuine News/Macro directional
+  disagreement or renormalization, not a gating mechanic.
+
+`analysis_not_directional_excluded` counts candidates excluded before
+any bucket (Analysis itself missing or neutral) — both policies skip
+these identically, so they're not attributable to any veto or gate.
+
+```json
+{
+  "symbol": "MNQ1!",
+  "timeframe": "5m",
+  "candidates_considered": 300,
+  "analysis_not_directional_excluded": 120,
+  "analysis_directional_candidates": 180,
+  "summary": {
+    "coordinator_agrees": 90,
+    "coordinator_quorum_block": 40,
+    "news_urgent_veto": 25,
+    "timing_low_liquidity_block": 15,
+    "macro_risk_off_veto": 6,
+    "news_macro_opposition_block": 3,
+    "timing_market_closed_block": 1
+  },
+  "cases": [
+    {
+      "candidate_id": "abc123",
+      "bar_timestamp": "2026-08-16T14:00:00Z",
+      "trading_date": "2026-08-16",
+      "analysis_opinion_timestamp": "2026-08-16T14:00:00Z",
+      "analysis_direction": "bullish",
+      "coordinator_decision": "enter_long",
+      "coordinator_direction": "bullish",
+      "news_urgent": false,
+      "macro_risk_off": false,
+      "attribution": "coordinator_agrees"
+    }
+  ],
+  "opinion_level_day_blocked": { "...": "see below" }
+}
+```
+
+(Illustrative shape; not a production pull.) `opinion_level_day_blocked`
+here uses the same shared aggregator as the other diagnostics in this
+family (see below), but keyed on Analysis's own `opinion_timestamp`
+rather than News/Macro's — this endpoint's subject is a whole-policy
+comparison per candidate, not one reused News/Macro opinion, so
+Analysis's opinion identity (the one field every case here is
+guaranteed to have) is the correct one to weight by.
+
+Entirely offline (no LLM calls, no candidate mutated,
+`COORDINATOR_THRESHOLD`/`WEIGHTS`/`analysis_risk_filtered`'s own veto
+scope all untouched).
+
+---
+
+### `opinion_level_day_blocked` (Tier 3.29 — present in all four endpoints above)
 
 Sixth external review, ranked backlog item #3. Every field documented
 above pools its cases as if each were an independent CANDIDATE — which
@@ -2010,11 +2109,11 @@ actually drove the split (News/Macro run on a slow cadence and get
 reused across many consecutive candidates while fresh), and whether the
 split holds across many TRADING DAYS or is one unusually active/
 volatile day dominating the pool. `threshold-crossing-deep-dive`,
-`news-urgent-decomposition`, and `news-urgent-vs-calendar-blackout` each
-gained this same additive key — nothing about their existing fields
-(`cross_tab`, `summary`, `by_attribution`, etc.) changed shape or
-meaning, so any prior consumer of these three endpoints keeps working
-unmodified.
+`news-urgent-decomposition`, `news-urgent-vs-calendar-blackout`, and
+(Tier 3.31) `risk-filter-veto-attribution` each gained this same
+additive key — nothing about their existing fields (`cross_tab`,
+`summary`, `by_attribution`, etc.) changed shape or meaning, so any
+prior consumer of these endpoints keeps working unmodified.
 
 ```json
 {
@@ -2045,7 +2144,10 @@ unmodified.
 (Illustrative shape; not a production pull. The category field itself
 differs per endpoint — `side` for threshold-crossing-deep-dive,
 `attribution` for news-urgent-decomposition, `quadrant` for
-news-urgent-vs-calendar-blackout.)
+news-urgent-vs-calendar-blackout, and (Tier 3.31) `attribution` again
+for risk-filter-veto-attribution — same field name as news-urgent-
+decomposition by coincidence, but a completely different bucket set and
+a different opinion identity, see that endpoint's own section above.)
 
 **`category_counts_opinion_weighted`** is the honest number to read
 first: each case is weighted `1 / (how many cases share its exact

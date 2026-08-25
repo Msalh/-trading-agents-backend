@@ -25,6 +25,7 @@ from app.coordinator_diagnostics import (
     compute_news_urgent_decomposition,
     compute_news_urgent_prevalence,
     compute_news_urgent_vs_calendar_blackout,
+    compute_risk_filter_veto_attribution,
     compute_threshold_crossing_deep_dive,
 )
 
@@ -1141,3 +1142,149 @@ def test_calendar_blackout_opinion_level_day_blocked_wiring():
     assert olb["candidate_level_totals"] == {"both_flagged": 1}
     assert olb["opinion_weighted_totals"] == {"both_flagged": 1.0}
     assert olb["by_day"]["2026-08-12"]["candidates_considered"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Tier 3.31: risk-filter veto attribution
+# ---------------------------------------------------------------------------
+
+def test_veto_attribution_excludes_non_directional_analysis():
+    c1 = _candidate(analysis=_opinion("neutral", 50))
+    c2 = _candidate()  # analysis missing entirely
+    result = compute_risk_filter_veto_attribution([c1, c2])
+    assert result["candidates_considered"] == 2
+    assert result["analysis_not_directional_excluded"] == 2
+    assert result["analysis_directional_candidates"] == 0
+    assert result["summary"] == {}
+    assert result["cases"] == []
+
+
+def test_veto_attribution_news_urgent_veto_takes_priority():
+    # Analysis and News agree bullish (would otherwise be
+    # coordinator_agrees) but News is flagged urgent -- analysis_risk_
+    # filtered vetoes regardless of what the real Coordinator decided.
+    candidate = _candidate(
+        analysis=_opinion("bullish", 90),
+        news=_flagged_opinion("bullish", 90, ["urgent"]),
+        macro=_opinion("bullish", 90),
+    )
+    result = compute_risk_filter_veto_attribution([candidate])
+    assert result["summary"] == {"news_urgent_veto": 1}
+    assert result["cases"][0]["news_urgent"] is True
+    assert result["cases"][0]["macro_risk_off"] is False
+
+
+def test_veto_attribution_macro_risk_off_veto():
+    candidate = _candidate(
+        analysis=_opinion("bearish", 90),
+        news=_opinion("bearish", 90),
+        macro=_flagged_opinion("bearish", 90, ["risk_off"]),
+    )
+    result = compute_risk_filter_veto_attribution([candidate])
+    assert result["summary"] == {"macro_risk_off_veto": 1}
+
+
+def test_veto_attribution_macro_other_flags_do_not_veto():
+    # conflicting_signals/stale_data are quality flags, not risk vetoes
+    # -- must NOT trigger macro_risk_off_veto (Tier 3.30's scoped design).
+    candidate = _candidate(
+        analysis=_opinion("bullish", 90),
+        news=_opinion("bullish", 90),
+        macro=_flagged_opinion("bullish", 90, ["conflicting_signals"]),
+    )
+    result = compute_risk_filter_veto_attribution([candidate])
+    assert result["summary"] == {"coordinator_agrees": 1}
+
+
+def test_veto_attribution_coordinator_agrees():
+    candidate = _candidate(
+        analysis=_opinion("bullish", 90),
+        news=_opinion("bullish", 90),
+        macro=_opinion("bullish", 90),
+    )
+    result = compute_risk_filter_veto_attribution([candidate])
+    assert result["summary"] == {"coordinator_agrees": 1}
+    case = result["cases"][0]
+    assert case["analysis_direction"] == "bullish"
+    assert case["coordinator_direction"] == "bullish"
+
+
+def test_veto_attribution_coordinator_opposite_direction():
+    # Analysis leans bearish but only mildly confident; News/Macro
+    # strongly bullish outweigh it -- same setup as
+    # test_opposite_direction_category above, score=27.5 -> enter_long
+    # while Analysis itself is bearish.
+    candidate = _candidate(
+        analysis=_opinion("bearish", 40),
+        news=_opinion("bullish", 95),
+        macro=_opinion("bullish", 95),
+    )
+    result = compute_risk_filter_veto_attribution([candidate])
+    assert result["summary"] == {"coordinator_opposite_direction": 1}
+
+
+def test_veto_attribution_coordinator_quorum_block():
+    # Analysis present alone (0.4/0.8 = 50% of directional weight) --
+    # below the live MIN_AVAILABLE_WEIGHT (60%) -- real Coordinator
+    # decision is insufficient_data, News/Macro both missing.
+    candidate = _candidate(
+        analysis=_opinion("bullish", 80),
+        min_available_weight=MIN_AVAILABLE_WEIGHT,
+    )
+    result = compute_risk_filter_veto_attribution([candidate])
+    assert result["summary"] == {"coordinator_quorum_block": 1}
+    assert result["cases"][0]["coordinator_decision"] == "insufficient_data"
+
+
+def _timing_candidate(analysis, news, timing_flags, min_available_weight=0.0):
+    opinions = {"analysis": analysis, "news": news}
+    opinions["timing"] = {
+        "direction": "neutral", "confidence": 50, "timestamp": "2026-08-16T14:00:00Z",
+        "key_data": {"session_label": "new_york"}, "flags": timing_flags,
+    }
+    decision = _score_opinions(
+        symbol="TEST", timeframe="5m", opinions=opinions, missing_agents=[], stale_agents=[],
+        weights=WEIGHTS, threshold=25.0, min_available_weight=min_available_weight,
+    )
+    return {"candidate_id": f"test-candidate-{next(_candidate_ids)}", "symbol": "TEST", "timeframe": "5m",
+            "decision": decision.to_dict()}
+
+
+def test_veto_attribution_timing_market_closed_block():
+    # Quorum is fine (analysis+news = 0.65/0.8 = 81.25%), but Timing's
+    # market_closed flag forces the real Coordinator's score to zero.
+    candidate = _timing_candidate(_opinion("bullish", 90), _opinion("bullish", 90), ["market_closed"])
+    result = compute_risk_filter_veto_attribution([candidate])
+    assert result["summary"] == {"timing_market_closed_block": 1}
+    assert result["cases"][0]["coordinator_decision"] == "no_trade"
+
+
+def test_veto_attribution_timing_low_liquidity_block():
+    # weighted_sum = 0.4*30 + 0.25*30 = 19.5, available_weight=0.65,
+    # undampened score=30.0 (> threshold 25 -- would enter_long), but
+    # Timing's low_liquidity flag halves it to 15.0 (< threshold).
+    candidate = _timing_candidate(_opinion("bullish", 30), _opinion("bullish", 30), ["low_liquidity"])
+    result = compute_risk_filter_veto_attribution([candidate])
+    assert result["summary"] == {"timing_low_liquidity_block": 1}
+    assert result["cases"][0]["coordinator_decision"] == "no_trade"
+
+
+def test_veto_attribution_news_macro_opposition_block():
+    # Quorum fine, no Timing flags at all, but News's strong opposing
+    # confidence keeps the blended score under threshold -- genuine
+    # directional disagreement, not a gating mechanic.
+    candidate = _candidate(analysis=_opinion("bullish", 30), news=_opinion("bearish", 90))
+    result = compute_risk_filter_veto_attribution([candidate])
+    assert result["summary"] == {"news_macro_opposition_block": 1}
+
+
+def test_veto_attribution_opinion_level_day_blocked_wiring():
+    candidate = _candidate(
+        analysis=_opinion("bullish", 90), news=_opinion("bullish", 90), macro=_opinion("bullish", 90),
+    )
+    candidate["bar"] = {"timestamp": "2026-08-16T14:05:00Z", "trading_date": "2026-08-16"}
+    result = compute_risk_filter_veto_attribution([candidate])
+    olb = result["opinion_level_day_blocked"]
+    assert olb["candidate_level_totals"] == {"coordinator_agrees": 1}
+    assert olb["opinion_weighted_totals"] == {"coordinator_agrees": 1.0}
+    assert olb["by_day"]["2026-08-16"]["distinct_opinions"] == 1

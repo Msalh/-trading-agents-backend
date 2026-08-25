@@ -973,6 +973,33 @@ This closes out the sixth external review's full ranked backlog
 (items #1-4); what remains is time/data accumulation toward the
 15-day/50-trade interim checkpoint.
 
+Tier 3.31 (risk-filter veto attribution, seventh external review,
+2026-08-25): the reviewer's core objection to Tier 3.30 — "analysis_
+risk_filtered" bundles FOUR changes into one policy (removing News from
+the directional vote, removing Macro from the directional vote,
+removing the quorum gate, and removing Timing's session/liquidity
+gating entirely, since that source never reads Timing at all), so a
+trade-count difference against the live Coordinator can't be
+attributed specifically to "News/Macro became risk filters." New
+app.coordinator_diagnostics.compute_risk_filter_veto_attribution() and
+GET /candidates/history/risk-filter-veto-attribution separate the four
+out with real numbers, reusing the exact gating logic already frozen on
+every stored candidate (Tier 2.1's opinions_used/conflict_flags
+snapshot — the real Coordinator decision already encodes whether Timing
+vetoed/dampened it) rather than any new replay. Same turn: registered
+"analysis_risk_filtered" as its own prospective, watermark-locked
+experiment (separate from the existing coordinator experiment
+bc977800) per the review's request to start this policy's genuine
+out-of-sample clock now, since a champion-challenger holdout computed
+after a policy's definition was already informed by that same history
+isn't a clean epistemic OOS test — only candidates created after
+registration are eligible toward this new experiment's resolution;
+everything analysis_risk_filtered has produced before it (including the
+Package #7 champion-challenger/paired/sensitivity-grid numbers) stays
+exploratory only. Entirely offline, no LLM calls, no candidate mutated,
+COORDINATOR_THRESHOLD/WEIGHTS/analysis_risk_filtered's own veto scope
+all untouched.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -1040,6 +1067,7 @@ from app.coordinator_diagnostics import (
     compute_coordinator_divergence_report,
     compute_news_urgent_analysis,
     compute_news_urgent_vs_calendar_blackout,
+    compute_risk_filter_veto_attribution,
     compute_threshold_crossing_deep_dive,
 )
 from app.llm_telemetry import get_telemetry_health
@@ -2430,6 +2458,56 @@ def candidates_history_news_urgent_vs_calendar_blackout(
             window_hours=window_hours,
             horizons=_parse_replay_horizons(horizons),
         ),
+    }
+
+
+@app.get("/candidates/history/risk-filter-veto-attribution")
+def candidates_history_risk_filter_veto_attribution(
+    symbol: str = Query(...),
+    timeframe: str = Query(...),
+    limit: int = Query(default=300, le=1000),
+) -> dict:
+    """Tier 3.31 (seventh external review): app/backtest.py's
+    "analysis_risk_filtered" direction source (Tier 3.30) bundles FOUR
+    changes into one policy — removing News from the directional vote,
+    removing Macro from the directional vote, removing the Coordinator's
+    MIN_AVAILABLE_WEIGHT quorum gate, and removing Timing's session/
+    liquidity gating entirely (that source never reads Timing at all) —
+    so a trade-count difference against the live Coordinator can't yet
+    be attributed specifically to "News/Macro became risk filters." This
+    endpoint separates the four out with real numbers.
+
+    For every candidate with a directional (bullish/bearish) Analysis
+    opinion, `summary` reports exactly one bucket per candidate:
+    `news_urgent_veto` / `macro_risk_off_veto` (analysis_risk_filtered
+    itself would skip this candidate), `coordinator_agrees` (no veto
+    fires and the real Coordinator traded the same direction — no
+    blocking difference), `coordinator_opposite_direction` (rare/
+    structurally unproven under live weights, see Tier 3.21),
+    `coordinator_quorum_block` (News AND Macro both missing/stale),
+    `timing_market_closed_block` / `timing_low_liquidity_block` (the
+    real Coordinator decision's own conflict_flags show Timing vetoed
+    or dampened it), or `news_macro_opposition_block` (quorum was fine,
+    no Timing flag applied, the blended score simply didn't cross
+    +-threshold — genuine directional disagreement/renormalization, not
+    a gating mechanic). `analysis_not_directional_excluded` counts
+    candidates excluded before any bucket (Analysis itself missing/
+    neutral — both policies skip these identically).
+
+    Reads every field from each candidate's already-frozen decision
+    snapshot (Tier 2.1) — no new replay, no LLM calls, no candidate
+    mutated. `opinion_level_day_blocked` (same shared aggregator as the
+    other diagnostics in this family) re-tabulates by Analysis's own
+    opinion identity, day-blocked, since this endpoint's subject is a
+    whole-policy comparison rather than one reused News/Macro opinion.
+
+    Entirely offline. COORDINATOR_THRESHOLD/WEIGHTS/analysis_risk_
+    filtered's own veto scope are all untouched."""
+    candidates = get_candidate_history(symbol=symbol, timeframe=timeframe, limit=limit)
+    return {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        **compute_risk_filter_veto_attribution(candidates),
     }
 
 
