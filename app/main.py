@@ -1022,6 +1022,36 @@ one candidate. Entirely offline, no LLM calls, no candidate mutated,
 COORDINATOR_THRESHOLD/WEIGHTS/analysis_risk_filtered's own veto scope
 all untouched.
 
+Tier 3.33 (exploratory 4-way factorial, eighth external review,
+2026-08-25): Tier 3.31/3.32's veto-attribution findings showed
+"analysis_risk_filtered"'s extra trades versus the real historical
+"coordinator" decision come roughly 90% from quorum-blocked candidates
+(insufficient_data — Analysis directional but News/Macro not both
+available enough to clear MIN_AVAILABLE_WEIGHT), ~10% from the urgent/
+risk_off veto actively firing, and ~0% from Timing — meaning
+analysis_risk_filtered's single trade-count delta conflates two
+separate structural changes (bypassing the quorum floor vs. bypassing
+the veto) into one number. Two new app.backtest.DIRECTION_SOURCES
+entries isolate each alone, exploratory only, before any of the four
+resulting comparisons are committed to a confirmatory 15-day/50-trade
+experiment (the reviewer's explicit caution against registering all
+four at once): "coordinator_veto_filtered" (the REAL historical
+Coordinator decision — decision.decision, already reflecting live
+quorum/weights/threshold/Timing exactly as they ran — with the same
+urgent/risk_off veto layered on top post-hoc, no re-scoring) and
+"coordinator_quorum_bypass" (re-scores the candidate's frozen
+opinions_used via the existing app.replay.replay_candidate() with
+min_available_weight=0.0 as a one-off hypothetical override; live
+WEIGHTS/DECISION_THRESHOLD/ANALYSIS_REQUIRED and Timing's in-scoring
+veto/dampen all still apply exactly as they do for the real
+Coordinator — only the 60% availability floor is lifted, and
+app.coordinator.MIN_AVAILABLE_WEIGHT itself is never touched). Both
+consumed generically wherever DIRECTION_SOURCES already is — every
+existing backtest-lite/paired/grid/champion-challenger endpoint picks
+them up automatically, no new endpoint. Entirely offline, no LLM
+calls, no candidate mutated, COORDINATOR_THRESHOLD/WEIGHTS/
+MIN_AVAILABLE_WEIGHT/AUTO_EXECUTE_ENABLED all untouched.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """

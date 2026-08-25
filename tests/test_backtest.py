@@ -415,6 +415,133 @@ def test_analysis_risk_filtered_is_in_direction_sources():
 
 
 # ---------------------------------------------------------------------------
+# coordinator_veto_filtered / coordinator_quorum_bypass sources -- Tier 3.33
+# (exploratory 4-way factorial, eighth external review)
+# ---------------------------------------------------------------------------
+
+def test_coordinator_veto_filtered_matches_coordinator_when_no_flags():
+    """No News/Macro veto flags present -- isolates nothing, so this
+    source's call is identical to the real historical "coordinator"
+    decision."""
+    from app import backtest
+    anchor = datetime(2026, 8, 11, 14, 0, 0, tzinfo=timezone.utc)
+    candidate = _candidate("c1", "TEST", "5m", anchor, atr=2.0, decision="enter_long", analysis_direction="bullish")
+    direction, ts = backtest._direction_for_source("coordinator_veto_filtered", candidate)
+    assert direction == "bullish"
+    assert ts is not None
+
+
+def test_coordinator_veto_filtered_vetoes_on_news_urgent_even_though_coordinator_traded(fresh_env):
+    """The real historical Coordinator entered the trade (its decision
+    field says enter_long) -- but the isolated veto-filter effect
+    should still block it here, same veto scope as
+    analysis_risk_filtered."""
+    storage, backtest = fresh_env
+    anchor = datetime(2026, 8, 11, 14, 0, 0, tzinfo=timezone.utc)
+    candidate = _candidate("c1", "TEST", "5m", anchor, atr=2.0, decision="enter_long", analysis_direction="bullish")
+    _add_opinion(candidate, "news", "bullish", ["urgent"])
+    _save_bar(storage, "TEST", "5m", anchor + timedelta(minutes=5), open_=100.0, high=106.0, low=99.5, close=105.5)
+
+    summary = backtest.run_barrier_backtest([candidate], direction_source="coordinator_veto_filtered")
+    assert summary["trades_taken"] == 0
+    # The plain "coordinator" source (no veto concept layered on) still takes it.
+    coordinator_summary = backtest.run_barrier_backtest([candidate], direction_source="coordinator")
+    assert coordinator_summary["trades_taken"] == 1
+
+
+def test_coordinator_veto_filtered_vetoes_on_macro_risk_off(fresh_env):
+    storage, backtest = fresh_env
+    anchor = datetime(2026, 8, 11, 14, 0, 0, tzinfo=timezone.utc)
+    candidate = _candidate("c1", "TEST", "5m", anchor, atr=2.0, decision="enter_long", analysis_direction="bullish")
+    _add_opinion(candidate, "macro", "neutral", ["risk_off"])
+    _save_bar(storage, "TEST", "5m", anchor + timedelta(minutes=5), open_=100.0, high=106.0, low=99.5, close=105.5)
+
+    summary = backtest.run_barrier_backtest([candidate], direction_source="coordinator_veto_filtered")
+    assert summary["trades_taken"] == 0
+
+
+def test_coordinator_veto_filtered_requires_a_real_trade_decision():
+    """The real historical Coordinator said no_trade -- there's no
+    trade for the veto filter to isolate, so this must not fabricate
+    one from Analysis's opinion the way analysis_risk_filtered does."""
+    from app import backtest
+    anchor = datetime(2026, 8, 11, 14, 0, 0, tzinfo=timezone.utc)
+    candidate = _candidate("c1", "TEST", "5m", anchor, atr=2.0, decision="no_trade", analysis_direction="bullish")
+    direction, ts = backtest._direction_for_source("coordinator_veto_filtered", candidate)
+    assert direction is None
+    assert ts is None
+
+
+def _set_analysis_confidence(candidate, confidence):
+    """_candidate() doesn't set a confidence field on its analysis
+    opinion (0-100 scale, per app/analysis_agent.py) -- _score_opinions()
+    defaults a missing confidence to 0, which would score every replay
+    call in these tests as 0 regardless of direction. These
+    coordinator_quorum_bypass tests re-score for real (unlike
+    analysis_risk_filtered's tests above, which only ever read the
+    frozen direction), so they need a real, high confidence for the
+    blended score to actually cross COORDINATOR_THRESHOLD."""
+    candidate["decision"]["opinions_used"]["analysis"]["confidence"] = confidence
+    return candidate
+
+
+def test_coordinator_quorum_bypass_trades_when_analysis_alone_would_fail_quorum():
+    """Only Analysis (weight 0.40) is present in opinions_used -- below
+    the live 0.6 MIN_AVAILABLE_WEIGHT floor, so the real historical
+    Coordinator call would have been insufficient_data. The
+    quorum-bypass source re-scores with min_available_weight=0.0 and
+    should get a real directional call from Analysis alone."""
+    from app import backtest
+    anchor = datetime(2026, 8, 11, 14, 0, 0, tzinfo=timezone.utc)
+    candidate = _candidate("c1", "TEST", "5m", anchor, atr=2.0, decision="no_trade", analysis_direction="bullish")
+    _set_analysis_confidence(candidate, 80)
+    direction, ts = backtest._direction_for_source("coordinator_quorum_bypass", candidate)
+    assert direction == "bullish"
+    assert ts is not None
+
+
+def test_coordinator_quorum_bypass_still_respects_timing_veto():
+    """Timing's market_closed flag zeroes the blended score inside
+    _score_opinions() regardless of min_available_weight -- the
+    quorum-bypass override only changes the availability floor, not
+    Timing's separate post-score veto, so this must still come back
+    as no direction even though Analysis alone (confidence=80) would
+    otherwise clear the threshold easily."""
+    from app import backtest
+    anchor = datetime(2026, 8, 11, 14, 0, 0, tzinfo=timezone.utc)
+    candidate = _candidate("c1", "TEST", "5m", anchor, atr=2.0, decision="no_trade", analysis_direction="bullish")
+    _set_analysis_confidence(candidate, 80)
+    candidate["decision"]["opinions_used"]["timing"] = {
+        "direction": "neutral", "timestamp": candidate["bar"]["timestamp"], "flags": ["market_closed"],
+    }
+    direction, ts = backtest._direction_for_source("coordinator_quorum_bypass", candidate)
+    assert direction is None
+    assert ts is None
+
+
+def test_coordinator_quorum_bypass_is_offline_and_does_not_mutate_live_constant():
+    """The replay call passes min_available_weight=0.0 as a one-off
+    hypothetical override -- app.coordinator.MIN_AVAILABLE_WEIGHT
+    itself (the live value every OTHER source's real Coordinator
+    decisions were made under) must be untouched by calling this
+    source."""
+    from app import backtest
+    from app import coordinator
+    before = coordinator.MIN_AVAILABLE_WEIGHT
+    anchor = datetime(2026, 8, 11, 14, 0, 0, tzinfo=timezone.utc)
+    candidate = _candidate("c1", "TEST", "5m", anchor, atr=2.0, decision="no_trade", analysis_direction="bullish")
+    _set_analysis_confidence(candidate, 80)
+    backtest._direction_for_source("coordinator_quorum_bypass", candidate)
+    assert coordinator.MIN_AVAILABLE_WEIGHT == before
+
+
+def test_coordinator_veto_filtered_and_quorum_bypass_are_in_direction_sources():
+    from app import backtest
+    assert "coordinator_veto_filtered" in backtest.DIRECTION_SOURCES
+    assert "coordinator_quorum_bypass" in backtest.DIRECTION_SOURCES
+
+
+# ---------------------------------------------------------------------------
 # compute_backtest_comparison
 # ---------------------------------------------------------------------------
 

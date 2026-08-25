@@ -607,7 +607,7 @@ def test_backtest_lite_endpoint_returns_all_sources_by_default(client):
     body = r.json()
     assert set(body["by_source"].keys()) == {
         "analysis", "coordinator", "inverse_analysis", "always_bullish", "always_bearish", "vwap",
-        "analysis_risk_filtered",
+        "analysis_risk_filtered", "coordinator_veto_filtered", "coordinator_quorum_bypass",
     }
     assert body["by_source"]["coordinator"]["trades_taken"] == 1
 

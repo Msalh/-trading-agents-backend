@@ -699,7 +699,7 @@ was never actually filled/sized/executed, so there's no real P&L to
 attribute to it. 400 if `thresholds` doesn't parse as comma-separated
 numbers.
 
-### `GET /candidates/history/backtest-lite?symbol=MNQ1!&timeframe=5m&limit=200&sources=analysis,coordinator,always_bullish,always_bearish,vwap,inverse_analysis,analysis_risk_filtered&atr_stop_mult=1.5&atr_target_mult=2.5&expiry_bars=24&non_overlapping=true`
+### `GET /candidates/history/backtest-lite?symbol=MNQ1!&timeframe=5m&limit=200&sources=analysis,coordinator,always_bullish,always_bearish,vwap,inverse_analysis,analysis_risk_filtered,coordinator_veto_filtered,coordinator_quorum_bypass&atr_stop_mult=1.5&atr_target_mult=2.5&expiry_bars=24&non_overlapping=true`
 Tier 3.10 (ATR-barrier benchmark) — every accuracy number through Tier
 3.9 uses the "price higher/lower N minutes later" proxy, never an
 actual entry/stop/target trade simulation. This endpoint runs the
@@ -730,8 +730,47 @@ decides direction, News/Macro as risk filters only" shadow policy —
 News/Macro can only remove a trade Analysis wanted to take, never
 supply or shift its direction. See `app/backtest.py`'s module docstring
 for exactly why those two flags, out of News's and Macro's full
-vocabularies, were the ones confirmed for the veto). Omit `sources` for
-all seven.
+vocabularies, were the ones confirmed for the veto).
+
+**Tier 3.33 addition (exploratory 4-way factorial, eighth external
+review):** the veto-attribution report (Tier 3.31/3.32, see
+`risk-filter-veto-attribution` below) found that `analysis_risk_filtered`'s
+extra trades versus the real historical `coordinator` came roughly 90%
+from candidates the real Coordinator sent to `insufficient_data`
+(quorum block — Analysis was directional but News/Macro weren't both
+present/directional enough to clear `MIN_AVAILABLE_WEIGHT`), ~10% from
+candidates where News/Macro actively pulled the blended score below
+threshold, and ~0% from Timing. That 90/10 split means
+`analysis_risk_filtered`'s single number conflates two structurally
+different effects — bypassing the quorum floor, and bypassing the
+urgent/risk_off veto — and can't say which one is doing the work. Two
+new sources isolate each alone, so all four combinations
+(`coordinator` = neither, `coordinator_veto_filtered` = veto only,
+`coordinator_quorum_bypass` = quorum-bypass only,
+`analysis_risk_filtered` = both) can be compared side by side:
+
+- `coordinator_veto_filtered` — the REAL historical Coordinator
+  decision (`decision.decision`, already reflecting the live
+  quorum/weights/threshold/Timing exactly as they ran), with the same
+  urgent/risk_off veto layered on top post-hoc. No re-scoring at all —
+  if the real Coordinator said `insufficient_data` or `no_trade`,
+  this source has no direction either, same as plain `coordinator`.
+- `coordinator_quorum_bypass` — re-scores the candidate's frozen
+  `opinions_used` via `app.replay.replay_candidate()` with
+  `min_available_weight=0.0` as a one-off hypothetical override; live
+  `WEIGHTS`/`DECISION_THRESHOLD`/`ANALYSIS_REQUIRED` and Timing's
+  in-scoring veto/dampen all still apply exactly as they do for the
+  real Coordinator — only the 60% availability floor is lifted. Never
+  touches `app.coordinator.MIN_AVAILABLE_WEIGHT` itself; purely an
+  offline replay call, same machinery Tier 3.4's threshold-sweep
+  endpoints already use.
+
+Both are exploratory only, same as every other `DIRECTION_SOURCES`
+entry — see the module docstring in `app/backtest.py` for the full
+factorial-design rationale, and the eighth external review's explicit
+caution against registering all four as confirmatory experiments
+before an exploratory pass narrows down which comparisons are worth
+the 15-day/50-trade commitment. Omit `sources` for all nine.
 
 **Tier 3.12 correction:** this is a POLICY comparison, not a paired
 one — each source independently applies `non_overlapping` against its
@@ -776,7 +815,9 @@ constraint.
     "vwap": { "...": "same shape" },
     "inverse_analysis": { "...": "same shape" },
     "coordinator": { "...": "same shape" },
-    "analysis_risk_filtered": { "...": "same shape" }
+    "analysis_risk_filtered": { "...": "same shape" },
+    "coordinator_veto_filtered": { "...": "same shape" },
+    "coordinator_quorum_bypass": { "...": "same shape" }
   }
 }
 ```

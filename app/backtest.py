@@ -249,6 +249,52 @@ offline, no LLM calls, no new trades, COORDINATOR_THRESHOLD/WEIGHTS/
 AUTO_EXECUTE_ENABLED untouched — this changes what a BACKTEST simulates
 for one more hypothetical source, nothing about the live Coordinator or
 Risk/Execution pipeline.
+
+Tier 3.33 (exploratory 4-way factorial, eighth external review,
+2026-08-25): Tier 3.31's veto-attribution report found "analysis_risk_
+filtered" trading 254 candidates the live Coordinator wouldn't, and 90%
+of that gap (131/145) came from bypassing the MIN_AVAILABLE_WEIGHT
+quorum gate, not from the urgent/risk_off veto (10%, 14/145) or Timing
+(0%, structurally). The reviewer's own next question: "analysis_risk_
+filtered" still bundles the quorum-bypass effect and the veto-filter
+effect into one policy, so its backtest numbers can't say which effect
+— if either — actually helps. Two new DIRECTION_SOURCES entries isolate
+them, so all four of live Coordinator / veto-only / quorum-bypass-only /
+analysis_risk_filtered can be compared side by side through the exact
+same backtest-lite/paired/grid/champion-challenger machinery, before
+committing to registering any ONE of them as a confirmatory prospective
+experiment (that registration decision is deliberately NOT made by this
+tier — see the module comment at _direction_for_source's "coordinator_
+quorum_bypass" case for why).
+
+"coordinator_veto_filtered": the REAL historical Coordinator decision
+(same as the "coordinator" source), with the urgent/risk_off veto
+layered on top post-hoc — skipped entirely if Coordinator actually
+traded but News's opinion carries "urgent" or Macro's carries
+"risk_off" (_RISK_FILTER_NEWS_VETO_FLAGS/_RISK_FILTER_MACRO_VETO_FLAGS,
+the same constants "analysis_risk_filtered" uses). No re-scoring
+needed — quorum, weights, and Timing all stay exactly as the live
+Coordinator computed them; ONLY the veto is added. This isolates the
+veto-filter effect alone.
+
+"coordinator_quorum_bypass": re-scores each candidate via app.replay.
+replay_candidate() with min_available_weight=0.0 — the ONLY override;
+weights/threshold/analysis_required are left at their LIVE values (not
+overridden), so Timing's veto/dampen and the ANALYSIS_REQUIRED gate
+both still apply exactly as they do for the real Coordinator. This
+isolates the quorum-bypass effect alone, with NO new veto added — a
+candidate that would fail quorum today (e.g. Analysis alone, News and
+Macro both missing) gets a real blended score computed from whatever
+directional agents ARE present instead of being forced to
+insufficient_data.
+
+Both are exploratory only, same as every other DIRECTION_SOURCES entry
+— reusing existing backtest-lite/paired/grid/champion-challenger
+reporting, no new statistics code, no live scoring change.
+COORDINATOR_THRESHOLD/WEIGHTS/MIN_AVAILABLE_WEIGHT/AUTO_EXECUTE_ENABLED
+all untouched (min_available_weight=0.0 is passed only to this one
+OFFLINE replay call per candidate, never touching the live
+app.coordinator.MIN_AVAILABLE_WEIGHT constant itself).
 """
 
 import math
@@ -256,6 +302,7 @@ import os
 
 from app.outcomes import _candidate_anchor_timestamp, _resolve_anchor_timestamp, compute_baseline_comparison
 from app.paper_trades import COMMISSION_PER_CONTRACT, MNQ_POINT_VALUE, SLIPPAGE_POINTS
+from app.replay import replay_candidate
 from app.storage import get_bars_after
 from app.trading_calendar import expected_trading_date
 
@@ -309,6 +356,8 @@ DIRECTION_SOURCES = (
     "always_bearish",
     "vwap",
     "analysis_risk_filtered",
+    "coordinator_veto_filtered",
+    "coordinator_quorum_bypass",
 )
 
 # Tier 3.30 — the exact two flags "analysis_risk_filtered" treats as a
@@ -511,6 +560,42 @@ def _direction_for_source(source: str, candidate: dict) -> tuple[str | None, str
             return None, None
         anchor = _resolve_anchor_timestamp("analysis", candidate, analysis_opinion, decision)
         return analysis_opinion.get("direction"), anchor
+
+    if source == "coordinator_veto_filtered":
+        # Tier 3.33: isolates the veto-filter effect ALONE, no quorum
+        # change — the real historical Coordinator decision, with the
+        # same urgent/risk_off veto "analysis_risk_filtered" uses
+        # layered on top post-hoc. No re-scoring: quorum/weights/Timing
+        # all stay exactly as the live Coordinator computed them.
+        trade_decision = decision.get("decision")
+        if trade_decision not in ("enter_long", "enter_short"):
+            return None, None
+        news_opinion = opinions_used.get("news")
+        if news_opinion and _RISK_FILTER_NEWS_VETO_FLAGS & set(news_opinion.get("flags") or []):
+            return None, None
+        macro_opinion = opinions_used.get("macro")
+        if macro_opinion and _RISK_FILTER_MACRO_VETO_FLAGS & set(macro_opinion.get("flags") or []):
+            return None, None
+        direction = "bullish" if trade_decision == "enter_long" else "bearish"
+        return direction, _candidate_anchor_timestamp(candidate)
+
+    if source == "coordinator_quorum_bypass":
+        # Tier 3.33: isolates the quorum-bypass effect ALONE, no new
+        # veto — re-scores under the LIVE weights/threshold/
+        # analysis_required (Timing's veto/dampen and the
+        # ANALYSIS_REQUIRED gate both still apply exactly as they do for
+        # the real Coordinator) but with min_available_weight=0.0, so a
+        # candidate that would fail the 60% availability floor today
+        # gets a real blended score from whatever directional agents ARE
+        # present instead of being forced to insufficient_data. This
+        # OFFLINE replay call never touches the live app.coordinator.
+        # MIN_AVAILABLE_WEIGHT constant itself.
+        replayed = replay_candidate(candidate, min_available_weight=0.0)["replayed"]
+        trade_decision = replayed.get("decision")
+        if trade_decision not in ("enter_long", "enter_short"):
+            return None, None
+        direction = "bullish" if trade_decision == "enter_long" else "bearish"
+        return direction, _candidate_anchor_timestamp(candidate)
 
     raise ValueError(f"unknown direction_source {source!r} — must be one of {DIRECTION_SOURCES}")
 
