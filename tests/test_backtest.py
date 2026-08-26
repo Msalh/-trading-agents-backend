@@ -542,6 +542,145 @@ def test_coordinator_veto_filtered_and_quorum_bypass_are_in_direction_sources():
 
 
 # ---------------------------------------------------------------------------
+# Structural invariants for coordinator_veto_filtered/coordinator_
+# quorum_bypass -- Tier 3.35 (tenth external review)
+# ---------------------------------------------------------------------------
+#
+# The reviewer's item 5: these two sources' guarantees are worth locking
+# in with explicit tests rather than only checked ad hoc, since every
+# future diagnostic pull leans on them holding. Uses REAL
+# app.coordinator._score_opinions() (not the hand-set "decision" string
+# _candidate() above uses) so the fixture's own "decision" field is
+# provably consistent with what a fresh replay would independently
+# recompute -- coordinator_quorum_bypass calls app.replay.replay_
+# candidate() internally, which re-scores from opinions_used and ignores
+# whatever "decision" string a fixture happens to have set.
+#
+# CAVEAT (documented per the reviewer's own point, not just in this
+# comment): these invariants hold because the tests below score fixtures
+# under the SAME live WEIGHTS/DECISION_THRESHOLD/MIN_AVAILABLE_WEIGHT/
+# ANALYSIS_REQUIRED that replay_candidate() falls back to when no
+# override is passed. A real historical candidate scored under a
+# DIFFERENT config (before a past WEIGHTS/threshold change) would not
+# necessarily satisfy "coordinator_quorum_bypass matches the original
+# direction" under today's replay -- that's expected config drift, not a
+# bug, and is exactly why replay_candidate()'s own docstring already
+# frames every hypothetical override as "under TODAY's live value,"
+# never the original candidate's own frozen config.
+
+def _opinion(direction, confidence):
+    return {"direction": direction, "confidence": confidence, "timestamp": "2026-08-11T14:00:00Z"}
+
+
+def _live_scored_candidate(candidate_id, symbol, timeframe, anchor_dt, atr, opinions, min_available_weight=None):
+    from app.coordinator import (
+        ANALYSIS_REQUIRED as _LIVE_ANALYSIS_REQUIRED,
+        DECISION_THRESHOLD as _LIVE_THRESHOLD,
+        MIN_AVAILABLE_WEIGHT as _LIVE_MIN_AVAILABLE_WEIGHT,
+        WEIGHTS as _LIVE_WEIGHTS,
+        _score_opinions,
+    )
+    use_min_weight = min_available_weight if min_available_weight is not None else _LIVE_MIN_AVAILABLE_WEIGHT
+    decision = _score_opinions(
+        symbol=symbol, timeframe=timeframe, opinions=opinions, missing_agents=[], stale_agents=[],
+        weights=_LIVE_WEIGHTS, threshold=_LIVE_THRESHOLD,
+        min_available_weight=use_min_weight, analysis_required=_LIVE_ANALYSIS_REQUIRED,
+    )
+    return {
+        "candidate_id": candidate_id, "symbol": symbol, "timeframe": timeframe,
+        "bar": {"timestamp": _iso(anchor_dt), "atr": atr},
+        "decision": decision.to_dict(),
+    }
+
+
+def test_invariant_veto_filtered_never_trades_when_real_coordinator_did_not():
+    from app import backtest
+    anchor = datetime(2026, 8, 11, 14, 0, 0, tzinfo=timezone.utc)
+    # Quorum-blocked: Analysis alone, well below MIN_AVAILABLE_WEIGHT.
+    quorum_blocked = _live_scored_candidate(
+        "c1", "TEST", "5m", anchor, atr=2.0, opinions={"analysis": _opinion("bullish", 90)},
+    )
+    assert quorum_blocked["decision"]["decision"] == "insufficient_data"
+    direction, ts = backtest._direction_for_source("coordinator_veto_filtered", quorum_blocked)
+    assert direction is None and ts is None
+
+    # Below-threshold: quorum fine, score too low to cross threshold.
+    below_threshold = _live_scored_candidate(
+        "c2", "TEST", "5m", anchor, atr=2.0,
+        opinions={"analysis": _opinion("bullish", 20), "news": _opinion("bullish", 20)},
+    )
+    assert below_threshold["decision"]["decision"] == "no_trade"
+    direction, ts = backtest._direction_for_source("coordinator_veto_filtered", below_threshold)
+    assert direction is None and ts is None
+
+
+def test_invariant_veto_filtered_matches_coordinator_exactly_when_no_flags():
+    from app import backtest
+    anchor = datetime(2026, 8, 11, 14, 0, 0, tzinfo=timezone.utc)
+    candidate = _live_scored_candidate(
+        "c1", "TEST", "5m", anchor, atr=2.0,
+        opinions={"analysis": _opinion("bearish", 90), "news": _opinion("bearish", 90)},
+    )
+    assert candidate["decision"]["decision"] == "enter_short"
+    assert candidate["decision"]["direction"] == "bearish"
+    direction, ts = backtest._direction_for_source("coordinator_veto_filtered", candidate)
+    assert direction == candidate["decision"]["direction"]
+    assert ts is not None
+
+
+def test_invariant_quorum_bypass_matches_real_direction_when_quorum_already_sufficient():
+    # Monotonicity: when the real Coordinator already had enough quorum
+    # to trade, loosening min_available_weight further to 0.0 changes
+    # NOTHING about the score computation -- quorum_bypass must return
+    # the exact same direction the real historical decision had.
+    from app import backtest
+    anchor = datetime(2026, 8, 11, 14, 0, 0, tzinfo=timezone.utc)
+    candidate = _live_scored_candidate(
+        "c1", "TEST", "5m", anchor, atr=2.0,
+        opinions={"analysis": _opinion("bullish", 90), "news": _opinion("bullish", 90)},
+    )
+    assert candidate["decision"]["decision"] == "enter_long"
+    direction, ts = backtest._direction_for_source("coordinator_quorum_bypass", candidate)
+    assert direction == candidate["decision"]["direction"] == "bullish"
+    assert ts is not None
+
+
+def test_invariant_quorum_bypass_stays_flat_when_real_reason_was_below_threshold_not_quorum():
+    # The other half of the monotonicity property: if the real
+    # Coordinator's decision was "no_trade" (quorum already sufficient,
+    # score just didn't cross threshold), quorum_bypass must ALSO stay
+    # flat -- lifting the availability floor cannot manufacture a trade
+    # out of a score that was never close in the first place.
+    from app import backtest
+    anchor = datetime(2026, 8, 11, 14, 0, 0, tzinfo=timezone.utc)
+    candidate = _live_scored_candidate(
+        "c1", "TEST", "5m", anchor, atr=2.0,
+        opinions={"analysis": _opinion("bullish", 20), "news": _opinion("bullish", 20)},
+    )
+    assert candidate["decision"]["decision"] == "no_trade"
+    direction, ts = backtest._direction_for_source("coordinator_quorum_bypass", candidate)
+    assert direction is None and ts is None
+
+
+def test_invariant_quorum_bypass_extra_trades_only_originate_from_insufficient_data():
+    # The positive half: quorum_bypass DOES add a trade when the real
+    # reason was insufficient_data (Analysis alone, confidence high
+    # enough that lifting the floor lets its own score through) --
+    # combined with the two tests above, this fully establishes "any
+    # extra trade from quorum_bypass traces back to insufficient_data,
+    # never to a genuine no_trade."
+    from app import backtest
+    anchor = datetime(2026, 8, 11, 14, 0, 0, tzinfo=timezone.utc)
+    candidate = _live_scored_candidate(
+        "c1", "TEST", "5m", anchor, atr=2.0, opinions={"analysis": _opinion("bullish", 80)},
+    )
+    assert candidate["decision"]["decision"] == "insufficient_data"
+    direction, ts = backtest._direction_for_source("coordinator_quorum_bypass", candidate)
+    assert direction == "bullish"
+    assert ts is not None
+
+
+# ---------------------------------------------------------------------------
 # compute_backtest_comparison
 # ---------------------------------------------------------------------------
 

@@ -2198,11 +2198,22 @@ scope all untouched).
 
 ### `GET /candidates/history/veto-decision-transitions?symbol=MNQ1!&timeframe=5m&limit=300`
 
-Tier 3.34 (ninth external review). The reviewer found that neither
-`risk-filter-veto-attribution` (Tier 3.31) nor the `coordinator_veto_
-filtered`/`coordinator_quorum_bypass` sources (Tier 3.33) directly
-answer "how many of the real Coordinator's own trade decisions would
-the urgent/risk_off veto have killed":
+Tier 3.34 (ninth external review), extended Tier 3.35 (tenth external
+review). The ninth reviewer found that neither `risk-filter-veto-
+attribution` (Tier 3.31) nor the `coordinator_veto_filtered`/
+`coordinator_quorum_bypass` sources (Tier 3.33) directly answer "how
+many of the real Coordinator's own directional DECISIONS would the
+urgent/risk_off veto have killed":
+
+**Wording caution (Tier 3.35):** every "trade"/"traded" in this section
+means the real historical Coordinator's own `enter_long`/`enter_short`
+DECISION, not a confirmed executed real paper trade —
+`AUTO_EXECUTE_ENABLED` is `false` project-wide, opening an actual paper
+trade is a separate mostly-manual dashboard action, and the real
+executed-trade count is far smaller than this endpoint's counts. The
+tenth review caught an earlier internal write-up blurring this
+distinction (describing this endpoint's 294 real directional decisions
+as "294 real historical trades").
 
 - Tier 3.31's `news_urgent_veto`/`macro_risk_off_veto` buckets are
   checked BEFORE looking at what the real Coordinator decision actually
@@ -2249,10 +2260,30 @@ candidate-for-candidate comparability.
 `flag_basis_by_transition` splits each transition by which flag(s) were
 actually responsible (`news_urgent_only` / `macro_risk_off_only` /
 `both` / `neither`) — the explicit urgent-vs-risk_off-vs-overlap
-visibility the reviewer asked for, at the transition level rather than
-folded into one priority-ordered bucket. `coordinator_skip_reason_by_
+visibility the ninth reviewer asked for, at the transition level rather
+than folded into one priority-ordered bucket. **`direction_flag_basis_
+by_transition`** (Tier 3.35) adds a third axis — `transition ->
+coordinator_direction -> flag_basis -> count` — answering the tenth
+review's sharpest question directly: how many bearish (short)
+`coordinator_trade_veto_would_skip` cases came from `macro_risk_off_
+only` specifically, versus bullish (long) ones. A large short-side count
+there would be direct evidence `risk_off` is being used opposite to a
+plausible "bearish regime" directional reading (which would expect it
+to SUPPORT shorts, not block them). `coordinator_skip_reason_by_
 transition` further splits the two non-trade transitions by the real
 historical reason (`no_trade` vs `insufficient_data`).
+
+**Interpretation caution** (Tier 3.35): News's `"urgent"` flag already
+dampens the real Coordinator's score by 0.5x inside `_score_opinions`
+(Tier 2.9), independent of this endpoint. A `news_urgent_only`
+`coordinator_trade_veto_would_skip` case cleared threshold EVEN AFTER
+that existing dampening — this endpoint's hypothetical hard veto
+measures the MARGINAL move from "soft dampen, still enterable" to "hard
+block regardless of score," not urgent's raw effect from a zero
+baseline. Macro's `"risk_off"` has no such existing live-scoring effect
+anywhere else in this codebase, so `macro_risk_off_only` counts are the
+cleaner "raw" marginal-veto measurement by contrast — the two flags'
+kill counts aren't quite apples-to-apples.
 
 **Structural note** (live-config-dependent, not a universal guarantee
 the way Tier 3.31's Timing zero-count proof is): under the current live
@@ -2264,6 +2295,14 @@ occur when News AND Macro are BOTH absent (Analysis alone is
 0.40/0.80 = 50% < 60%; adding either agent alone already clears the
 floor), and a veto flag requires its agent to be present. Would need
 re-checking if `WEIGHTS`/`MIN_AVAILABLE_WEIGHT` ever change.
+
+**Population note** (Tier 3.35, per the tenth review's methodology
+point): `candidates_considered` reflects however many candidates exist
+for this symbol/timeframe at pull time — it grows as production
+accumulates more history, so two pulls at different times are the SAME
+cumulative population plus an increment, not two independent samples.
+Compare `candidates_considered` explicitly across pulls rather than
+assuming a changed rate implies a regime change.
 
 ```json
 {
@@ -2284,6 +2323,12 @@ re-checking if `WEIGHTS`/`MIN_AVAILABLE_WEIGHT` ever change.
     "coordinator_trade_veto_would_skip": { "news_urgent_only": 12, "macro_risk_off_only": 2, "both": 1 },
     "coordinator_skip_veto_would_also_skip": { "news_urgent_only": 13, "macro_risk_off_only": 1 }
   },
+  "direction_flag_basis_by_transition": {
+    "coordinator_trade_veto_would_skip": {
+      "bullish": { "news_urgent_only": 9, "both": 1 },
+      "bearish": { "macro_risk_off_only": 2, "news_urgent_only": 3 }
+    }
+  },
   "coordinator_skip_reason_by_transition": {
     "coordinator_skip_veto_irrelevant": { "no_trade": 40, "insufficient_data": 21 },
     "coordinator_skip_veto_would_also_skip": { "no_trade": 14 }
@@ -2293,22 +2338,35 @@ re-checking if `WEIGHTS`/`MIN_AVAILABLE_WEIGHT` ever change.
       "candidate_id": "abc123",
       "bar_timestamp": "2026-08-16T14:00:00Z",
       "trading_date": "2026-08-16",
+      "session_name": "RTH",
       "analysis_opinion_timestamp": "2026-08-16T14:00:00Z",
+      "news_opinion_timestamp": "2026-08-16T14:00:00Z",
+      "macro_opinion_timestamp": null,
       "analysis_direction": "bullish",
       "coordinator_decision": "enter_long",
+      "coordinator_direction": "bullish",
       "news_urgent": false,
       "macro_risk_off": false,
       "flag_basis": "neither",
       "transition": "coordinator_trade_veto_survives"
     }
   ],
-  "opinion_level_day_blocked": { "...": "see below" }
+  "opinion_level_day_blocked": { "...": "see below" },
+  "news_opinion_level_day_blocked": { "...": "same aggregator, keyed on news_opinion_timestamp" },
+  "macro_opinion_level_day_blocked": { "...": "same aggregator, keyed on macro_opinion_timestamp" }
 }
 ```
 
 (Illustrative shape; not a production pull.) `opinion_level_day_blocked`
 uses the same shared aggregator as the rest of this diagnostic family,
-keyed on Analysis's own `opinion_timestamp`.
+keyed on Analysis's own `opinion_timestamp`. `news_opinion_level_day_
+blocked` / `macro_opinion_level_day_blocked` (Tier 3.35) re-run the same
+aggregator keyed on each flag's OWN opinion identity instead — a case
+where that particular agent didn't run (its opinion timestamp is `null`)
+is automatically excluded into that aggregator's own
+`uncategorized_count`, not guessed into a bucket — giving the
+flag-specific reuse/independence view the tenth reviewer asked for,
+distinct from the whole-policy Analysis-keyed view.
 
 Entirely offline (no LLM calls, no candidate mutated,
 `COORDINATOR_THRESHOLD`/`WEIGHTS`/`MIN_AVAILABLE_WEIGHT`/`analysis_risk_

@@ -1081,6 +1081,45 @@ kill-count. Entirely offline, no LLM calls, no candidate mutated,
 COORDINATOR_THRESHOLD/WEIGHTS/MIN_AVAILABLE_WEIGHT/analysis_risk_
 filtered's own veto scope all untouched.
 
+Tier 3.35 (tenth external review, 2026-08-25): the tenth reviewer
+approved Tier 3.34's method but corrected how its 56.5% headline number
+(166/294 in one production pull) was described — those are Coordinator's
+own directional DECISIONS, not confirmed executed real paper trades
+(AUTO_EXECUTE_ENABLED is false project-wide) — and asked for it broken
+down further before drawing conclusions. compute_veto_decision_
+transitions() gained three purely additive pieces, no existing field's
+shape or meaning changed: (1) each case now carries coordinator_
+direction, news_opinion_timestamp, macro_opinion_timestamp, and
+session_name; (2) direction_flag_basis_by_transition cross-tabs
+transition -> coordinator_direction -> flag_basis -> count, answering
+the reviewer's sharpest question directly (how many bearish/short cases
+did macro_risk_off kill, versus bullish/long) without the caller
+re-deriving it from raw cases; (3) news_opinion_level_day_blocked and
+macro_opinion_level_day_blocked re-run the existing shared aggregator
+keyed on EACH flag's own opinion identity (cases where that agent didn't
+run auto-excluded), distinct from the existing Analysis-keyed
+opinion_level_day_blocked. Also documented two interpretation cautions
+the reviewer raised: News's urgent flag already soft-dampens the real
+Coordinator's score by 0.5x independent of this diagnostic, so a
+news_urgent_only kill measures the MARGINAL move from soft-dampen to
+hard-block, not urgent's raw effect from zero — Macro's risk_off has no
+such existing live-scoring effect, so the two flags' kill counts aren't
+quite apples-to-apples. Same turn: added explicit structural invariant
+tests for Tier 3.33's coordinator_veto_filtered/coordinator_quorum_
+bypass sources (the reviewer's item 5) — veto_filtered never trades a
+candidate the real Coordinator didn't, matches it exactly with no flags
+present; quorum_bypass is a monotonic superset of real Coordinator
+trades under matching config (any extra trade traces back to
+insufficient_data, never a genuine no_trade) — documented as holding
+only when replay's config matches the live config the fixtures are
+scored under, per the reviewer's own config-drift caveat. Entirely
+offline, no LLM calls, no candidate mutated, no live behavior changed —
+COORDINATOR_THRESHOLD/WEIGHTS/MIN_AVAILABLE_WEIGHT/AUTO_EXECUTE_ENABLED
+all untouched. Not addressed this tier (deferred as separate, larger
+follow-ups per the reviewer's own priority ordering): the shared-
+watermark-950 paired prospective comparison design, incremental P&L for
+the killed decisions, and the risk_off semantic redesign.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -2627,11 +2666,17 @@ def candidates_history_veto_decision_transitions(
     timeframe: str = Query(...),
     limit: int = Query(default=300, le=1000),
 ) -> dict:
-    """Tier 3.34 (ninth external review). Corrects a real gap the
-    reviewer found in how Package #9 compared Tier 3.31's and Tier
-    3.33's numbers: neither report directly counts "how many of the
-    real Coordinator's own trade decisions would the urgent/risk_off
-    veto have killed." Tier 3.31's `news_urgent_veto`/`macro_risk_off_
+    """Tier 3.34 (ninth external review), extended Tier 3.35 (tenth
+    external review). Corrects a real gap the ninth reviewer found:
+    neither Tier 3.31 nor Tier 3.33 directly counts "how many of the
+    real Coordinator's own directional DECISIONS would the urgent/
+    risk_off veto have killed." (WORDING NOTE, Tier 3.35: every "trade"/
+    "traded" below means the real historical Coordinator's own
+    enter_long/enter_short decision, NOT a confirmed executed real paper
+    trade — AUTO_EXECUTE_ENABLED is false project-wide and the real
+    executed-trade count is far smaller than this endpoint's counts;
+    the tenth review flagged an earlier internal write-up for blurring
+    that distinction.) Tier 3.31's `news_urgent_veto`/`macro_risk_off_
     veto` buckets are checked BEFORE looking at what the real Coordinator
     decision actually was, so those candidates were never cross-tabulated
     against whether Coordinator traded them. Tier 3.33's `coordinator_
@@ -2662,14 +2707,33 @@ def candidates_history_veto_decision_transitions(
     `coordinator_skip_veto_irrelevant` (Coordinator skipped, no veto flag
     present either).
 
+    INTERPRETATION NOTE (Tier 3.35): News's `"urgent"` flag already
+    dampens the real Coordinator's score by 0.5x inside `_score_opinions`
+    (Tier 2.9), independent of this endpoint. A `news_urgent_only`
+    `coordinator_trade_veto_would_skip` case cleared threshold EVEN AFTER
+    that existing dampening — this endpoint's hypothetical hard veto
+    measures the MARGINAL move from "soft dampen, still enterable" to
+    "hard block regardless of score," not urgent's raw effect from a
+    zero baseline. Macro's `"risk_off"` has no such existing live-scoring
+    effect, so `macro_risk_off_only` counts are the cleaner "raw" measure
+    by contrast — the two flags aren't quite apples-to-apples here.
+
     `flag_basis_by_transition` splits each transition by which flag(s)
     were responsible (`news_urgent_only` / `macro_risk_off_only` /
     `both` / `neither`) — the explicit urgent-vs-risk_off-vs-overlap
-    visibility the reviewer asked for, at the transition level.
-    `coordinator_skip_reason_by_transition` further splits the two
-    non-trade transitions by the real historical reason (`no_trade` vs
-    `insufficient_data`), since a redundant veto means something
-    different depending on why Coordinator was already skipping.
+    visibility the ninth reviewer asked for, at the transition level.
+    `direction_flag_basis_by_transition` (Tier 3.35) adds a third axis —
+    transition -> coordinator_direction -> flag_basis -> count —
+    answering the tenth review's sharpest question directly: how many
+    bearish (short) `coordinator_trade_veto_would_skip` cases came from
+    `macro_risk_off_only` specifically (a large count there would be
+    direct evidence `risk_off` is being used opposite to a plausible
+    "bearish regime" directional meaning, since that reading would
+    expect it to SUPPORT shorts, not block them). `coordinator_skip_
+    reason_by_transition` further splits the two non-trade transitions
+    by the real historical reason (`no_trade` vs `insufficient_data`),
+    since a redundant veto means something different depending on why
+    Coordinator was already skipping.
 
     `analysis_not_directional_excluded` counts candidates excluded
     before any transition (Analysis itself missing/neutral — matches
@@ -2677,6 +2741,21 @@ def candidates_history_veto_decision_transitions(
     endpoints share the same precondition). `opinion_level_day_blocked`
     (same shared aggregator as the rest of this diagnostic family)
     re-tabulates by Analysis's own opinion identity, day-blocked.
+    `news_opinion_level_day_blocked` and `macro_opinion_level_day_
+    blocked` (Tier 3.35) re-run the same aggregator keyed on EACH flag's
+    own opinion identity instead — cases where that particular agent
+    didn't run are automatically excluded (not guessed into a bucket) —
+    giving the flag-specific reuse/independence view the tenth reviewer
+    asked for, distinct from the whole-policy Analysis-keyed view above.
+
+    Population note (Tier 3.35, per the tenth review's methodology
+    point): `candidates_considered` reflects however many candidates
+    exist for this symbol/timeframe at pull time — it grows as
+    production accumulates more history, so two pulls at different times
+    are the SAME cumulative population plus an increment, not two
+    independent samples. Compare `candidates_considered` explicitly
+    across pulls rather than assuming a changed rate implies a regime
+    change.
 
     Entirely offline. COORDINATOR_THRESHOLD/WEIGHTS/MIN_AVAILABLE_WEIGHT/
     analysis_risk_filtered's own veto scope are all untouched."""

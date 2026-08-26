@@ -1239,12 +1239,22 @@ def test_veto_decision_transitions_endpoint_returns_shape(client):
     assert body["analysis_directional_candidates"] == 1
     assert body["transition_summary"] == {"coordinator_trade_veto_survives": 1}
     assert body["flag_basis_by_transition"] == {"coordinator_trade_veto_survives": {"neither": 1}}
+    assert body["direction_flag_basis_by_transition"] == {
+        "coordinator_trade_veto_survives": {"bullish": {"neither": 1}},
+    }
     assert body["coordinator_skip_reason_by_transition"] == {}
     case = body["cases"][0]
     assert case["transition"] == "coordinator_trade_veto_survives"
     assert case["trading_date"] == "2026-08-16"
+    assert case["coordinator_direction"] == "bullish"
+    assert case["news_opinion_timestamp"] == anchor
+    assert case["macro_opinion_timestamp"] is None
     olb = body["opinion_level_day_blocked"]
     assert olb["candidate_level_totals"] == {"coordinator_trade_veto_survives": 1}
+    news_olb = body["news_opinion_level_day_blocked"]
+    assert news_olb["candidate_level_totals"] == {"coordinator_trade_veto_survives": 1}
+    macro_olb = body["macro_opinion_level_day_blocked"]
+    assert macro_olb["uncategorized_count"] == 1  # Macro didn't run on this candidate
 
 
 def test_veto_decision_transitions_endpoint_empty_history(client):
@@ -1258,6 +1268,7 @@ def test_veto_decision_transitions_endpoint_empty_history(client):
     assert body["analysis_not_directional_excluded"] == 0
     assert body["transition_summary"] == {}
     assert body["flag_basis_by_transition"] == {}
+    assert body["direction_flag_basis_by_transition"] == {}
     assert body["coordinator_skip_reason_by_transition"] == {}
     assert body["cases"] == []
 

@@ -1402,6 +1402,61 @@ def compute_risk_filter_veto_attribution(candidates: list[dict]) -> dict:
 # `insufficient_data` reason today — only `no_trade`. See the test
 # suite for the explicit proof this doesn't silently happen.
 #
+# WORDING CAUTION (Tier 3.35, tenth external review): every "trade" /
+# "traded" in this module — `coordinator_trade_veto_would_skip`,
+# `coordinator_traded`, `trades_taken` elsewhere in app/backtest.py —
+# means "the real historical Coordinator's own directional decision
+# (enter_long/enter_short)," NOT a confirmed executed real paper trade.
+# AUTO_EXECUTE_ENABLED is false project-wide; opening an actual paper
+# trade is a separate, mostly-manual dashboard action, and the real
+# executed-trade count has stayed at 1 for most of this project's
+# history. 294 real Coordinator directional DECISIONS is a different,
+# much larger quantity than 294 real trades — reports and prose
+# consuming this endpoint's numbers must say "decision," not "trade,"
+# to avoid re-creating exactly the kind of overclaim this project has
+# otherwise been careful to avoid.
+#
+# INTERPRETATION CAUTION (Tier 3.35): News's "urgent" flag ALREADY
+# dampens the real Coordinator's score by 0.5x inside
+# app.coordinator._score_opinions (Tier 2.9), independent of this
+# diagnostic. A `news_urgent_only`-flagged `coordinator_trade_veto_
+# would_skip` case is therefore a candidate whose score cleared
+# threshold EVEN AFTER that existing 0.5x dampening — this diagnostic's
+# hypothetical hard veto measures the MARGINAL effect of moving from
+# "soft dampen, still enterable" to "hard block regardless of score,"
+# not urgent's raw/undampened effect from a zero baseline. Macro's
+# "risk_off" flag has no such existing soft effect in the live
+# Coordinator — its only effect anywhere in this codebase is this
+# diagnostic's/`analysis_risk_filtered`'s own hypothetical hard veto —
+# so `macro_risk_off_only` cases are a cleaner "raw" marginal-veto
+# measurement by contrast, one more reason the risk_off/urgent
+# comparison in section 2 of Package #10 isn't quite apples-to-apples.
+#
+# Tier 3.35 additions, all purely additive (no existing field's shape
+# or meaning changed): each case now also carries `coordinator_
+# direction` (bullish/bearish/neutral, from the real decision's own
+# `direction` field — answers the reviewer's "how many SHORTs did
+# risk_off kill" question directly), `news_opinion_timestamp` /
+# `macro_opinion_timestamp` (None when that agent didn't run — lets a
+# caller re-aggregate by EACH flag's own opinion identity, not just
+# Analysis's, since Analysis's opinion identity says nothing about
+# whether the SAME News/Macro opinion got reused across many
+# candidates), and `session_name` (from the candidate's own bar, same
+# field Tier 3.18's day-session reporting already uses).
+# `direction_flag_basis_by_transition` cross-tabs transition ->
+# coordinator_direction -> flag_basis -> count, directly answering
+# "how many bearish (short) coordinator_trade_veto_would_skip cases
+# came from macro_risk_off_only or both" without the caller having to
+# re-derive it from raw `cases`. `news_opinion_level_day_blocked` and
+# `macro_opinion_level_day_blocked` re-run the same shared aggregator
+# keyed on each flag's OWN opinion identity instead of Analysis's —
+# cases where that particular agent didn't run are automatically
+# excluded (the aggregator's existing missing-opinion-field handling),
+# not guessed into a bucket — giving the flag-specific
+# independence/reuse view the reviewer asked for, versus the existing
+# `opinion_level_day_blocked` which stays keyed on Analysis's identity
+# for whole-policy comparison.
+#
 # Entirely offline: reads already-stored candidate.decision fields only,
 # no replay, no LLM calls, no candidate mutated, no barrier-backtest
 # simulation involved at all. COORDINATOR_THRESHOLD/WEIGHTS/
@@ -1410,17 +1465,24 @@ def compute_risk_filter_veto_attribution(candidates: list[dict]) -> dict:
 
 
 def compute_veto_decision_transitions(candidates: list[dict]) -> dict:
-    """See the Tier 3.34 module comment above. Same analysis-directional
-    population scope as compute_risk_filter_veto_attribution (Tier
-    3.31), for direct candidate-for-candidate comparability. Returns
-    candidates_considered, the analysis_not_directional exclusion count,
-    `transition_summary` (the 2x2 transition -> count), `flag_basis_by_
-    transition` (transition -> {news_urgent_only/macro_risk_off_only/
-    both/neither -> count}), `coordinator_skip_reason_by_transition`
-    (the two non-trade transitions split by no_trade vs
-    insufficient_data), the full per-candidate `cases` list, and
-    `opinion_level_day_blocked` (Analysis-opinion identity, day-blocked,
-    same convention as Tier 3.31's own report)."""
+    """See the Tier 3.34/3.35 module comments above. Same
+    analysis-directional population scope as
+    compute_risk_filter_veto_attribution (Tier 3.31), for direct
+    candidate-for-candidate comparability. Returns candidates_considered,
+    the analysis_not_directional exclusion count, `transition_summary`
+    (the 2x2 transition -> count — "trade" here means Coordinator's own
+    directional DECISION, not a confirmed executed real paper trade, see
+    the wording caution above), `flag_basis_by_transition` (transition ->
+    {news_urgent_only/macro_risk_off_only/both/neither -> count}),
+    `direction_flag_basis_by_transition` (Tier 3.35: transition ->
+    coordinator_direction -> flag_basis -> count), `coordinator_skip_
+    reason_by_transition` (the two non-trade transitions split by
+    no_trade vs insufficient_data), the full per-candidate `cases` list,
+    and three day-blocked re-aggregations of the shared aggregator:
+    `opinion_level_day_blocked` (Analysis-opinion identity, matching Tier
+    3.31's own report), `news_opinion_level_day_blocked` and
+    `macro_opinion_level_day_blocked` (Tier 3.35: each flag's OWN opinion
+    identity, cases where that agent didn't run auto-excluded)."""
     cases = []
     excluded_not_directional = 0
 
@@ -1452,6 +1514,7 @@ def compute_veto_decision_transitions(candidates: list[dict]) -> dict:
             flag_basis = "neither"
 
         coordinator_decision = decision.get("decision")
+        coordinator_direction = decision.get("direction")
         coordinator_traded = coordinator_decision in _DIRECTIONAL_DECISIONS
 
         if coordinator_traded and veto_would_apply:
@@ -1467,9 +1530,13 @@ def compute_veto_decision_transitions(candidates: list[dict]) -> dict:
             "candidate_id": candidate.get("candidate_id"),
             "bar_timestamp": (candidate.get("bar") or {}).get("timestamp"),
             "trading_date": (candidate.get("bar") or {}).get("trading_date"),
+            "session_name": (candidate.get("bar") or {}).get("session_name"),
             "analysis_opinion_timestamp": analysis_opinion.get("timestamp"),
+            "news_opinion_timestamp": (news_opinion or {}).get("timestamp"),
+            "macro_opinion_timestamp": (macro_opinion or {}).get("timestamp"),
             "analysis_direction": analysis_direction,
             "coordinator_decision": coordinator_decision,
+            "coordinator_direction": coordinator_direction,
             "news_urgent": news_urgent,
             "macro_risk_off": macro_risk_off,
             "flag_basis": flag_basis,
@@ -1478,6 +1545,7 @@ def compute_veto_decision_transitions(candidates: list[dict]) -> dict:
 
     transition_summary: dict[str, int] = {}
     flag_basis_by_transition: dict[str, dict[str, int]] = {}
+    direction_flag_basis_by_transition: dict[str, dict[str, dict[str, int]]] = {}
     coordinator_skip_reason_by_transition: dict[str, dict[str, int]] = {}
     for case in cases:
         t = case["transition"]
@@ -1486,6 +1554,12 @@ def compute_veto_decision_transitions(candidates: list[dict]) -> dict:
         fb = case["flag_basis"]
         flag_basis_by_transition.setdefault(t, {})
         flag_basis_by_transition[t][fb] = flag_basis_by_transition[t].get(fb, 0) + 1
+
+        direction = case["coordinator_direction"] or "neutral"
+        direction_flag_basis_by_transition.setdefault(t, {}).setdefault(direction, {})
+        direction_flag_basis_by_transition[t][direction][fb] = (
+            direction_flag_basis_by_transition[t][direction].get(fb, 0) + 1
+        )
 
         if t in ("coordinator_skip_veto_would_also_skip", "coordinator_skip_veto_irrelevant"):
             reason = case["coordinator_decision"]  # "no_trade" or "insufficient_data"
@@ -1500,10 +1574,17 @@ def compute_veto_decision_transitions(candidates: list[dict]) -> dict:
         "analysis_directional_candidates": len(cases),
         "transition_summary": transition_summary,
         "flag_basis_by_transition": flag_basis_by_transition,
+        "direction_flag_basis_by_transition": direction_flag_basis_by_transition,
         "coordinator_skip_reason_by_transition": coordinator_skip_reason_by_transition,
         "cases": cases,
         "opinion_level_day_blocked": _opinion_level_day_blocked_summary(
             cases, category_field="transition", opinion_field="analysis_opinion_timestamp", day_field="trading_date",
+        ),
+        "news_opinion_level_day_blocked": _opinion_level_day_blocked_summary(
+            cases, category_field="transition", opinion_field="news_opinion_timestamp", day_field="trading_date",
+        ),
+        "macro_opinion_level_day_blocked": _opinion_level_day_blocked_summary(
+            cases, category_field="transition", opinion_field="macro_opinion_timestamp", day_field="trading_date",
         ),
     }
 

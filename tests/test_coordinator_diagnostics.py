@@ -1470,3 +1470,71 @@ def test_veto_transitions_opinion_level_day_blocked_wiring():
     assert olb["candidate_level_totals"] == {"coordinator_trade_veto_survives": 1}
     assert olb["opinion_weighted_totals"] == {"coordinator_trade_veto_survives": 1.0}
     assert olb["by_day"]["2026-08-16"]["distinct_opinions"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Tier 3.35: direction/flag-opinion breakdown (tenth external review)
+# ---------------------------------------------------------------------------
+
+def test_veto_transitions_direction_flag_basis_answers_shorts_killed_by_risk_off():
+    # The reviewer's central question: how many SHORT (bearish) trades
+    # would be killed by risk_off specifically? Build one bearish case
+    # killed by risk_off alone and one bullish case killed by urgent
+    # alone -- direction_flag_basis_by_transition must keep them
+    # separate, not just pool both under the same transition.
+    short_killed_by_risk_off = _candidate(
+        analysis=_opinion("bearish", 90),
+        news=_opinion("bearish", 90),
+        macro=_flagged_opinion("neutral", 50, ["risk_off"]),
+    )
+    long_killed_by_urgent = _candidate(
+        analysis=_opinion("bullish", 90),
+        news=_flagged_opinion("bullish", 90, ["urgent"]),
+        macro=_opinion("bullish", 90),
+    )
+    result = compute_veto_decision_transitions([short_killed_by_risk_off, long_killed_by_urgent])
+    assert result["transition_summary"] == {"coordinator_trade_veto_would_skip": 2}
+    dfb = result["direction_flag_basis_by_transition"]["coordinator_trade_veto_would_skip"]
+    assert dfb["bearish"] == {"macro_risk_off_only": 1}
+    assert dfb["bullish"] == {"news_urgent_only": 1}
+
+
+def test_veto_transitions_news_and_macro_opinion_level_day_blocked_are_independent():
+    # News's opinion is reused across two candidates (same timestamp);
+    # Macro only ever appears on one of them. The News-keyed
+    # re-aggregation should see 1 distinct News opinion reused twice;
+    # the Macro-keyed one should see only 1 case total (the other
+    # excluded automatically since Macro didn't run on it -- no
+    # macro_opinion_timestamp to key by).
+    shared_news = _opinion("bullish", 90)
+    c1 = _candidate(analysis=_opinion("bullish", 90), news=shared_news, macro=_opinion("bullish", 90))
+    c2 = _candidate(analysis=_opinion("bullish", 85), news=shared_news)  # macro absent this time
+    c1["bar"] = {"timestamp": "2026-08-16T14:00:00Z", "trading_date": "2026-08-16"}
+    c2["bar"] = {"timestamp": "2026-08-16T14:05:00Z", "trading_date": "2026-08-16"}
+    result = compute_veto_decision_transitions([c1, c2])
+
+    news_olb = result["news_opinion_level_day_blocked"]
+    assert news_olb["distinct_opinions_total"] == 1
+    assert news_olb["by_day"]["2026-08-16"]["candidates_considered"] == 2
+
+    macro_olb = result["macro_opinion_level_day_blocked"]
+    assert macro_olb["distinct_opinions_total"] == 1
+    assert macro_olb["by_day"]["2026-08-16"]["candidates_considered"] == 1
+    assert macro_olb["uncategorized_count"] == 1  # c2, Macro didn't run
+
+
+def test_veto_transitions_cases_carry_direction_and_session_fields():
+    candidate = _candidate(
+        analysis=_opinion("bearish", 90),
+        news=_opinion("bearish", 90),
+        macro=_flagged_opinion("neutral", 50, ["risk_off"]),
+    )
+    candidate["bar"] = {
+        "timestamp": "2026-08-16T14:00:00Z", "trading_date": "2026-08-16", "session_name": "OVERNIGHT",
+    }
+    result = compute_veto_decision_transitions([candidate])
+    case = result["cases"][0]
+    assert case["coordinator_direction"] == "bearish"
+    assert case["session_name"] == "OVERNIGHT"
+    assert case["news_opinion_timestamp"] == "2026-08-16T14:00:00Z"
+    assert case["macro_opinion_timestamp"] == "2026-08-16T14:00:00Z"
