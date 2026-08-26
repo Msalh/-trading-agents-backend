@@ -1462,6 +1462,54 @@ def compute_risk_filter_veto_attribution(candidates: list[dict]) -> dict:
 # simulation involved at all. COORDINATOR_THRESHOLD/WEIGHTS/
 # MIN_AVAILABLE_WEIGHT/analysis_risk_filtered's own veto scope all
 # untouched.
+#
+# Tier 3.36 (eleventh external review, items #2/#3 of its priority
+# order): the tenth/eleventh reviews' direction breakdown (Tier 3.35's
+# `direction_flag_basis_by_transition`) found `risk_off`-implicated
+# kills are ~40:1 skewed toward SHORT (bearish) coordinator decisions
+# (128 short vs 38 long in a fresh production pull). The eleventh review
+# correctly flagged that this raw count alone doesn't distinguish two
+# very different explanations: (a) `risk_off` is a poorly-named but
+# genuinely direction-agnostic risk filter that happens to fire more
+# often when Analysis/News have already gone short (a STRUCTURAL
+# ENDOGENEITY — Macro's own directional opinion feeds the same score
+# that produces the short decision in the first place, so of course
+# risk_off-flagged candidates skew short), vs (b) `risk_off` is
+# functionally anti-correlated with Macro's own bearish reads, which
+# would be a much stranger and more concerning pattern. Tier 3.36 adds
+# two things needed to start telling these apart, without touching any
+# live scoring/veto behavior:
+#
+# `macro_direction`/`news_direction` per case (each agent's OWN
+# directional opinion, None when that agent didn't run) — lets a caller
+# cross-tab Macro's own bearish/bullish/neutral read against
+# Coordinator's resulting short/long direction, directly on the
+# `risk_off`-flagged population. `macro_risk_off_direction_crosstab`
+# does exactly this: macro_direction -> coordinator_direction -> count,
+# scoped to `macro_risk_off == True` cases only (the population the
+# asymmetry claim is actually about). If risk_off's short-skew is driven
+# by Macro itself reading bearish (the endogenous, less surprising
+# explanation), that will show up here as bearish-macro_direction rows
+# dominating; if risk_off fires with Macro reading neutral/bullish while
+# still killing short Coordinator decisions, that's the more surprising
+# case worth flagging back to the reviewer.
+#
+# `macro_opinion_diversity`/`news_opinion_diversity` (Tier 3.36, item #3
+# — "how many DISTINCT Macro opinions produced the risk_off-killed short
+# count, not just how many candidates") — transition -> coordinator_
+# direction -> {candidates, distinct_opinions, distinct_trading_days},
+# scoped to `macro_risk_off == True` (`news_urgent == True` for the News
+# variant) cases. A single Macro opinion commonly anchors many
+# candidates (per Tier 3.29's existing opinion-vs-candidate distinction)
+# — this makes explicit how much of the 118/121 risk_off-implicated
+# short-kill count is independent evidence (many distinct Macro calls)
+# versus one or a few opinions repeated across candidates, addressing
+# the reviewer's own "day remains the most conservative unit of
+# independence" blind-spot note by tracking distinct trading days too.
+#
+# Both new aggregates are purely additive re-slices of the same `cases`
+# already built above — no new population, no new exclusion criteria,
+# no replay, no live behavior touched.
 
 
 def compute_veto_decision_transitions(candidates: list[dict]) -> dict:
@@ -1482,7 +1530,13 @@ def compute_veto_decision_transitions(candidates: list[dict]) -> dict:
     `opinion_level_day_blocked` (Analysis-opinion identity, matching Tier
     3.31's own report), `news_opinion_level_day_blocked` and
     `macro_opinion_level_day_blocked` (Tier 3.35: each flag's OWN opinion
-    identity, cases where that agent didn't run auto-excluded)."""
+    identity, cases where that agent didn't run auto-excluded).
+    Tier 3.36 additionally returns `macro_risk_off_direction_crosstab`
+    (macro_direction -> coordinator_direction -> count, scoped to
+    macro_risk_off cases) and `macro_opinion_diversity`/`news_opinion_
+    diversity` (transition -> coordinator_direction -> {candidates,
+    distinct_opinions, distinct_trading_days}, scoped to that flag's
+    True cases) — see the Tier 3.36 module comment above."""
     cases = []
     excluded_not_directional = 0
 
@@ -1535,6 +1589,8 @@ def compute_veto_decision_transitions(candidates: list[dict]) -> dict:
             "news_opinion_timestamp": (news_opinion or {}).get("timestamp"),
             "macro_opinion_timestamp": (macro_opinion or {}).get("timestamp"),
             "analysis_direction": analysis_direction,
+            "news_direction": (news_opinion or {}).get("direction"),
+            "macro_direction": (macro_opinion or {}).get("direction"),
             "coordinator_decision": coordinator_decision,
             "coordinator_direction": coordinator_direction,
             "news_urgent": news_urgent,
@@ -1547,6 +1603,12 @@ def compute_veto_decision_transitions(candidates: list[dict]) -> dict:
     flag_basis_by_transition: dict[str, dict[str, int]] = {}
     direction_flag_basis_by_transition: dict[str, dict[str, dict[str, int]]] = {}
     coordinator_skip_reason_by_transition: dict[str, dict[str, int]] = {}
+    macro_risk_off_direction_crosstab: dict[str, dict[str, int]] = {}
+    # (transition, coordinator_direction) -> {"candidates": int,
+    # "_opinion_timestamps": set, "_trading_days": set} — the two sets
+    # are converted to counts after the loop and dropped from output.
+    macro_diversity_acc: dict[tuple[str, str], dict] = {}
+    news_diversity_acc: dict[tuple[str, str], dict] = {}
     for case in cases:
         t = case["transition"]
         transition_summary[t] = transition_summary.get(t, 0) + 1
@@ -1568,6 +1630,47 @@ def compute_veto_decision_transitions(candidates: list[dict]) -> dict:
                 coordinator_skip_reason_by_transition[t].get(reason, 0) + 1
             )
 
+        if case["macro_risk_off"]:
+            macro_dir = case["macro_direction"] or "neutral"
+            macro_risk_off_direction_crosstab.setdefault(macro_dir, {})
+            macro_risk_off_direction_crosstab[macro_dir][direction] = (
+                macro_risk_off_direction_crosstab[macro_dir].get(direction, 0) + 1
+            )
+
+            key = (t, direction)
+            acc = macro_diversity_acc.setdefault(
+                key, {"candidates": 0, "_opinion_timestamps": set(), "_trading_days": set()}
+            )
+            acc["candidates"] += 1
+            if case["macro_opinion_timestamp"] is not None:
+                acc["_opinion_timestamps"].add(case["macro_opinion_timestamp"])
+            if case["trading_date"] is not None:
+                acc["_trading_days"].add(case["trading_date"])
+
+        if case["news_urgent"]:
+            key = (t, direction)
+            acc = news_diversity_acc.setdefault(
+                key, {"candidates": 0, "_opinion_timestamps": set(), "_trading_days": set()}
+            )
+            acc["candidates"] += 1
+            if case["news_opinion_timestamp"] is not None:
+                acc["_opinion_timestamps"].add(case["news_opinion_timestamp"])
+            if case["trading_date"] is not None:
+                acc["_trading_days"].add(case["trading_date"])
+
+    def _finalize_diversity(acc_map: dict[tuple[str, str], dict]) -> dict[str, dict[str, dict]]:
+        result: dict[str, dict[str, dict]] = {}
+        for (t, direction), acc in acc_map.items():
+            result.setdefault(t, {})[direction] = {
+                "candidates": acc["candidates"],
+                "distinct_opinions": len(acc["_opinion_timestamps"]),
+                "distinct_trading_days": len(acc["_trading_days"]),
+            }
+        return result
+
+    macro_opinion_diversity = _finalize_diversity(macro_diversity_acc)
+    news_opinion_diversity = _finalize_diversity(news_diversity_acc)
+
     return {
         "candidates_considered": len(candidates),
         "analysis_not_directional_excluded": excluded_not_directional,
@@ -1576,6 +1679,9 @@ def compute_veto_decision_transitions(candidates: list[dict]) -> dict:
         "flag_basis_by_transition": flag_basis_by_transition,
         "direction_flag_basis_by_transition": direction_flag_basis_by_transition,
         "coordinator_skip_reason_by_transition": coordinator_skip_reason_by_transition,
+        "macro_risk_off_direction_crosstab": macro_risk_off_direction_crosstab,
+        "macro_opinion_diversity": macro_opinion_diversity,
+        "news_opinion_diversity": news_opinion_diversity,
         "cases": cases,
         "opinion_level_day_blocked": _opinion_level_day_blocked_summary(
             cases, category_field="transition", opinion_field="analysis_opinion_timestamp", day_field="trading_date",

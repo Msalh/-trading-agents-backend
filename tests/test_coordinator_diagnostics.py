@@ -1538,3 +1538,102 @@ def test_veto_transitions_cases_carry_direction_and_session_fields():
     assert case["session_name"] == "OVERNIGHT"
     assert case["news_opinion_timestamp"] == "2026-08-16T14:00:00Z"
     assert case["macro_opinion_timestamp"] == "2026-08-16T14:00:00Z"
+
+
+# ---------------------------------------------------------------------------
+# Tier 3.36: macro/news direction fields + risk_off direction crosstab +
+# opinion-diversity aggregation (eleventh external review, items #2/#3)
+# ---------------------------------------------------------------------------
+
+def _flagged_opinion_at(direction, confidence, flags, timestamp):
+    return {"direction": direction, "confidence": confidence, "timestamp": timestamp, "flags": flags}
+
+
+def test_veto_transitions_cases_carry_macro_and_news_direction_fields():
+    # macro_direction/news_direction mirror each agent's own directional
+    # opinion; None when that agent didn't run at all (distinct from
+    # "ran but was neutral").
+    candidate = _candidate(
+        analysis=_opinion("bearish", 90),
+        news=_opinion("bearish", 90),
+    )
+    result = compute_veto_decision_transitions([candidate])
+    case = result["cases"][0]
+    assert case["news_direction"] == "bearish"
+    assert case["macro_direction"] is None  # Macro never ran on this candidate
+
+
+def test_veto_transitions_macro_risk_off_direction_crosstab():
+    # Three risk_off-flagged Macro cases: one where Macro itself read
+    # bearish (the endogenous, expected case), one where Macro read
+    # bullish, and one where Macro read neutral -- yet all three still
+    # produced a bearish or bullish Coordinator decision. The crosstab
+    # must key strictly off macro_direction, separate from
+    # coordinator_direction, and must NOT include the non-risk_off case.
+    macro_bearish_coordinator_bearish = _candidate(
+        analysis=_opinion("bearish", 90),
+        news=_opinion("bearish", 90),
+        macro=_flagged_opinion("bearish", 90, ["risk_off"]),
+    )
+    macro_bullish_coordinator_bullish = _candidate(
+        analysis=_opinion("bullish", 90),
+        news=_opinion("bullish", 90),
+        macro=_flagged_opinion("bullish", 90, ["risk_off"]),
+    )
+    macro_neutral_coordinator_bearish = _candidate(
+        analysis=_opinion("bearish", 90),
+        news=_opinion("bearish", 90),
+        macro=_flagged_opinion("neutral", 50, ["risk_off"]),
+    )
+    not_risk_off_at_all = _candidate(
+        analysis=_opinion("bullish", 90), news=_opinion("bullish", 90), macro=_opinion("bullish", 90),
+    )
+    result = compute_veto_decision_transitions([
+        macro_bearish_coordinator_bearish,
+        macro_bullish_coordinator_bullish,
+        macro_neutral_coordinator_bearish,
+        not_risk_off_at_all,
+    ])
+    assert result["macro_risk_off_direction_crosstab"] == {
+        "bearish": {"bearish": 1},
+        "bullish": {"bullish": 1},
+        "neutral": {"bearish": 1},
+    }
+
+
+def test_veto_transitions_macro_opinion_diversity_counts_distinct_opinions_not_candidates():
+    # Same Macro opinion (same timestamp) reused across two candidates,
+    # a third candidate carries a genuinely distinct Macro opinion.
+    # distinct_opinions must count 2, not 3 -- candidates must count 3.
+    shared_macro = _flagged_opinion_at("bearish", 90, ["risk_off"], "2026-08-16T14:00:00Z")
+    distinct_macro = _flagged_opinion_at("bearish", 90, ["risk_off"], "2026-08-16T15:00:00Z")
+    c1 = _candidate(analysis=_opinion("bearish", 90), news=_opinion("bearish", 90), macro=shared_macro)
+    c2 = _candidate(analysis=_opinion("bearish", 85), news=_opinion("bearish", 85), macro=shared_macro)
+    c3 = _candidate(analysis=_opinion("bearish", 80), news=_opinion("bearish", 80), macro=distinct_macro)
+    c1["bar"] = {"trading_date": "2026-08-16"}
+    c2["bar"] = {"trading_date": "2026-08-16"}
+    c3["bar"] = {"trading_date": "2026-08-17"}
+    result = compute_veto_decision_transitions([c1, c2, c3])
+    diversity = result["macro_opinion_diversity"]["coordinator_trade_veto_would_skip"]["bearish"]
+    assert diversity == {"candidates": 3, "distinct_opinions": 2, "distinct_trading_days": 2}
+
+
+def test_veto_transitions_news_opinion_diversity_scoped_to_urgent_only():
+    # news_opinion_diversity must only include news_urgent cases -- a
+    # non-urgent candidate in the same population must not leak in.
+    urgent_case = _candidate(
+        analysis=_opinion("bullish", 90),
+        news=_flagged_opinion("bullish", 90, ["urgent"]),
+        macro=_opinion("bullish", 90),
+    )
+    non_urgent_case = _candidate(
+        analysis=_opinion("bullish", 90), news=_opinion("bullish", 90), macro=_opinion("bullish", 90),
+    )
+    result = compute_veto_decision_transitions([urgent_case, non_urgent_case])
+    diversity = result["news_opinion_diversity"]
+    assert diversity["coordinator_trade_veto_would_skip"]["bullish"] == {
+        "candidates": 1, "distinct_opinions": 1, "distinct_trading_days": 0,
+    }
+    # non_urgent_case landed in a different transition and must not
+    # appear in news_opinion_diversity at all (no news_urgent flag).
+    assert "coordinator_trade_veto_survives" not in diversity

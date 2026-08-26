@@ -2304,6 +2304,44 @@ cumulative population plus an increment, not two independent samples.
 Compare `candidates_considered` explicitly across pulls rather than
 assuming a changed rate implies a regime change.
 
+**Tier 3.36** (eleventh external review, items #2/#3): a fresh
+production pull through `direction_flag_basis_by_transition` found
+`risk_off`-implicated kills skewed ~40:1 toward short (bearish)
+Coordinator decisions (128 short vs. 38 long in one pull). The eleventh
+reviewer correctly noted that raw skew alone can't distinguish "`risk_
+off` is direction-agnostic but structurally correlated with Macro's own
+directional opinion, which feeds the same score that produced the short
+decision in the first place" (a structural endogeneity, not a bug) from
+"`risk_off` is functionally anti-correlated with Macro's own bearish
+reads" (a much stranger pattern). Three purely additive fields help
+start telling these apart:
+
+- Each case now also carries **`news_direction`** / **`macro_
+  direction`** — that agent's own directional opinion (`"bullish"` /
+  `"bearish"` / `"neutral"`), `null` when that agent didn't run at all
+  (distinct from having run and read neutral).
+- **`macro_risk_off_direction_crosstab`** — `macro_direction ->
+  coordinator_direction -> count`, scoped to `macro_risk_off == true`
+  cases only (the population the skew claim is actually about). If the
+  short-skew is driven by Macro itself reading bearish, that shows up as
+  `"bearish"` rows dominating; `risk_off` firing while Macro read
+  `"neutral"`/`"bullish"` and still killing short decisions is the more
+  surprising pattern worth flagging back.
+- **`macro_opinion_diversity`** / **`news_opinion_diversity`** —
+  `transition -> coordinator_direction -> {candidates, distinct_
+  opinions, distinct_trading_days}`, scoped to that flag's `true` cases
+  (`macro_risk_off` / `news_urgent` respectively). Answers "how many
+  DISTINCT Macro/News opinions produced this kill count," not just how
+  many candidates — a single opinion commonly anchors several
+  consecutive candidates (Tier 3.29's own opinion-vs-candidate
+  distinction) — and separately tracks distinct trading days, per the
+  eleventh review's own "day is the most conservative unit of
+  independence" blind-spot note.
+
+Both new aggregates are re-slices of the same `cases` already built —
+no new population, no new exclusion criteria, no replay, no live
+behavior touched.
+
 ```json
 {
   "symbol": "MNQ1!",
@@ -2343,6 +2381,8 @@ assuming a changed rate implies a regime change.
       "news_opinion_timestamp": "2026-08-16T14:00:00Z",
       "macro_opinion_timestamp": null,
       "analysis_direction": "bullish",
+      "news_direction": "bullish",
+      "macro_direction": null,
       "coordinator_decision": "enter_long",
       "coordinator_direction": "bullish",
       "news_urgent": false,
@@ -2353,7 +2393,22 @@ assuming a changed rate implies a regime change.
   ],
   "opinion_level_day_blocked": { "...": "see below" },
   "news_opinion_level_day_blocked": { "...": "same aggregator, keyed on news_opinion_timestamp" },
-  "macro_opinion_level_day_blocked": { "...": "same aggregator, keyed on macro_opinion_timestamp" }
+  "macro_opinion_level_day_blocked": { "...": "same aggregator, keyed on macro_opinion_timestamp" },
+  "macro_risk_off_direction_crosstab": {
+    "bearish": { "bearish": 55 },
+    "neutral": { "bearish": 63, "bullish": 3 }
+  },
+  "macro_opinion_diversity": {
+    "coordinator_trade_veto_would_skip": {
+      "bearish": { "candidates": 118, "distinct_opinions": 31, "distinct_trading_days": 9 }
+    }
+  },
+  "news_opinion_diversity": {
+    "coordinator_trade_veto_would_skip": {
+      "bearish": { "candidates": 73, "distinct_opinions": 22, "distinct_trading_days": 8 },
+      "bullish": { "candidates": 35, "distinct_opinions": 14, "distinct_trading_days": 6 }
+    }
+  }
 }
 ```
 

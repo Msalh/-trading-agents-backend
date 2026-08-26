@@ -1249,12 +1249,19 @@ def test_veto_decision_transitions_endpoint_returns_shape(client):
     assert case["coordinator_direction"] == "bullish"
     assert case["news_opinion_timestamp"] == anchor
     assert case["macro_opinion_timestamp"] is None
+    assert case["news_direction"] == "bullish"
+    assert case["macro_direction"] is None  # Macro didn't run on this candidate
     olb = body["opinion_level_day_blocked"]
     assert olb["candidate_level_totals"] == {"coordinator_trade_veto_survives": 1}
     news_olb = body["news_opinion_level_day_blocked"]
     assert news_olb["candidate_level_totals"] == {"coordinator_trade_veto_survives": 1}
     macro_olb = body["macro_opinion_level_day_blocked"]
     assert macro_olb["uncategorized_count"] == 1  # Macro didn't run on this candidate
+    # Tier 3.36: no risk_off/urgent flags present anywhere in this fixture,
+    # so all three new aggregates stay empty rather than fabricating buckets.
+    assert body["macro_risk_off_direction_crosstab"] == {}
+    assert body["macro_opinion_diversity"] == {}
+    assert body["news_opinion_diversity"] == {}
 
 
 def test_veto_decision_transitions_endpoint_empty_history(client):
@@ -1270,6 +1277,9 @@ def test_veto_decision_transitions_endpoint_empty_history(client):
     assert body["flag_basis_by_transition"] == {}
     assert body["direction_flag_basis_by_transition"] == {}
     assert body["coordinator_skip_reason_by_transition"] == {}
+    assert body["macro_risk_off_direction_crosstab"] == {}
+    assert body["macro_opinion_diversity"] == {}
+    assert body["news_opinion_diversity"] == {}
     assert body["cases"] == []
 
 

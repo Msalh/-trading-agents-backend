@@ -1120,6 +1120,40 @@ follow-ups per the reviewer's own priority ordering): the shared-
 watermark-950 paired prospective comparison design, incremental P&L for
 the killed decisions, and the risk_off semantic redesign.
 
+Tier 3.36 (eleventh external review, 2026-08-26, items #2/#3): a fresh
+production pull through Tier 3.35's direction_flag_basis_by_transition
+found risk_off-implicated kills skewed ~40:1 short over long (128 vs 38
+in one pull). The eleventh reviewer correctly noted the raw skew alone
+can't separate "risk_off is direction-agnostic but structurally
+correlated with Macro's own directional opinion, which feeds the same
+score that produced the short decision in the first place" from
+"risk_off is functionally anti-correlated with Macro's own bearish
+reads" — a real structural-endogeneity concern, not just a wording one.
+compute_veto_decision_transitions() gained purely additive pieces
+answering items #2/#3 of the reviewer's priority order: (1) each case
+now also carries news_direction/macro_direction (that agent's own
+directional opinion, None when it didn't run); (2)
+macro_risk_off_direction_crosstab cross-tabs macro_direction ->
+coordinator_direction -> count, scoped to macro_risk_off cases only,
+letting a caller see directly whether the short-skew traces back to
+Macro itself reading bearish (the more expected, endogenous case) or
+persists even when Macro read neutral/bullish (the more surprising
+case); (3) macro_opinion_diversity/news_opinion_diversity (transition ->
+coordinator_direction -> {candidates, distinct_opinions,
+distinct_trading_days}, scoped to that flag's True cases) answer how
+many DISTINCT opinions — not just candidates — produced the kill count,
+since one opinion commonly anchors several candidates, and separately
+track distinct trading days per the reviewer's own "day is the most
+conservative unit of independence" note. No existing field's shape or
+meaning changed. Entirely offline, no replay, no LLM calls, no live
+behavior touched — COORDINATOR_THRESHOLD/WEIGHTS/MIN_AVAILABLE_WEIGHT/
+AUTO_EXECUTE_ENABLED all untouched. Not addressed this tier (still
+deferred, per the reviewer's own priority ordering): items #1
+(denominators/kill-rates, already partly answered by the corrected
+direction-normalized analysis in Package #11's discussion), the paired-
+watermark-950 comparison, incremental P&L, and the risk_off/Macro
+3-axis schema redesign.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -2756,6 +2790,30 @@ def candidates_history_veto_decision_transitions(
     independent samples. Compare `candidates_considered` explicitly
     across pulls rather than assuming a changed rate implies a regime
     change.
+
+    Tier 3.36 (eleventh external review, items #2/#3): a fresh
+    production pull through this endpoint found `risk_off`-implicated
+    kills skewed ~40:1 toward short (bearish) Coordinator decisions. The
+    eleventh review correctly noted this raw skew alone can't distinguish
+    "risk_off is direction-agnostic but structurally correlated with
+    Macro's own bearish reads feeding the same score" from "risk_off is
+    functionally anti-correlated with Macro's own bearish reads" — both
+    would need more before drawing conclusions. Two additive fields help:
+    each case now also carries `news_direction`/`macro_direction` (that
+    agent's own directional opinion, None when it didn't run).
+    `macro_risk_off_direction_crosstab` cross-tabs macro_direction ->
+    coordinator_direction -> count, scoped to `macro_risk_off == True`
+    cases only — if the short-skew is driven by Macro itself reading
+    bearish, that shows up as bearish-macro_direction rows dominating;
+    risk_off firing while Macro reads neutral/bullish and still killing
+    short decisions would be the more surprising pattern. `macro_opinion_
+    diversity`/`news_opinion_diversity` (transition -> coordinator_
+    direction -> {candidates, distinct_opinions, distinct_trading_days},
+    scoped to that flag's True cases) answer "how many DISTINCT Macro/
+    News opinions produced this kill count," not just how many
+    candidates — since one opinion commonly anchors several candidates —
+    and track distinct trading days too, per the eleventh review's own
+    "day is the most conservative unit of independence" note.
 
     Entirely offline. COORDINATOR_THRESHOLD/WEIGHTS/MIN_AVAILABLE_WEIGHT/
     analysis_risk_filtered's own veto scope are all untouched."""
