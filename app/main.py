@@ -1154,6 +1154,37 @@ direction-normalized analysis in Package #11's discussion), the paired-
 watermark-950 comparison, incremental P&L, and the risk_off/Macro
 3-axis schema redesign.
 
+Tier 3.37 (twelfth external review, 2026-08-26, item #1): the twelfth
+reviewer confirmed Tier 3.36's 83%/17% Macro-endogeneity split (98
+bearish-Macro / 20 neutral-Macro among the 118 risk_off-killed shorts)
+is arithmetically sound but does NOT resolve risk_off's semantics
+either way — 83% "explains" the skew mechanically without proving
+risk_off is working as intended, and 17% doesn't condemn it either. The
+reviewer's sharper point: a more basic gap was still open from Package
+#11 — the raw 128 short / 38 long kill counts were never normalized
+against how many directional decisions Coordinator produces in each
+direction in the first place, so "128 killed" conflates the DISTRIBUTION
+within the killed population with the PROPENSITY to kill, which needs
+the full population as its denominator. compute_veto_decision_
+transitions() gained one small additive field answering item #1 exactly:
+direction_kill_rate_summary (coordinator_direction -> total_directional_
+decisions/urgent_implicated_kills/risk_off_implicated_kills/both_
+implicated_kills/survived/urgent_kill_rate/risk_off_kill_rate) — computed
+directly from the existing per-case data, no new population, no replay,
+no live behavior touched, rates rounded to 3 decimals following this
+module's existing rate-field convention (compute_news_urgent_
+prevalence's urgent_rate). Deliberately NOT done this tier, per the
+reviewer's own priority ordering, which puts this denominator step
+first specifically because it's small and should close the last clear
+descriptive gap before anything bigger is attempted: incremental P&L
+(decision-level AND portfolio-level, per the reviewer's explicit request
+for both views plus a "first candidate per distinct Macro opinion"
+conservative view), the paired-watermark-950 comparison, and the
+risk_off/Macro 3-axis schema redesign (to be built as a separate
+shadow/versioned Macro output, never silently overwriting the live
+prompt or conflated with the existing 1ba9ad78 experiment's frozen
+definition, per the reviewer's explicit caution).
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -2814,6 +2845,26 @@ def candidates_history_veto_decision_transitions(
     candidates — since one opinion commonly anchors several candidates —
     and track distinct trading days too, per the eleventh review's own
     "day is the most conservative unit of independence" note.
+
+    Tier 3.37 (twelfth external review, item #1): Tier 3.36's crosstab
+    found 83% of risk_off-implicated killed shorts had Macro itself
+    reading bearish versus 17% reading neutral. The twelfth reviewer's
+    verdict was that this split doesn't resolve risk_off's semantics
+    either way, AND flagged a more basic gap still open: Package #11's
+    raw kill counts (128 short / 38 long) were never normalized against
+    how many directional decisions Coordinator produces in EACH
+    direction — 128-of-166-killed sounds large, but 128-of-however-many-
+    short-decisions-exist is the number that measures propensity.
+    `direction_kill_rate_summary` (coordinator_direction ->
+    {total_directional_decisions, urgent_implicated_kills, risk_off_
+    implicated_kills, both_implicated_kills, survived, urgent_kill_rate,
+    risk_off_kill_rate}) adds exactly that missing denominator:
+    total_directional_decisions is every real Coordinator trade in that
+    direction, killed or not (would_skip + survives combined); each rate
+    is that direction's implicated-kill count divided by its own total,
+    rounded to 3 decimals (a direction with zero real trades simply
+    doesn't appear as a key — no divide-by-zero case exists to return
+    None for).
 
     Entirely offline. COORDINATOR_THRESHOLD/WEIGHTS/MIN_AVAILABLE_WEIGHT/
     analysis_risk_filtered's own veto scope are all untouched."""

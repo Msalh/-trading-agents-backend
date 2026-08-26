@@ -1262,6 +1262,19 @@ def test_veto_decision_transitions_endpoint_returns_shape(client):
     assert body["macro_risk_off_direction_crosstab"] == {}
     assert body["macro_opinion_diversity"] == {}
     assert body["news_opinion_diversity"] == {}
+    # Tier 3.37: the one real trade (bullish, survived, no flags) still
+    # populates its own denominator with zero implicated kills.
+    assert body["direction_kill_rate_summary"] == {
+        "bullish": {
+            "total_directional_decisions": 1,
+            "urgent_implicated_kills": 0,
+            "risk_off_implicated_kills": 0,
+            "both_implicated_kills": 0,
+            "survived": 1,
+            "urgent_kill_rate": 0.0,
+            "risk_off_kill_rate": 0.0,
+        },
+    }
 
 
 def test_veto_decision_transitions_endpoint_empty_history(client):
@@ -1280,6 +1293,7 @@ def test_veto_decision_transitions_endpoint_empty_history(client):
     assert body["macro_risk_off_direction_crosstab"] == {}
     assert body["macro_opinion_diversity"] == {}
     assert body["news_opinion_diversity"] == {}
+    assert body["direction_kill_rate_summary"] == {}
     assert body["cases"] == []
 
 

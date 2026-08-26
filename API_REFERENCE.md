@@ -2342,6 +2342,43 @@ Both new aggregates are re-slices of the same `cases` already built —
 no new population, no new exclusion criteria, no replay, no live
 behavior touched.
 
+**Tier 3.37** (twelfth external review, item #1): the twelfth reviewer
+confirmed Tier 3.36's 83%/17% Macro-endogeneity split is arithmetically
+sound but flagged that it doesn't resolve `risk_off`'s semantics either
+way — and pointed at a more basic gap still open from Package #11: the
+raw kill counts (128 short / 38 long) were never normalized against how
+many directional decisions Coordinator produces in EACH direction in
+the first place. 128-of-166-killed is a DISTRIBUTION-within-the-killed-
+population number; 128-of-however-many-short-decisions-exist is the
+PROPENSITY number that actually measures kill rate.
+
+**`direction_kill_rate_summary`** adds exactly that missing denominator
+— `coordinator_direction -> {total_directional_decisions, urgent_
+implicated_kills, risk_off_implicated_kills, both_implicated_kills,
+survived, urgent_kill_rate, risk_off_kill_rate}`:
+
+- `total_directional_decisions` — every real Coordinator trade in that
+  direction, killed or not (`coordinator_trade_veto_would_skip` +
+  `coordinator_trade_veto_survives` combined for that direction).
+- `urgent_implicated_kills` / `risk_off_implicated_kills` — the same
+  `news_urgent_only + both` / `macro_risk_off_only + both` counts used
+  elsewhere in this endpoint, now paired with a real denominator.
+- `both_implicated_kills` — the overlap subset, reported separately for
+  transparency.
+- `survived` — traded, no veto flag present (`coordinator_trade_veto_
+  survives` for that direction).
+- `urgent_kill_rate` / `risk_off_kill_rate` — the implicated-kill count
+  divided by `total_directional_decisions`, rounded to 3 decimals,
+  following this module's existing rate-field convention (e.g.
+  `news-urgent-prevalence`'s `urgent_rate`). A direction with zero real
+  trades simply doesn't appear as a key at all — there's no `0/0` case
+  to return `null` for.
+
+This is a small, purely additive re-slice of the same `cases` — no new
+population, no replay, no live behavior touched — but it's the piece
+needed before any kill-COUNT claim (like Package #11's raw 128/38) can
+be read as a kill-RATE / propensity claim.
+
 ```json
 {
   "symbol": "MNQ1!",
@@ -2407,6 +2444,26 @@ behavior touched.
     "coordinator_trade_veto_would_skip": {
       "bearish": { "candidates": 73, "distinct_opinions": 22, "distinct_trading_days": 8 },
       "bullish": { "candidates": 35, "distinct_opinions": 14, "distinct_trading_days": 6 }
+    }
+  },
+  "direction_kill_rate_summary": {
+    "bearish": {
+      "total_directional_decisions": 161,
+      "urgent_implicated_kills": 73,
+      "risk_off_implicated_kills": 118,
+      "both_implicated_kills": 63,
+      "survived": 33,
+      "urgent_kill_rate": 0.453,
+      "risk_off_kill_rate": 0.733
+    },
+    "bullish": {
+      "total_directional_decisions": 138,
+      "urgent_implicated_kills": 35,
+      "risk_off_implicated_kills": 3,
+      "both_implicated_kills": 0,
+      "survived": 100,
+      "urgent_kill_rate": 0.254,
+      "risk_off_kill_rate": 0.022
     }
   }
 }

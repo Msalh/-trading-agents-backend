@@ -1510,6 +1510,35 @@ def compute_risk_filter_veto_attribution(candidates: list[dict]) -> dict:
 # Both new aggregates are purely additive re-slices of the same `cases`
 # already built above — no new population, no new exclusion criteria,
 # no replay, no live behavior touched.
+#
+# Tier 3.37 (twelfth external review, item #1 of its priority order):
+# Tier 3.36's crosstab found 83% of risk_off-implicated killed shorts
+# had Macro itself reading bearish (the endogenous case) versus 17%
+# where Macro read neutral yet the kill still happened. The twelfth
+# review's verdict: that split doesn't resolve the semantic question
+# either way (a 3-axis Macro schema is still needed regardless of the
+# ratio), AND a more basic descriptive gap remains open — Package #11's
+# raw kill counts (128 short / 38 long) were never normalized against
+# how many directional decisions Coordinator produces in EACH direction
+# in the first place. 128-of-166 killed sounds large; 128-of-however-
+# many-short-decisions-exist is the number that actually measures
+# propensity, not just the mix of who got killed.
+#
+# `direction_kill_rate_summary` adds exactly that missing denominator:
+# per coordinator_direction (bearish/bullish), `total_directional_
+# decisions` (every real Coordinator trade in that direction, killed or
+# not — the trade_veto_would_skip + trade_veto_survives populations
+# combined), `urgent_implicated_kills`/`risk_off_implicated_kills` (the
+# now-familiar news_urgent_only+both / macro_risk_off_only+both counts),
+# `both_implicated_kills`, `survived`, and the two rates themselves —
+# `urgent_kill_rate`/`risk_off_kill_rate`, each implicated-kill count
+# divided by that direction's total directional decisions, rounded to 3
+# decimals (None when the denominator is 0, matching this module's
+# existing rate-field convention, e.g. compute_news_urgent_prevalence's
+# urgent_rate). This is a small, purely additive re-slice of the same
+# `cases` — no new population, no replay, no live behavior touched —
+# but it's the piece needed before any kill-COUNT claim can be read as
+# a kill-RATE / propensity claim.
 
 
 def compute_veto_decision_transitions(candidates: list[dict]) -> dict:
@@ -1536,7 +1565,12 @@ def compute_veto_decision_transitions(candidates: list[dict]) -> dict:
     macro_risk_off cases) and `macro_opinion_diversity`/`news_opinion_
     diversity` (transition -> coordinator_direction -> {candidates,
     distinct_opinions, distinct_trading_days}, scoped to that flag's
-    True cases) — see the Tier 3.36 module comment above."""
+    True cases) — see the Tier 3.36 module comment above. Tier 3.37
+    additionally returns `direction_kill_rate_summary` (coordinator_
+    direction -> {total_directional_decisions, urgent_implicated_kills,
+    risk_off_implicated_kills, both_implicated_kills, survived,
+    urgent_kill_rate, risk_off_kill_rate}) — see the Tier 3.37 module
+    comment above."""
     cases = []
     excluded_not_directional = 0
 
@@ -1609,6 +1643,10 @@ def compute_veto_decision_transitions(candidates: list[dict]) -> dict:
     # are converted to counts after the loop and dropped from output.
     macro_diversity_acc: dict[tuple[str, str], dict] = {}
     news_diversity_acc: dict[tuple[str, str], dict] = {}
+    # coordinator_direction -> {total, urgent_implicated, risk_off_implicated,
+    # both_implicated, survived} — Tier 3.37, scoped to the two "Coordinator
+    # actually traded" transitions only (would_skip + survives).
+    direction_kill_rate_acc: dict[str, dict[str, int]] = {}
     for case in cases:
         t = case["transition"]
         transition_summary[t] = transition_summary.get(t, 0) + 1
@@ -1629,6 +1667,22 @@ def compute_veto_decision_transitions(candidates: list[dict]) -> dict:
             coordinator_skip_reason_by_transition[t][reason] = (
                 coordinator_skip_reason_by_transition[t].get(reason, 0) + 1
             )
+
+        if t in ("coordinator_trade_veto_would_skip", "coordinator_trade_veto_survives"):
+            dkr = direction_kill_rate_acc.setdefault(
+                direction,
+                {"total": 0, "urgent_implicated": 0, "risk_off_implicated": 0, "both_implicated": 0, "survived": 0},
+            )
+            dkr["total"] += 1
+            if t == "coordinator_trade_veto_survives":
+                dkr["survived"] += 1
+            else:
+                if case["news_urgent"]:
+                    dkr["urgent_implicated"] += 1
+                if case["macro_risk_off"]:
+                    dkr["risk_off_implicated"] += 1
+                if case["news_urgent"] and case["macro_risk_off"]:
+                    dkr["both_implicated"] += 1
 
         if case["macro_risk_off"]:
             macro_dir = case["macro_direction"] or "neutral"
@@ -1671,6 +1725,19 @@ def compute_veto_decision_transitions(candidates: list[dict]) -> dict:
     macro_opinion_diversity = _finalize_diversity(macro_diversity_acc)
     news_opinion_diversity = _finalize_diversity(news_diversity_acc)
 
+    direction_kill_rate_summary: dict[str, dict] = {}
+    for direction, acc in direction_kill_rate_acc.items():
+        total = acc["total"]
+        direction_kill_rate_summary[direction] = {
+            "total_directional_decisions": total,
+            "urgent_implicated_kills": acc["urgent_implicated"],
+            "risk_off_implicated_kills": acc["risk_off_implicated"],
+            "both_implicated_kills": acc["both_implicated"],
+            "survived": acc["survived"],
+            "urgent_kill_rate": round(acc["urgent_implicated"] / total, 3) if total else None,
+            "risk_off_kill_rate": round(acc["risk_off_implicated"] / total, 3) if total else None,
+        }
+
     return {
         "candidates_considered": len(candidates),
         "analysis_not_directional_excluded": excluded_not_directional,
@@ -1682,6 +1749,7 @@ def compute_veto_decision_transitions(candidates: list[dict]) -> dict:
         "macro_risk_off_direction_crosstab": macro_risk_off_direction_crosstab,
         "macro_opinion_diversity": macro_opinion_diversity,
         "news_opinion_diversity": news_opinion_diversity,
+        "direction_kill_rate_summary": direction_kill_rate_summary,
         "cases": cases,
         "opinion_level_day_blocked": _opinion_level_day_blocked_summary(
             cases, category_field="transition", opinion_field="analysis_opinion_timestamp", day_field="trading_date",

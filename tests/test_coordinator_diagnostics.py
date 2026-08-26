@@ -1637,3 +1637,64 @@ def test_veto_transitions_news_opinion_diversity_scoped_to_urgent_only():
     # non_urgent_case landed in a different transition and must not
     # appear in news_opinion_diversity at all (no news_urgent flag).
     assert "coordinator_trade_veto_survives" not in diversity
+
+
+# ---------------------------------------------------------------------------
+# Tier 3.37: direction-specific kill-rate denominators (twelfth external
+# review, item #1)
+# ---------------------------------------------------------------------------
+
+def test_direction_kill_rate_summary_computes_rates_against_total_decisions():
+    # One direction (bearish): one risk_off-killed case, one
+    # urgent-killed case, one survivor -- total_directional_decisions
+    # must be all three combined (killed + survived), not just the
+    # killed subset, and each rate is implicated-kills / that total.
+    killed_by_risk_off = _candidate(
+        analysis=_opinion("bearish", 90),
+        news=_opinion("bearish", 90),
+        macro=_flagged_opinion("bearish", 90, ["risk_off"]),
+    )
+    killed_by_urgent = _candidate(
+        analysis=_opinion("bearish", 90),
+        news=_flagged_opinion("bearish", 90, ["urgent"]),
+    )
+    survived = _candidate(analysis=_opinion("bearish", 90), news=_opinion("bearish", 90))
+    result = compute_veto_decision_transitions([killed_by_risk_off, killed_by_urgent, survived])
+    summary = result["direction_kill_rate_summary"]["bearish"]
+    assert summary["total_directional_decisions"] == 3
+    assert summary["risk_off_implicated_kills"] == 1
+    assert summary["urgent_implicated_kills"] == 1
+    assert summary["both_implicated_kills"] == 0
+    assert summary["survived"] == 1
+    assert summary["risk_off_kill_rate"] == round(1 / 3, 3)
+    assert summary["urgent_kill_rate"] == round(1 / 3, 3)
+
+
+def test_direction_kill_rate_summary_both_flags_count_toward_both_rates():
+    # A "both"-basis kill counts toward urgent_implicated_kills AND
+    # risk_off_implicated_kills AND both_implicated_kills -- the same
+    # implicated-count convention Tier 3.35/3.36 already use elsewhere.
+    killed_by_both = _candidate(
+        analysis=_opinion("bullish", 90),
+        news=_flagged_opinion("bullish", 90, ["urgent"]),
+        macro=_flagged_opinion("bullish", 90, ["risk_off"]),
+    )
+    result = compute_veto_decision_transitions([killed_by_both])
+    summary = result["direction_kill_rate_summary"]["bullish"]
+    assert summary["total_directional_decisions"] == 1
+    assert summary["urgent_implicated_kills"] == 1
+    assert summary["risk_off_implicated_kills"] == 1
+    assert summary["both_implicated_kills"] == 1
+    assert summary["survived"] == 0
+    assert summary["urgent_kill_rate"] == 1.0
+    assert summary["risk_off_kill_rate"] == 1.0
+
+
+def test_direction_kill_rate_summary_excludes_non_traded_directions():
+    # A direction that never produced a real Coordinator trade (only
+    # skip transitions) must not appear as a key at all -- there is no
+    # "0 total_directional_decisions" entry to divide by zero on.
+    never_traded = _candidate(analysis=_opinion("bullish", 20), news=_opinion("bullish", 20))
+    result = compute_veto_decision_transitions([never_traded])
+    assert result["transition_summary"] == {"coordinator_skip_veto_irrelevant": 1}
+    assert result["direction_kill_rate_summary"] == {}
