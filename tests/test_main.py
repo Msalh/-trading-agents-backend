@@ -1277,6 +1277,86 @@ def test_veto_decision_transitions_endpoint_returns_shape(client):
     }
 
 
+def test_veto_decision_transitions_endpoint_summary_only_omits_cases(client):
+    # Tier 3.38 (thirteenth external review): summary_only=true must
+    # drop "cases" but leave every other field -- including all Tier
+    # 3.35/3.36/3.37 additive fields -- byte-for-byte identical to the
+    # default response.
+    import app.storage as storage
+
+    anchor = "2026-08-16T14:00:00Z"
+    bar = {
+        "event_id": "evt-vdt-so-1", "symbol": "MNQ1!", "timeframe": "5m", "timestamp": anchor,
+        "trading_date": "2026-08-16",
+    }
+    decision = {
+        "decision": "enter_long",
+        "direction": "bullish",
+        "score": 90.0,
+        "threshold": 25.0,
+        "opinions_used": {
+            "analysis": {"direction": "bullish", "confidence": 90, "timestamp": anchor, "flags": []},
+            "news": {"direction": "bullish", "confidence": 90, "timestamp": anchor, "flags": []},
+        },
+        "missing_agents": [],
+        "stale_agents": [],
+        "contributions": {},
+        "conflict_flags": [],
+        "timestamp": anchor,
+    }
+    storage.save_candidate(candidate_id="cand-vdt-so-1", symbol="MNQ1!", timeframe="5m", bar=bar, decision=decision)
+
+    default_r = client.get(
+        "/candidates/history/veto-decision-transitions",
+        params={"symbol": "MNQ1!", "timeframe": "5m"},
+    )
+    summary_r = client.get(
+        "/candidates/history/veto-decision-transitions",
+        params={"symbol": "MNQ1!", "timeframe": "5m", "summary_only": "true"},
+    )
+    assert default_r.status_code == 200
+    assert summary_r.status_code == 200
+    default_body = default_r.json()
+    summary_body = summary_r.json()
+
+    assert "cases" in default_body
+    assert "cases" not in summary_body
+
+    # Every OTHER field must be identical between the two responses.
+    default_without_cases = {k: v for k, v in default_body.items() if k != "cases"}
+    assert summary_body == default_without_cases
+    # Sanity: the additive aggregate fields introduced across Tiers
+    # 3.35-3.37 are all still present and non-trivial in summary_only mode.
+    assert summary_body["direction_kill_rate_summary"] == {
+        "bullish": {
+            "total_directional_decisions": 1,
+            "urgent_implicated_kills": 0,
+            "risk_off_implicated_kills": 0,
+            "both_implicated_kills": 0,
+            "survived": 1,
+            "urgent_kill_rate": 0.0,
+            "risk_off_kill_rate": 0.0,
+        },
+    }
+
+
+def test_veto_decision_transitions_endpoint_summary_only_default_false_unaffected(client):
+    # Explicitly confirms omitting the param (existing consumers) behaves
+    # identically to passing summary_only=false -- backward compatible.
+    r_omitted = client.get(
+        "/candidates/history/veto-decision-transitions",
+        params={"symbol": "NOSUCH-SO", "timeframe": "5m"},
+    )
+    r_explicit_false = client.get(
+        "/candidates/history/veto-decision-transitions",
+        params={"symbol": "NOSUCH-SO", "timeframe": "5m", "summary_only": "false"},
+    )
+    assert r_omitted.status_code == 200
+    assert r_explicit_false.status_code == 200
+    assert r_omitted.json() == r_explicit_false.json()
+    assert "cases" in r_omitted.json()
+
+
 def test_veto_decision_transitions_endpoint_empty_history(client):
     r = client.get(
         "/candidates/history/veto-decision-transitions",

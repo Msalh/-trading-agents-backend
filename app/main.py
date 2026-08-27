@@ -1185,6 +1185,29 @@ shadow/versioned Macro output, never silently overwriting the live
 prompt or conflated with the existing 1ba9ad78 experiment's frozen
 definition, per the reviewer's explicit caution).
 
+Tier 3.38 (thirteenth external review, 2026-08-26, data-pull
+methodology item): the thirteenth reviewer accepted Tier 3.37's kill-rate numbers
+(73.3%/2.2%) as correctly computed but flagged that needing a manual
+derivation workaround to get them (direction_kill_rate_summary itself
+kept failing to pull at any large limit via WebFetch, worse than Tier
+3.36's fields) is a data-observability defect in its own right, not
+just a one-off inconvenience — and asked for a fix before the factorial
+P&L diagnostic, not another workaround. GET /candidates/history/
+veto-decision-transitions gained one new optional query param,
+summary_only (default false, fully backward compatible): when true, the
+response is identical in every respect except the large per-candidate
+cases array is omitted entirely, leaving every summary/crosstab/rate
+field (transition_summary through direction_kill_rate_summary and the
+three opinion_level_day_blocked variants) intact and reachable at full
+population without a multi-hundred-candidate array crowding them out of
+whatever's pulling the response. Existing consumers (the dashboard,
+saved queries) are unaffected since the default stays false. This is
+the reviewer's own suggested fix (Package #12/#13's methodology
+sections), built exactly as scoped — a query-param trim on an existing
+endpoint, no new population, no replay, no live behavior touched.
+Deliberately not bundled with the factorial P&L diagnostic this tier,
+per the reviewer's own recommendation to fix the pull mechanism first.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -2730,6 +2753,7 @@ def candidates_history_veto_decision_transitions(
     symbol: str = Query(...),
     timeframe: str = Query(...),
     limit: int = Query(default=300, le=1000),
+    summary_only: bool = Query(default=False),
 ) -> dict:
     """Tier 3.34 (ninth external review), extended Tier 3.35 (tenth
     external review). Corrects a real gap the ninth reviewer found:
@@ -2867,12 +2891,48 @@ def candidates_history_veto_decision_transitions(
     None for).
 
     Entirely offline. COORDINATOR_THRESHOLD/WEIGHTS/MIN_AVAILABLE_WEIGHT/
-    analysis_risk_filtered's own veto scope are all untouched."""
+    analysis_risk_filtered's own veto scope are all untouched.
+
+    Tier 3.38 (thirteenth external review, data-pull methodology item):
+    every pull of this endpoint's summary/crosstab/rate fields has been
+    fighting the same recurring problem — the per-candidate `cases`
+    array dwarfs everything else in the response once the population
+    grows into the hundreds, and WebFetch's own size-based summarization
+    (used to pull production data for every package in this series) has
+    repeatedly failed to reliably surface fields sitting even BEFORE
+    `cases` once the total payload gets large enough, worsening as more
+    fields have been added over Tiers 3.34-3.37. The reviewer's own
+    diagnosis: WebFetch was never meant to be a large-number analytics
+    tool, and every workaround so far (smaller `limit`, cross-validating
+    partial windows, deriving one field from a different, more-reliable
+    field) has been a workaround, not a fix.
+
+    `summary_only=true` fixes it at the source: the response is
+    identical in every other respect — same symbol/timeframe/candidates_
+    considered/transition_summary/flag_basis_by_transition/direction_
+    flag_basis_by_transition/coordinator_skip_reason_by_transition/
+    macro_risk_off_direction_crosstab/macro_opinion_diversity/news_
+    opinion_diversity/direction_kill_rate_summary/opinion_level_day_
+    blocked/news_opinion_level_day_blocked/macro_opinion_level_day_
+    blocked — with only the `cases` key omitted entirely. Every existing
+    consumer of this endpoint (the dashboard, any saved query) keeps
+    working unmodified with `summary_only` left at its default `false`;
+    this is purely an opt-in trim for pulling aggregates at full
+    population without the large array crowding them out. Fetching the
+    raw per-candidate `cases` list itself (e.g. for the reviewer's
+    requested raw-JSON-file extraction workflow) still works exactly as
+    before via the default (unchanged) response — this flag only ever
+    removes data from the response, it adds nothing and changes no other
+    field's shape or meaning. No live behavior touched, no new
+    population, no replay."""
     candidates = get_candidate_history(symbol=symbol, timeframe=timeframe, limit=limit)
+    result = compute_veto_decision_transitions(candidates)
+    if summary_only:
+        result = {key: value for key, value in result.items() if key != "cases"}
     return {
         "symbol": symbol,
         "timeframe": timeframe,
-        **compute_veto_decision_transitions(candidates),
+        **result,
     }
 
 

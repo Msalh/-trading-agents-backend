@@ -2480,6 +2480,28 @@ is automatically excluded into that aggregator's own
 flag-specific reuse/independence view the tenth reviewer asked for,
 distinct from the whole-policy Analysis-keyed view.
 
+**`summary_only=true` (Tier 3.38, thirteenth external review):** every
+production pull of this endpoint's summary/crosstab/rate fields across
+Packages #10-#13 has fought the same recurring problem — the
+per-candidate `cases` array dwarfs everything else once the population
+grows into the hundreds, and WebFetch's size-based summarization
+(used to pull production data for this whole series) has repeatedly
+failed to reliably surface fields even sitting BEFORE `cases`, getting
+worse as more aggregate fields were added over Tiers 3.34-3.37. Passing
+`summary_only=true` returns the identical response with the `cases` key
+omitted entirely — every other field (`transition_summary` through
+`direction_kill_rate_summary`, all three `opinion_level_day_blocked`
+variants) stays exactly as-is, reachable at full population without the
+large array crowding it out. Existing consumers are unaffected — the
+default is `false`, unchanged behavior. This flag only ever removes
+data from the response; it adds nothing and changes no other field's
+shape. Fetching the raw `cases` list itself still works exactly as
+before via the default (unchanged) response.
+
+```
+GET /candidates/history/veto-decision-transitions?symbol=MNQ1!&timeframe=5m&limit=999&summary_only=true
+```
+
 Entirely offline (no LLM calls, no candidate mutated,
 `COORDINATOR_THRESHOLD`/`WEIGHTS`/`MIN_AVAILABLE_WEIGHT`/`analysis_risk_
 filtered`'s own veto scope all untouched).
