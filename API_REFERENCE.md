@@ -2508,6 +2508,168 @@ filtered`'s own veto scope all untouched).
 
 ---
 
+### `GET /candidates/history/veto-incremental-pnl?symbol=MNQ1!&timeframe=5m&limit=300`
+
+Tier 3.39, thirteenth external review. Every diagnostic above (Tiers
+3.34-3.38) answers HOW OFTEN or HOW SKEWED the urgent/risk_off veto's
+effect is — none of them answer whether the killed decisions would
+have won or lost money. This endpoint does, by running the exact same
+ATR-barrier simulation as `/backtest-lite` (`app.backtest.
+run_barrier_backtest`, `direction_source="coordinator"` — identical
+stop/target/expiry/slippage/commission mechanics) against pre-filtered
+candidate subsets, across four fixed veto policies. **Not entirely
+offline** — performs real forward-bar lookups and barrier simulations
+per candidate, same performance profile as `/backtest-lite`, and runs
+roughly 40-50 separate backtest passes internally, so it can be
+noticeably slower than the rest of this diagnostic family on a large
+population.
+
+Query params: `symbol`, `timeframe` (required); `limit` (default 300,
+max 1000); `atr_stop_mult`/`atr_target_mult`/`expiry_bars` (same
+defaults and meaning as `/backtest-lite`).
+
+**Four policies** (`policies` in the response, exact meaning): `none`
+(every real Coordinator directional decision — the pre-veto baseline),
+`urgent_only` (drop only if News carries `urgent`), `risk_off_only`
+(drop only if Macro carries `risk_off`), `both` (drop if either flag is
+present — the same population Tier 3.33's `coordinator_veto_filtered`
+direction_source already selects).
+
+**Three views:** `decision_level` (every surviving candidate simulated
+independently, `non_overlapping=False` — a raw per-candidate baseline,
+not a claim of N independent trading opportunities); `portfolio_level`
+(`non_overlapping=True`, scheduled independently per policy — the
+economically real figure). **Caution:** at either level, a policy's
+`short`/`long` sub-keys are separately-scheduled subsets, not a
+decomposition of `overall` — at `portfolio_level` specifically,
+`short.trades_taken + long.trades_taken` can exceed `overall.
+trades_taken`, since real single-position scheduling lets a long and a
+short compete for the same slot but the isolated per-direction subsets
+don't reflect that competition. `overall` is the only "if this policy
+ran live" number at portfolio level. The third view,
+`conservative_opinion_level`, is described below.
+
+**`attribution`** exists specifically to avoid the double-counting
+mistake the thirteenth review caught in Tier 3.37's headline numbers:
+`risk_off_implicated_kills` (118/161 bearish) INCLUDES the 63
+candidates where News' `urgent` was also present, so it overstates
+risk_off's own solo effect. This endpoint reports four
+non-overlapping candidate sets instead — `risk_off_solo_excluded`
+(risk_off present, urgent absent), `urgent_solo_excluded` (urgent
+present, risk_off absent), `both_excluded_overlap` (both present), and
+`any_excluded_union` (either present) — each run at both
+`decision_level` and `portfolio_level`. By construction, `risk_off_
+solo_excluded.candidates + urgent_solo_excluded.candidates + both_
+excluded_overlap.candidates == any_excluded_union.candidates` exactly
+(covered directly by `test_veto_pnl_attribution_solo_plus_overlap_
+equals_union` in `tests/test_backtest.py`) — no candidate's P&L is
+ever counted toward both flags' "effect."
+
+**`macro_direction_breakdown`** splits the risk_off-flagged population
+by Macro's OWN direction on that candidate (`bearish` vs `neutral`),
+continuing Tier 3.36's endogeneity question with real P&L attached
+instead of just candidate counts. **`day_session_breakdown`** reports
+`distinct_trading_days`/`distinct_opinions` (Tier 3.36's diversity
+convention) plus a per-`session_name` P&L split, for both the
+risk_off-excluded and urgent-excluded populations — so a reader can see
+whether a policy's effect is broad or concentrated in a handful of
+days/opinions/sessions.
+
+**`conservative_opinion_level`** dedupes each flagged population down
+to one candidate per independent opinion before simulating, per the
+thirteenth review's own naming clarification: `first_per_day_and_
+opinion` keeps the chronologically-first candidate per distinct
+`(trading_date, agent_opinion_timestamp)` pair — the primary,
+recommended view — and the stricter `first_per_opinion_global` keeps
+the first candidate per `agent_opinion_timestamp` across the ENTIRE
+pulled history, ignoring day boundaries entirely. Both are
+decision-level only (a non-overlap schedule on an already-deduped set
+would add a confound, not information, per the review's own reasoning).
+
+```json
+{
+  "symbol": "MNQ1!",
+  "timeframe": "5m",
+  "config": { "stop_mult": 1.5, "target_mult": 2.5, "expiry_bars": 24 },
+  "population": {
+    "candidates_considered": 299,
+    "coordinator_traded_population": 299,
+    "short": 161,
+    "long": 138
+  },
+  "policies": ["none", "urgent_only", "risk_off_only", "both"],
+  "decision_level": {
+    "none": {
+      "overall": { "trades_taken": 299, "win_rate": 0.51, "total_pnl_usd": -412.0, "candidates_in_subset": 299 },
+      "short": { "trades_taken": 161, "win_rate": 0.47, "total_pnl_usd": -890.0, "candidates_in_subset": 161 },
+      "long": { "trades_taken": 138, "win_rate": 0.56, "total_pnl_usd": 478.0, "candidates_in_subset": 138 }
+    },
+    "risk_off_only": {
+      "overall": { "trades_taken": 178, "win_rate": 0.55, "total_pnl_usd": 640.0, "candidates_in_subset": 178 },
+      "short": { "trades_taken": 43, "win_rate": 0.60, "total_pnl_usd": 210.0, "candidates_in_subset": 43 },
+      "long": { "trades_taken": 135, "win_rate": 0.56, "total_pnl_usd": 430.0, "candidates_in_subset": 135 }
+    }
+  },
+  "portfolio_level": {
+    "none": { "overall": { "trades_taken": 84, "win_rate": 0.52, "total_pnl_usd": 190.0, "candidates_in_subset": 299 } }
+  },
+  "attribution": {
+    "risk_off_solo_excluded": {
+      "decision_level": { "trades_taken": 55, "win_rate": 0.60, "total_pnl_usd": 410.0, "candidates_in_subset": 55 },
+      "portfolio_level": { "trades_taken": 21, "win_rate": 0.62, "total_pnl_usd": 205.0, "candidates_in_subset": 55 }
+    },
+    "urgent_solo_excluded": {
+      "decision_level": { "trades_taken": 10, "win_rate": 0.40, "total_pnl_usd": -95.0, "candidates_in_subset": 10 },
+      "portfolio_level": { "trades_taken": 4, "win_rate": 0.25, "total_pnl_usd": -60.0, "candidates_in_subset": 10 }
+    },
+    "both_excluded_overlap": {
+      "decision_level": { "trades_taken": 63, "win_rate": 0.49, "total_pnl_usd": 55.0, "candidates_in_subset": 63 },
+      "portfolio_level": { "trades_taken": 19, "win_rate": 0.47, "total_pnl_usd": 30.0, "candidates_in_subset": 63 }
+    },
+    "any_excluded_union": {
+      "decision_level": { "trades_taken": 128, "win_rate": 0.52, "total_pnl_usd": 370.0, "candidates_in_subset": 128 },
+      "portfolio_level": { "trades_taken": 40, "win_rate": 0.53, "total_pnl_usd": 175.0, "candidates_in_subset": 128 }
+    }
+  },
+  "macro_direction_breakdown": {
+    "bearish": { "candidates": 118, "distinct_opinions": 31, "distinct_trading_days": 9, "decision_level": { "trades_taken": 118, "win_rate": 0.54, "total_pnl_usd": 305.0, "candidates_in_subset": 118 } },
+    "neutral": { "candidates": 15, "distinct_opinions": 6, "distinct_trading_days": 4, "decision_level": { "trades_taken": 15, "win_rate": 0.47, "total_pnl_usd": -40.0, "candidates_in_subset": 15 } }
+  },
+  "day_session_breakdown": {
+    "risk_off_excluded": { "distinct_trading_days": 9, "distinct_opinions": 31, "by_session_name": { "rth": { "candidates": 96, "decision_level": { "trades_taken": 96, "win_rate": 0.55, "total_pnl_usd": 520.0, "candidates_in_subset": 96 } } } },
+    "urgent_excluded": { "distinct_trading_days": 8, "distinct_opinions": 22, "by_session_name": { "rth": { "candidates": 60, "decision_level": { "trades_taken": 60, "win_rate": 0.48, "total_pnl_usd": -110.0, "candidates_in_subset": 60 } } } }
+  },
+  "conservative_opinion_level": {
+    "risk_off_excluded": {
+      "candidates_before_dedup": 118,
+      "first_per_day_and_opinion": { "candidates_after_dedup": 31, "decision_level": { "trades_taken": 31, "win_rate": 0.58, "total_pnl_usd": 140.0, "candidates_in_subset": 31 } },
+      "first_per_opinion_global": { "candidates_after_dedup": 29, "decision_level": { "trades_taken": 29, "win_rate": 0.59, "total_pnl_usd": 135.0, "candidates_in_subset": 29 } }
+    }
+  }
+}
+```
+
+(Illustrative shape and numbers; not a production pull — the `short`/
+`long` population counts (161/138) match the real Tier 3.37 pull, the
+rest is fabricated for shape purposes only. Several `decision_level`/
+`portfolio_level` entries and the `urgent_only`/`both` policy keys are
+omitted above for brevity; the real response includes all four
+policies at both levels in full.)
+
+`config` reports the exact stop/target/expiry mults used — same query
+params and defaults as `/backtest-lite`, so results here compare
+directly against any other backtest endpoint's default run. Entirely
+read-only: no candidate mutated, nothing written to any trade table,
+`COORDINATOR_THRESHOLD`/`WEIGHTS`/`MIN_AVAILABLE_WEIGHT`/
+`AUTO_EXECUTE_ENABLED` all untouched — this only ever simulates a
+HYPOTHETICAL policy against real historical price bars, it never
+places or affects a real trade. `DIRECTION_SOURCES` is unchanged by
+this tier — all four policies reuse the existing `"coordinator"`
+direction source against pre-filtered candidate subsets, rather than
+registering new synthetic sources.
+
+---
+
 ### `opinion_level_day_blocked` (Tier 3.29 — present in all five endpoints above)
 
 Sixth external review, ranked backlog item #3. Every field documented

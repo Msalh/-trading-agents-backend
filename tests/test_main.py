@@ -1378,6 +1378,111 @@ def test_veto_decision_transitions_endpoint_empty_history(client):
 
 
 # ---------------------------------------------------------------------------
+# Tier 3.39: factorial incremental P&L (thirteenth external review)
+# ---------------------------------------------------------------------------
+
+def test_veto_incremental_pnl_endpoint_returns_shape(client):
+    import app.storage as storage
+
+    anchor = "2026-08-11T14:00:00Z"
+    bar = {
+        "event_id": "evt-vpnl-1", "symbol": "MNQ1!", "timeframe": "5m", "timestamp": anchor,
+        "atr": 2.0, "trading_date": "2026-08-11",
+    }
+    decision = {
+        "decision": "enter_long",
+        "direction": "bullish",
+        "score": 90.0,
+        "threshold": 25.0,
+        "opinions_used": {
+            "analysis": {"direction": "bullish", "confidence": 90, "timestamp": anchor, "flags": []},
+            "news": {"direction": "bullish", "confidence": 90, "timestamp": anchor, "flags": []},
+        },
+        "missing_agents": [],
+        "stale_agents": [],
+        "contributions": {},
+        "conflict_flags": [],
+        "timestamp": anchor,
+    }
+    storage.save_candidate(candidate_id="cand-vpnl-1", symbol="MNQ1!", timeframe="5m", bar=bar, decision=decision)
+    _save_market_bar(
+        storage, "MNQ1!", "5m", "2026-08-11T14:05:00Z",
+        open_=20000.0, high=20060.0, low=19995.0, close=20055.0,
+    )
+
+    r = client.get(
+        "/candidates/history/veto-incremental-pnl",
+        params={"symbol": "MNQ1!", "timeframe": "5m"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["symbol"] == "MNQ1!"
+    assert body["timeframe"] == "5m"
+    assert body["config"] == {"stop_mult": 1.5, "target_mult": 2.5, "expiry_bars": 24}
+    assert body["population"] == {
+        "candidates_considered": 1,
+        "coordinator_traded_population": 1,
+        "short": 0,
+        "long": 1,
+    }
+    assert body["policies"] == ["none", "urgent_only", "risk_off_only", "both"]
+    # No urgent/risk_off flags on this fixture, so every policy keeps the
+    # one candidate -- all four policies must agree on trades_taken.
+    for policy in body["policies"]:
+        assert body["decision_level"][policy]["overall"]["trades_taken"] == 1
+        assert body["decision_level"][policy]["overall"]["candidates_in_subset"] == 1
+        assert body["portfolio_level"][policy]["overall"]["trades_taken"] == 1
+    assert body["decision_level"]["none"]["short"]["candidates_in_subset"] == 0
+    assert body["decision_level"]["none"]["long"]["candidates_in_subset"] == 1
+    # Attribution: nothing flagged, so every excluded set is empty.
+    for key in (
+        "risk_off_solo_excluded", "urgent_solo_excluded",
+        "both_excluded_overlap", "any_excluded_union",
+    ):
+        assert body["attribution"][key]["decision_level"]["candidates_in_subset"] == 0
+        assert body["attribution"][key]["decision_level"]["trades_taken"] == 0
+    assert body["macro_direction_breakdown"] == {}
+    assert body["day_session_breakdown"]["risk_off_excluded"]["distinct_trading_days"] == 0
+    assert body["day_session_breakdown"]["urgent_excluded"]["distinct_trading_days"] == 0
+    cons = body["conservative_opinion_level"]["risk_off_excluded"]
+    assert cons["candidates_before_dedup"] == 0
+    assert cons["first_per_day_and_opinion"]["candidates_after_dedup"] == 0
+    assert cons["first_per_opinion_global"]["candidates_after_dedup"] == 0
+
+
+def test_veto_incremental_pnl_endpoint_empty_history(client):
+    r = client.get(
+        "/candidates/history/veto-incremental-pnl",
+        params={"symbol": "NOSUCH-VPNL", "timeframe": "5m"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["population"] == {
+        "candidates_considered": 0,
+        "coordinator_traded_population": 0,
+        "short": 0,
+        "long": 0,
+    }
+    for policy in body["policies"]:
+        assert body["decision_level"][policy]["overall"]["candidates_in_subset"] == 0
+        assert body["portfolio_level"][policy]["overall"]["candidates_in_subset"] == 0
+    assert body["macro_direction_breakdown"] == {}
+
+
+def test_veto_incremental_pnl_endpoint_accepts_config_overrides(client):
+    r = client.get(
+        "/candidates/history/veto-incremental-pnl",
+        params={
+            "symbol": "NOSUCH-VPNL-2", "timeframe": "5m",
+            "atr_stop_mult": 2.0, "atr_target_mult": 3.0, "expiry_bars": 10,
+        },
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["config"] == {"stop_mult": 2.0, "target_mult": 3.0, "expiry_bars": 10}
+
+
+# ---------------------------------------------------------------------------
 # Tier 3.18: day/session reporting
 # ---------------------------------------------------------------------------
 

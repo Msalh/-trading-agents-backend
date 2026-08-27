@@ -1208,6 +1208,47 @@ endpoint, no new population, no replay, no live behavior touched.
 Deliberately not bundled with the factorial P&L diagnostic this tier,
 per the reviewer's own recommendation to fix the pull mechanism first.
 
+Tier 3.39 (thirteenth external review, 2026-08-27, factorial incremental
+P&L): with the data-observability fix shipped (summary_only) and
+technically reviewed as correctly implemented, the reviewer approved
+proceeding to the P&L diagnostic itself — but specified it as a
+FACTORIAL 4-policy design (none / urgent_only / risk_off_only / both)
+rather than a simple before/after comparison, precisely to avoid
+double-counting the 63 candidates where urgent and risk_off overlap
+(the reviewer's own correction to Tier 3.37's headline numbers: the
+73.3%/2.2% figures measure each flag's presence among kill reasons,
+not its solo/confirmed effect, which is 34.2%/2.2% once overlap is
+attributed correctly). New GET /candidates/history/veto-incremental-pnl
+endpoint runs the SAME barrier-backtest engine used by /backtest-lite
+(identical stop/target/expiry defaults, identical slippage/commission,
+same run_barrier_backtest non-overlap scheduling) across all four
+policies, at both decision-level (every directional candidate) and
+portfolio-level (each policy's own independent non_overlapping
+schedule), further split short vs long. A dedicated attribution
+section reports risk_off-solo-excluded, urgent-solo-excluded,
+both-excluded (the overlap), and any-excluded (the union) as four
+non-double-counted candidate sets, so solo_urgent + solo_risk_off +
+overlap == union exactly by construction (covered directly by
+test_veto_pnl_attribution_solo_plus_overlap_equals_union). Also adds a
+macro_direction_breakdown (splits risk_off-implicated candidates by
+bearish vs neutral Macro direction), a day_session_breakdown (distinct
+trading days/opinions and per-session P&L for both excluded sets), and
+a conservative_opinion_level view implementing the reviewer's own
+naming clarification — "first candidate per (trading_date,
+agent_opinion_timestamp)" as the primary dedup, plus a stricter
+"first candidate per agent_opinion_timestamp across the whole history"
+global variant — for both the risk_off and urgent populations. This is
+a read-only diagnostic: no live policy, weight, threshold, or
+execution behavior is touched; DIRECTION_SOURCES is unchanged (all
+four policies reuse direction_source="coordinator" against
+pre-filtered candidate subsets, not new synthetic direction sources),
+and Coordinator scoring/weights remain exactly as configured. Per the
+reviewer's own framing, this is the step that actually answers whether
+the veto protects the account or deletes profitable short trades —
+this tier only ships the measurement; interpreting the resulting
+numbers and any policy recommendation is deferred to the next review
+round once real production data is pulled through this endpoint.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -1234,6 +1275,7 @@ from app.backtest import (
     compute_champion_challenger_report,
     compute_day_session_breakdown,
     compute_trading_date_integrity_report,
+    compute_veto_incremental_pnl,
     run_paired_barrier_backtest,
     run_sensitivity_grid,
 )
@@ -3295,6 +3337,89 @@ def candidates_history_backtest_lite_sensitivity_grid(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    return {"symbol": symbol, "timeframe": timeframe, **result}
+
+
+@app.get("/candidates/history/veto-incremental-pnl")
+def candidates_history_veto_incremental_pnl(
+    symbol: str = Query(...),
+    timeframe: str = Query(...),
+    limit: int = Query(default=300, le=1000),
+    atr_stop_mult: float = Query(default=ATR_STOP_MULT),
+    atr_target_mult: float = Query(default=ATR_TARGET_MULT),
+    expiry_bars: int = Query(default=EXPIRY_BARS, le=200),
+) -> dict:
+    """Tier 3.39 (thirteenth external review) — see app/backtest.py's
+    Tier 3.39 module comment block for the full design rationale. Every
+    prior veto-decision-transitions diagnostic (Tier 3.34-3.38) answered
+    HOW OFTEN or HOW SKEWED the urgent/risk_off veto's effect is — none
+    of them answer whether the killed decisions would have won or lost.
+    This endpoint does, by running the SAME app.backtest.
+    run_barrier_backtest() ATR-barrier simulation every other backtest
+    endpoint in this project uses — identical stop/target/expiry/
+    slippage/commission mechanics throughout — against pre-filtered
+    candidate subsets for four fixed policies and several breakdowns.
+
+    NOT entirely offline, unlike the rest of this diagnostic family: it
+    performs real forward-bar lookups and barrier simulations per
+    candidate (same profile as /backtest-lite and /backtest-lite/paired)
+    and runs roughly 40-50 separate backtest passes internally, so it
+    can be noticeably slower than this family's purely-offline endpoints
+    on a large population.
+
+    Four policies (`policies` in the response, exact meaning): `none`
+    (every real Coordinator directional decision — the pre-veto
+    baseline), `urgent_only` (drop only if News carries "urgent"),
+    `risk_off_only` (drop only if Macro carries "risk_off"), `both`
+    (drop if either flag is present — the same candidate set Tier
+    3.33's `coordinator_veto_filtered` direction_source already
+    selects).
+
+    Three views: `decision_level` (every candidate simulated
+    independently, non_overlapping=False — NOT 299 independent trading
+    opportunities, just a raw per-candidate baseline); `portfolio_level`
+    (non_overlapping=True, independently scheduled per policy — the
+    economically real number). CAUTION: each view's `short`/`long`
+    sub-keys are separately-scheduled subsets, not a decomposition of
+    `overall` — at `portfolio_level`, `short.trades_taken + long.
+    trades_taken` can exceed `overall.trades_taken`, since real
+    single-position scheduling lets a long and a short compete for the
+    same slot but the isolated per-direction subsets don't reflect that
+    competition. `overall` is the only "if this policy ran live" figure
+    at portfolio level.
+
+    `attribution` avoids the exact double-counting mistake the
+    thirteenth review caught in an earlier package: `risk_off_solo_
+    excluded`/`urgent_solo_excluded` (each flag's OWN effect, the other
+    flag absent) plus `both_excluded_overlap` sum EXACTLY to `any_
+    excluded_union` in candidate count — no candidate's P&L is counted
+    toward both flags' "effect."
+
+    `macro_direction_breakdown` splits the risk_off-flagged population
+    by Macro's OWN direction on that candidate (continuing Tier 3.36's
+    endogeneity question with real outcome data). `day_session_
+    breakdown` reports distinct-opinion/distinct-day counts (Tier
+    3.36's diversity convention) plus a by-session P&L split, for both
+    flagged populations. `conservative_opinion_level` dedupes to one
+    candidate per independent opinion — `first_per_day_and_opinion`
+    (one per (trading_date, opinion_timestamp)) and the stricter
+    `first_per_opinion_global` (one per opinion_timestamp across the
+    entire history) — decision-level P&L only, per the thirteenth
+    review's own reasoning that a schedule on an already-deduped set
+    adds a confound rather than information.
+
+    `config` reports the exact stop_mult/target_mult/expiry_bars used —
+    same query params and same defaults as /backtest-lite, so a result
+    here is directly comparable to any other backtest endpoint's default
+    run. Entirely read-only: no candidate mutated, nothing written to
+    any trade table, COORDINATOR_THRESHOLD/WEIGHTS/MIN_AVAILABLE_WEIGHT/
+    AUTO_EXECUTE_ENABLED all untouched — this only ever simulates a
+    HYPOTHETICAL policy against real historical price bars, it never
+    places or affects a real trade."""
+    candidates = get_candidate_history(symbol=symbol, timeframe=timeframe, limit=limit)
+    result = compute_veto_incremental_pnl(
+        candidates, stop_mult=atr_stop_mult, target_mult=atr_target_mult, expiry_bars=expiry_bars,
+    )
     return {"symbol": symbol, "timeframe": timeframe, **result}
 
 

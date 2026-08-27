@@ -1430,3 +1430,347 @@ def run_sensitivity_grid(
         "robustness": {source: _summarize_robustness(results) for source, results in per_source_results.items()},
         "combinations": combinations,
     }
+
+
+# ---------------------------------------------------------------------------
+# Tier 3.39: factorial incremental P&L for the urgent/risk_off veto
+# ---------------------------------------------------------------------------
+#
+# Chain of external reviews leading here: Tier 3.34/3.35 (ninth/tenth
+# reviews) found the urgent/risk_off hard veto would kill 56.5% of
+# Coordinator's real directional decisions, sharply skewed toward
+# shorts. The eleventh/twelfth/thirteenth reviews progressively
+# corrected the framing — normalizing against each direction's own
+# base rate (Tier 3.37: risk_off kills 73.3% of shorts vs 2.2% of
+# longs), then separating solo/overlap contribution (thirteenth review:
+# risk_off ALONE, ignoring urgent entirely, still kills 34.2% of shorts
+# vs 2.2% of longs — the union/combined-policy number of 79.5%/27.5%
+# double-counts the 63 candidates both flags would have killed anyway).
+# Every one of these was a DIRECTION-count or KILL-RATE diagnostic —
+# none of them touch the one question that actually decides whether the
+# veto helps or hurts the account: would the killed decisions have won
+# or lost under the SAME realistic trading rules real Coordinator trades
+# use?
+#
+# This is NOT an "entirely offline" diagnostic like the rest of this
+# module — it runs the real ATR-barrier simulation (run_barrier_
+# backtest, same engine every other backtest endpoint in this project
+# uses) against real stored forward price bars, so results depend on
+# what candles Actually happened after each candidate. No new
+# simulation logic is introduced: every P&L figure below comes from
+# run_barrier_backtest(..., direction_source="coordinator", ...) called
+# against a pre-filtered candidate SUBSET — the four veto policies and
+# every breakdown differ only in WHICH candidates are included, never in
+# how a trade is priced, sized, or scheduled. Same stop_mult/
+# target_mult/expiry_bars, same slippage/commission constants, same
+# forward-bar source, for every policy and every breakdown — the
+# thirteenth review's explicit "identical trading mechanics across
+# policies" requirement.
+#
+# Four fixed policies (thirteenth review, exact spec): "none" (no veto
+# at all — every real Coordinator directional decision, the pre-veto
+# baseline), "urgent_only" (drop a candidate only if News carries
+# "urgent", risk_off is ignored), "risk_off_only" (drop only if Macro
+# carries "risk_off", urgent is ignored), "both" (drop if EITHER flag is
+# present — this is the SAME candidate set Tier 3.33's
+# `coordinator_veto_filtered` direction_source already selects, just
+# computed independently here rather than reusing that source, to keep
+# every policy's candidate-selection logic visible in one place).
+#
+# Three views, per policy: `decision_level` (every candidate simulated
+# independently, non_overlapping=False — acknowledged NOT to represent
+# 299 independent trading opportunities, since consecutive candidates
+# from the same move are correlated and many would never coexist under
+# real one-position-at-a-time scheduling); `portfolio_level` (the SAME
+# non_overlapping=True scheduling every other backtest endpoint in this
+# project uses, run independently per policy — the economically real
+# number). CAUTION: each view's own `short`/`long` sub-keys are
+# SEPARATELY non-overlap-scheduled subsets, not a decomposition of
+# `overall` — `overall` reflects real single-position competition
+# BETWEEN directions (a long and a short can never both be open), so
+# `short.trades_taken + long.trades_taken` can exceed `overall.
+# trades_taken` at portfolio level. This is documented, not a bug —
+# useful for isolating each direction's own numbers, but `overall` is
+# the only "if we ran this policy live" figure.
+#
+# `attribution`: risk_off's SOLO effect (`risk_off_solo_excluded` —
+# risk_off present, urgent absent), urgent's SOLO effect
+# (`urgent_solo_excluded`), the two flags' OVERLAP (`both_excluded_
+# overlap`), and the UNION (`any_excluded_union` — either flag present,
+# what a hard veto with no schema change would drop as a whole). These
+# four candidate sets are mutually exclusive except union = solo ∪ solo
+# ∪ overlap, so summing solo+solo+overlap P&L equals union P&L exactly
+# — no double-counting the 63 overlap candidates into both flags'
+# "effect" the way a naive "risk_off_implicated" vs "urgent_implicated"
+# comparison would (the thirteenth review's central correction).
+#
+# `macro_direction_breakdown`: the risk_off-flagged population (any
+# candidate risk_off is present on, regardless of urgent) split by
+# Macro's OWN direction on that candidate — decision-level P&L per
+# bucket, continuing Tier 3.36's endogeneity question with real outcome
+# data instead of just counts.
+#
+# `day_session_breakdown`: distinct-opinion/distinct-day counts (Tier
+# 3.36's own diversity convention) plus a by-session decision-level P&L
+# split, for both the risk_off-flagged and urgent-flagged populations.
+#
+# `conservative_opinion_level`: the thirteenth review's explicit
+# disambiguation — "first candidate per (trading_date, agent_opinion_
+# timestamp)" (one observation per independent judgment call PER DAY)
+# and the stricter "first candidate per agent_opinion_timestamp,
+# globally" (one observation per independent judgment call across the
+# ENTIRE history, collapsing a reused opinion spanning multiple days
+# into one). Both dedupe by keeping the chronologically EARLIEST
+# candidate in each group (ties broken by anchor_timestamp string
+# comparison) — decision-level P&L only; a schedule-level view on an
+# already-deduped, already-sparse set adds a second confound without
+# adding real information.
+
+_VETO_POLICIES = ("none", "urgent_only", "risk_off_only", "both")
+
+
+def _veto_pnl_population(candidates: list[dict]) -> list[dict]:
+    """Same analysis-directional + coordinator-traded population
+    app.coordinator_diagnostics.compute_veto_decision_transitions()
+    scopes to (the union of its coordinator_trade_veto_would_skip and
+    coordinator_trade_veto_survives transitions): every candidate with
+    a directional Analysis opinion AND a real Coordinator enter_long/
+    enter_short decision. Returns the ORIGINAL candidate dicts (not a
+    distilled summary) since run_barrier_backtest() needs the full
+    candidate shape to fetch forward bars and read `bar.atr`."""
+    population = []
+    for candidate in candidates:
+        if not candidate.get("candidate_id"):
+            continue
+        decision = candidate.get("decision") or {}
+        opinions_used = decision.get("opinions_used") or {}
+        analysis_opinion = opinions_used.get("analysis")
+        if not analysis_opinion or analysis_opinion.get("direction") not in ("bullish", "bearish"):
+            continue
+        if decision.get("decision") not in ("enter_long", "enter_short"):
+            continue
+        population.append(candidate)
+    return population
+
+
+def _veto_pnl_flags(candidate: dict) -> dict:
+    """Per-candidate flag/attribute extraction, same implicated-flag
+    definitions app.coordinator_diagnostics.compute_veto_decision_
+    transitions() uses. Kept independently here (not imported) since
+    app.coordinator_diagnostics already imports FROM this module —
+    importing back would create a cycle."""
+    decision = candidate.get("decision") or {}
+    bar = candidate.get("bar") or {}
+    opinions_used = decision.get("opinions_used") or {}
+    news_opinion = opinions_used.get("news")
+    macro_opinion = opinions_used.get("macro")
+    news_urgent = bool(news_opinion and _RISK_FILTER_NEWS_VETO_FLAGS & set(news_opinion.get("flags") or []))
+    macro_risk_off = bool(macro_opinion and _RISK_FILTER_MACRO_VETO_FLAGS & set(macro_opinion.get("flags") or []))
+    trade_decision = decision.get("decision")
+    return {
+        "direction": "bullish" if trade_decision == "enter_long" else "bearish",
+        "news_urgent": news_urgent,
+        "macro_risk_off": macro_risk_off,
+        "macro_direction": (macro_opinion or {}).get("direction"),
+        "news_opinion_timestamp": (news_opinion or {}).get("timestamp"),
+        "macro_opinion_timestamp": (macro_opinion or {}).get("timestamp"),
+        "trading_date": bar.get("trading_date"),
+        "session_name": bar.get("session_name"),
+        "anchor_timestamp": _candidate_anchor_timestamp(candidate),
+    }
+
+
+def _policy_included(policy: str, news_urgent: bool, macro_risk_off: bool) -> bool:
+    if policy == "none":
+        return True
+    if policy == "urgent_only":
+        return not news_urgent
+    if policy == "risk_off_only":
+        return not macro_risk_off
+    if policy == "both":
+        return not news_urgent and not macro_risk_off
+    raise ValueError(f"unknown policy {policy!r} — must be one of {_VETO_POLICIES}")
+
+
+def _distinct_count(meta: dict, ids: set, field: str) -> int:
+    return len({meta[cid][field] for cid in ids if meta[cid].get(field) is not None})
+
+
+def _first_per_group(meta: dict, ids: set, group_fields: tuple) -> set:
+    """Dedupes `ids` down to one candidate per distinct combination of
+    group_fields, keeping the chronologically EARLIEST candidate (by
+    anchor_timestamp) in each group. A candidate missing any field in
+    group_fields is excluded entirely, not guessed into a bucket —
+    same convention this project's other aggregators already use."""
+    best_by_group: dict[tuple, tuple[str, str]] = {}
+    for cid in ids:
+        candidate_meta = meta[cid]
+        group_key = tuple(candidate_meta.get(f) for f in group_fields)
+        if any(v is None for v in group_key):
+            continue
+        anchor = candidate_meta.get("anchor_timestamp") or ""
+        current = best_by_group.get(group_key)
+        if current is None or anchor < current[0]:
+            best_by_group[group_key] = (anchor, cid)
+    return {cid for _, cid in best_by_group.values()}
+
+
+def compute_veto_incremental_pnl(
+    candidates: list[dict],
+    stop_mult: float = ATR_STOP_MULT,
+    target_mult: float = ATR_TARGET_MULT,
+    expiry_bars: int = EXPIRY_BARS,
+) -> dict:
+    """Tier 3.39 (thirteenth external review) — see the module comment
+    block above for the full design rationale. Runs the SAME barrier
+    simulation (run_barrier_backtest, direction_source="coordinator")
+    against pre-filtered candidate subsets for each of the four fixed
+    veto policies (`none`/`urgent_only`/`risk_off_only`/`both`), at both
+    `decision_level` (non_overlapping=False) and `portfolio_level`
+    (non_overlapping=True, independently scheduled per policy) — plus a
+    solo/overlap/union `attribution` split, a `macro_direction_
+    breakdown` of the risk_off-flagged population, a `day_session_
+    breakdown`, and a `conservative_opinion_level` view deduped to one
+    candidate per independent opinion. NOT entirely offline — performs
+    real forward-bar lookups and barrier simulations per candidate,
+    same performance profile as any other backtest endpoint (can be
+    slower than this diagnostic family's other, purely-offline
+    endpoints on a large population, since it runs roughly 40-50
+    separate backtest passes internally across all the breakdowns)."""
+    population = _veto_pnl_population(candidates)
+    candidates_by_id = {c["candidate_id"]: c for c in population}
+    meta = {cid: _veto_pnl_flags(c) for cid, c in candidates_by_id.items()}
+    all_ids = set(candidates_by_id.keys())
+
+    short_ids = {cid for cid in all_ids if meta[cid]["direction"] == "bearish"}
+    long_ids = {cid for cid in all_ids if meta[cid]["direction"] == "bullish"}
+    urgent_ids = {cid for cid in all_ids if meta[cid]["news_urgent"]}
+    risk_off_ids = {cid for cid in all_ids if meta[cid]["macro_risk_off"]}
+    both_ids = urgent_ids & risk_off_ids
+    urgent_solo_ids = urgent_ids - risk_off_ids
+    risk_off_solo_ids = risk_off_ids - urgent_ids
+    any_excluded_ids = urgent_ids | risk_off_ids
+
+    def _run(ids: set, non_overlapping: bool) -> dict:
+        subset = [candidates_by_id[cid] for cid in ids]
+        summary = run_barrier_backtest(
+            subset, direction_source="coordinator",
+            stop_mult=stop_mult, target_mult=target_mult, expiry_bars=expiry_bars,
+            non_overlapping=non_overlapping, include_trades=False,
+        )
+        summary.pop("trades", None)
+        summary["candidates_in_subset"] = len(ids)
+        return summary
+
+    policy_ids = {
+        policy: {cid for cid in all_ids if _policy_included(policy, meta[cid]["news_urgent"], meta[cid]["macro_risk_off"])}
+        for policy in _VETO_POLICIES
+    }
+
+    decision_level = {}
+    portfolio_level = {}
+    for policy in _VETO_POLICIES:
+        ids = policy_ids[policy]
+        decision_level[policy] = {
+            "overall": _run(ids, non_overlapping=False),
+            "short": _run(ids & short_ids, non_overlapping=False),
+            "long": _run(ids & long_ids, non_overlapping=False),
+        }
+        portfolio_level[policy] = {
+            "overall": _run(ids, non_overlapping=True),
+            "short": _run(ids & short_ids, non_overlapping=True),
+            "long": _run(ids & long_ids, non_overlapping=True),
+        }
+
+    attribution = {
+        "risk_off_solo_excluded": {
+            "decision_level": _run(risk_off_solo_ids, non_overlapping=False),
+            "portfolio_level": _run(risk_off_solo_ids, non_overlapping=True),
+        },
+        "urgent_solo_excluded": {
+            "decision_level": _run(urgent_solo_ids, non_overlapping=False),
+            "portfolio_level": _run(urgent_solo_ids, non_overlapping=True),
+        },
+        "both_excluded_overlap": {
+            "decision_level": _run(both_ids, non_overlapping=False),
+            "portfolio_level": _run(both_ids, non_overlapping=True),
+        },
+        "any_excluded_union": {
+            "decision_level": _run(any_excluded_ids, non_overlapping=False),
+            "portfolio_level": _run(any_excluded_ids, non_overlapping=True),
+        },
+    }
+
+    macro_direction_groups: dict[str, set] = {}
+    for cid in risk_off_ids:
+        key = meta[cid]["macro_direction"] or "neutral"
+        macro_direction_groups.setdefault(key, set()).add(cid)
+    macro_direction_breakdown = {
+        direction: {
+            "candidates": len(ids),
+            "distinct_opinions": _distinct_count(meta, ids, "macro_opinion_timestamp"),
+            "distinct_trading_days": _distinct_count(meta, ids, "trading_date"),
+            "decision_level": _run(ids, non_overlapping=False),
+        }
+        for direction, ids in macro_direction_groups.items()
+    }
+
+    def _session_breakdown(ids: set) -> dict:
+        by_session: dict[str, set] = {}
+        for cid in ids:
+            session = meta[cid]["session_name"] or "unknown"
+            by_session.setdefault(session, set()).add(cid)
+        return {
+            session: {"candidates": len(session_ids), "decision_level": _run(session_ids, non_overlapping=False)}
+            for session, session_ids in by_session.items()
+        }
+
+    day_session_breakdown = {
+        "risk_off_excluded": {
+            "distinct_trading_days": _distinct_count(meta, risk_off_ids, "trading_date"),
+            "distinct_opinions": _distinct_count(meta, risk_off_ids, "macro_opinion_timestamp"),
+            "by_session_name": _session_breakdown(risk_off_ids),
+        },
+        "urgent_excluded": {
+            "distinct_trading_days": _distinct_count(meta, urgent_ids, "trading_date"),
+            "distinct_opinions": _distinct_count(meta, urgent_ids, "news_opinion_timestamp"),
+            "by_session_name": _session_breakdown(urgent_ids),
+        },
+    }
+
+    def _conservative(ids: set, opinion_field: str) -> dict:
+        by_day_and_opinion = _first_per_group(meta, ids, ("trading_date", opinion_field))
+        global_by_opinion = _first_per_group(meta, ids, (opinion_field,))
+        return {
+            "candidates_before_dedup": len(ids),
+            "first_per_day_and_opinion": {
+                "candidates_after_dedup": len(by_day_and_opinion),
+                "decision_level": _run(by_day_and_opinion, non_overlapping=False),
+            },
+            "first_per_opinion_global": {
+                "candidates_after_dedup": len(global_by_opinion),
+                "decision_level": _run(global_by_opinion, non_overlapping=False),
+            },
+        }
+
+    conservative_opinion_level = {
+        "risk_off_excluded": _conservative(risk_off_ids, "macro_opinion_timestamp"),
+        "urgent_excluded": _conservative(urgent_ids, "news_opinion_timestamp"),
+    }
+
+    return {
+        "config": {"stop_mult": stop_mult, "target_mult": target_mult, "expiry_bars": expiry_bars},
+        "population": {
+            "candidates_considered": len(candidates),
+            "coordinator_traded_population": len(all_ids),
+            "short": len(short_ids),
+            "long": len(long_ids),
+        },
+        "policies": list(_VETO_POLICIES),
+        "decision_level": decision_level,
+        "portfolio_level": portfolio_level,
+        "attribution": attribution,
+        "macro_direction_breakdown": macro_direction_breakdown,
+        "day_session_breakdown": day_session_breakdown,
+        "conservative_opinion_level": conservative_opinion_level,
+    }

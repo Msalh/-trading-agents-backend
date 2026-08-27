@@ -1373,3 +1373,177 @@ def test_trading_date_integrity_empty_candidates_returns_zeroed_shape(fresh_env)
         "earliest_anchor_timestamp": None,
         "latest_anchor_timestamp": None,
     }
+
+
+# ---------------------------------------------------------------------------
+# Tier 3.39: factorial incremental P&L (thirteenth external review)
+# ---------------------------------------------------------------------------
+
+def _veto_candidate(
+    candidate_id, symbol, timeframe, anchor_dt, atr, decision, direction,
+    news_urgent=False, macro_risk_off=False, macro_direction=None,
+    news_opinion_ts=None, macro_opinion_ts=None, trading_date=None, session_name=None,
+):
+    """Like _candidate() above, but carries News/Macro opinions with
+    flags/direction so Tier 3.39's compute_veto_incremental_pnl() has
+    something to key its policies/breakdowns off of. news_opinion_ts/
+    macro_opinion_ts default to the candidate's own anchor timestamp
+    (a fresh opinion) unless overridden to simulate a REUSED opinion
+    shared across multiple candidates."""
+    anchor_iso = _iso(anchor_dt)
+    bar = {"timestamp": anchor_iso, "atr": atr}
+    if trading_date is not None:
+        bar["trading_date"] = trading_date
+    if session_name is not None:
+        bar["session_name"] = session_name
+    opinions_used = {
+        "analysis": {"direction": direction, "timestamp": anchor_iso},
+        "news": {
+            "direction": "neutral", "timestamp": news_opinion_ts or anchor_iso,
+            "flags": ["urgent"] if news_urgent else [],
+        },
+        "macro": {
+            "direction": macro_direction or "neutral", "timestamp": macro_opinion_ts or anchor_iso,
+            "flags": ["risk_off"] if macro_risk_off else [],
+        },
+    }
+    return {
+        "candidate_id": candidate_id, "symbol": symbol, "timeframe": timeframe,
+        "bar": bar,
+        "decision": {"decision": decision, "timestamp": anchor_iso, "opinions_used": opinions_used},
+    }
+
+
+def test_veto_pnl_population_excludes_non_directional_and_non_traded(fresh_env):
+    _, backtest = fresh_env
+    anchor = datetime(2026, 8, 11, 14, 0, tzinfo=timezone.utc)
+    traded = _veto_candidate("c1", "TEST", "5m", anchor, atr=2.0, decision="enter_long", direction="bullish")
+    no_trade = _veto_candidate("c2", "TEST", "5m", anchor, atr=2.0, decision="no_trade", direction="bullish")
+    neutral_analysis = _veto_candidate("c3", "TEST", "5m", anchor, atr=2.0, decision="enter_long", direction="neutral")
+
+    population = backtest._veto_pnl_population([traded, no_trade, neutral_analysis])
+    assert [c["candidate_id"] for c in population] == ["c1"]
+
+
+def test_veto_pnl_four_policies_partition_correctly(fresh_env):
+    storage, backtest = fresh_env
+    anchor = datetime(2026, 8, 11, 14, 0, tzinfo=timezone.utc)
+
+    clean = _veto_candidate("clean", "TEST", "5m", anchor, atr=2.0, decision="enter_long", direction="bullish")
+    urgent_only = _veto_candidate(
+        "urgent", "TEST", "5m", anchor, atr=2.0, decision="enter_long", direction="bullish", news_urgent=True,
+    )
+    risk_off_only = _veto_candidate(
+        "risk_off", "TEST", "5m", anchor, atr=2.0, decision="enter_short", direction="bearish", macro_risk_off=True,
+    )
+    both_flags = _veto_candidate(
+        "both", "TEST", "5m", anchor, atr=2.0, decision="enter_short", direction="bearish",
+        news_urgent=True, macro_risk_off=True,
+    )
+    _save_bar(storage, "TEST", "5m", anchor + timedelta(minutes=5), open_=100.0, high=106.0, low=99.5, close=105.5)
+
+    result = backtest.compute_veto_incremental_pnl([clean, urgent_only, risk_off_only, both_flags])
+    assert result["population"]["coordinator_traded_population"] == 4
+    assert result["population"]["short"] == 2
+    assert result["population"]["long"] == 2
+
+    # "none" includes everyone; "both" only the flag-free candidate.
+    assert result["decision_level"]["none"]["overall"]["candidates_in_subset"] == 4
+    assert result["decision_level"]["both"]["overall"]["candidates_in_subset"] == 1
+    # "urgent_only" drops the urgent-flagged pair (urgent, both) -> 2 remain.
+    assert result["decision_level"]["urgent_only"]["overall"]["candidates_in_subset"] == 2
+    # "risk_off_only" drops the risk_off-flagged pair (risk_off, both) -> 2 remain.
+    assert result["decision_level"]["risk_off_only"]["overall"]["candidates_in_subset"] == 2
+
+
+def test_veto_pnl_attribution_solo_plus_overlap_equals_union(fresh_env):
+    storage, backtest = fresh_env
+    anchor = datetime(2026, 8, 11, 14, 0, tzinfo=timezone.utc)
+    clean = _veto_candidate("clean", "TEST", "5m", anchor, atr=2.0, decision="enter_long", direction="bullish")
+    urgent_only = _veto_candidate(
+        "urgent", "TEST", "5m", anchor, atr=2.0, decision="enter_long", direction="bullish", news_urgent=True,
+    )
+    risk_off_only = _veto_candidate(
+        "risk_off", "TEST", "5m", anchor, atr=2.0, decision="enter_short", direction="bearish", macro_risk_off=True,
+    )
+    both_flags = _veto_candidate(
+        "both", "TEST", "5m", anchor, atr=2.0, decision="enter_short", direction="bearish",
+        news_urgent=True, macro_risk_off=True,
+    )
+    _save_bar(storage, "TEST", "5m", anchor + timedelta(minutes=5), open_=100.0, high=106.0, low=99.5, close=105.5)
+
+    result = backtest.compute_veto_incremental_pnl([clean, urgent_only, risk_off_only, both_flags])
+    attribution = result["attribution"]
+    solo_urgent = attribution["urgent_solo_excluded"]["decision_level"]["candidates_in_subset"]
+    solo_risk_off = attribution["risk_off_solo_excluded"]["decision_level"]["candidates_in_subset"]
+    overlap = attribution["both_excluded_overlap"]["decision_level"]["candidates_in_subset"]
+    union = attribution["any_excluded_union"]["decision_level"]["candidates_in_subset"]
+    assert (solo_urgent, solo_risk_off, overlap) == (1, 1, 1)
+    assert solo_urgent + solo_risk_off + overlap == union == 3
+
+
+def test_veto_pnl_portfolio_level_respects_non_overlap_but_decision_level_does_not(fresh_env):
+    storage, backtest = fresh_env
+    anchor1 = datetime(2026, 8, 11, 14, 0, tzinfo=timezone.utc)
+    anchor2 = anchor1 + timedelta(minutes=5)  # inside trade 1's life, before it resolves
+
+    c1 = _veto_candidate("c1", "TEST", "5m", anchor1, atr=2.0, decision="enter_long", direction="bullish")
+    c2 = _veto_candidate("c2", "TEST", "5m", anchor2, atr=2.0, decision="enter_long", direction="bullish")
+
+    _save_bar(storage, "TEST", "5m", anchor1 + timedelta(minutes=5), open_=100.0, high=100.5, low=99.5, close=100.2)
+    _save_bar(storage, "TEST", "5m", anchor1 + timedelta(minutes=10), open_=100.2, high=100.6, low=99.6, close=100.3)
+    _save_bar(storage, "TEST", "5m", anchor1 + timedelta(minutes=15), open_=100.3, high=106.0, low=99.5, close=105.5)
+
+    result = backtest.compute_veto_incremental_pnl([c1, c2])
+    # decision_level: both simulated independently, no scheduling conflict.
+    assert result["decision_level"]["none"]["overall"]["trades_taken"] == 2
+    # portfolio_level: c2's anchor falls before c1 resolves -> skipped.
+    assert result["portfolio_level"]["none"]["overall"]["trades_taken"] == 1
+    assert result["portfolio_level"]["none"]["overall"]["skipped_overlapping"] == 1
+
+
+def test_veto_pnl_macro_direction_breakdown_splits_risk_off_population(fresh_env):
+    storage, backtest = fresh_env
+    anchor = datetime(2026, 8, 11, 14, 0, tzinfo=timezone.utc)
+    bearish_macro = _veto_candidate(
+        "c1", "TEST", "5m", anchor, atr=2.0, decision="enter_short", direction="bearish",
+        macro_risk_off=True, macro_direction="bearish",
+    )
+    neutral_macro = _veto_candidate(
+        "c2", "TEST", "5m", anchor, atr=2.0, decision="enter_short", direction="bearish",
+        macro_risk_off=True, macro_direction="neutral",
+    )
+    not_risk_off = _veto_candidate(
+        "c3", "TEST", "5m", anchor, atr=2.0, decision="enter_long", direction="bullish",
+    )
+    _save_bar(storage, "TEST", "5m", anchor + timedelta(minutes=5), open_=100.0, high=106.0, low=99.5, close=105.5)
+
+    result = backtest.compute_veto_incremental_pnl([bearish_macro, neutral_macro, not_risk_off])
+    breakdown = result["macro_direction_breakdown"]
+    assert breakdown["bearish"]["candidates"] == 1
+    assert breakdown["neutral"]["candidates"] == 1
+    assert "bullish" not in breakdown  # not_risk_off never carried the risk_off flag
+
+
+def test_veto_pnl_conservative_view_dedupes_reused_opinion(fresh_env):
+    storage, backtest = fresh_env
+    anchor1 = datetime(2026, 8, 11, 14, 0, tzinfo=timezone.utc)
+    anchor2 = anchor1 + timedelta(minutes=20)
+    shared_opinion_ts = _iso(anchor1)  # both candidates cite the SAME Macro opinion timestamp
+
+    c1 = _veto_candidate(
+        "c1", "TEST", "5m", anchor1, atr=2.0, decision="enter_short", direction="bearish",
+        macro_risk_off=True, macro_opinion_ts=shared_opinion_ts, trading_date="2026-08-11",
+    )
+    c2 = _veto_candidate(
+        "c2", "TEST", "5m", anchor2, atr=2.0, decision="enter_short", direction="bearish",
+        macro_risk_off=True, macro_opinion_ts=shared_opinion_ts, trading_date="2026-08-11",
+    )
+    _save_bar(storage, "TEST", "5m", anchor1 + timedelta(minutes=5), open_=100.0, high=106.0, low=99.5, close=105.5)
+    _save_bar(storage, "TEST", "5m", anchor2 + timedelta(minutes=5), open_=100.0, high=106.0, low=99.5, close=105.5)
+
+    result = backtest.compute_veto_incremental_pnl([c1, c2])
+    conservative = result["conservative_opinion_level"]["risk_off_excluded"]
+    assert conservative["candidates_before_dedup"] == 2
+    assert conservative["first_per_day_and_opinion"]["candidates_after_dedup"] == 1
+    assert conservative["first_per_opinion_global"]["candidates_after_dedup"] == 1
