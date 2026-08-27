@@ -1586,6 +1586,108 @@ def test_veto_incremental_pnl_endpoint_accepts_config_overrides(client):
 
 
 # ---------------------------------------------------------------------------
+# Tier 3.42: frozen prospective 3-arm comparison (fifteenth external review)
+# ---------------------------------------------------------------------------
+
+def _save_veto_candidate(storage, candidate_id, symbol, timeframe, anchor, trading_date,
+                          news_urgent=False, macro_risk_off=False, decision="enter_long", direction="bullish"):
+    bar = {
+        "event_id": f"evt-{candidate_id}", "symbol": symbol, "timeframe": timeframe, "timestamp": anchor,
+        "atr": 2.0, "trading_date": trading_date,
+    }
+    decision_body = {
+        "decision": decision, "direction": direction, "score": 90.0, "threshold": 25.0,
+        "opinions_used": {
+            "analysis": {"direction": direction, "confidence": 90, "timestamp": anchor, "flags": []},
+            "news": {"direction": "neutral", "confidence": 90, "timestamp": anchor, "flags": ["urgent"] if news_urgent else []},
+            "macro": {"direction": "neutral", "confidence": 90, "timestamp": anchor, "flags": ["risk_off"] if macro_risk_off else []},
+        },
+        "missing_agents": [], "stale_agents": [], "contributions": {}, "conflict_flags": [], "timestamp": anchor,
+    }
+    storage.save_candidate(candidate_id=candidate_id, symbol=symbol, timeframe=timeframe, bar=bar, decision=decision_body)
+
+
+def test_current_rowid_endpoint_empty_history(client):
+    r = client.get("/candidates/history/current-rowid", params={"symbol": "NOSUCH-ROWID", "timeframe": "5m"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["symbol"] == "NOSUCH-ROWID"
+    assert body["timeframe"] == "5m"
+    assert body["current_rowid"] == 0
+
+
+def test_current_rowid_endpoint_advances_as_candidates_are_saved(client):
+    import app.storage as storage
+
+    r0 = client.get("/candidates/history/current-rowid", params={"symbol": "MNQ1!", "timeframe": "5m"})
+    watermark = r0.json()["current_rowid"]
+
+    _save_veto_candidate(storage, "cand-rw-1", "MNQ1!", "5m", "2026-08-11T14:00:00Z", "2026-08-11")
+
+    r1 = client.get("/candidates/history/current-rowid", params={"symbol": "MNQ1!", "timeframe": "5m"})
+    assert r1.json()["current_rowid"] > watermark
+
+
+def test_veto_prospective_comparison_endpoint_requires_since_rowid(client):
+    # No default on purpose -- omitting it must be a validation error, not
+    # a silently-chosen default window.
+    r = client.get(
+        "/candidates/history/veto-prospective-comparison",
+        params={"symbol": "MNQ1!", "timeframe": "5m"},
+    )
+    assert r.status_code == 422
+
+
+def test_veto_prospective_comparison_endpoint_filters_by_frozen_watermark(client):
+    import app.storage as storage
+
+    _save_veto_candidate(storage, "cand-pre-1", "MNQ1!", "5m", "2026-08-10T14:00:00Z", "2026-08-10")
+    _save_market_bar(storage, "MNQ1!", "5m", "2026-08-10T14:05:00Z", open_=20000.0, high=20060.0, low=19995.0, close=20055.0)
+
+    watermark = client.get(
+        "/candidates/history/current-rowid", params={"symbol": "MNQ1!", "timeframe": "5m"},
+    ).json()["current_rowid"]
+
+    _save_veto_candidate(storage, "cand-post-1", "MNQ1!", "5m", "2026-08-11T14:00:00Z", "2026-08-11")
+    _save_market_bar(storage, "MNQ1!", "5m", "2026-08-11T14:05:00Z", open_=20000.0, high=20060.0, low=19995.0, close=20055.0)
+
+    r = client.get(
+        "/candidates/history/veto-prospective-comparison",
+        params={"symbol": "MNQ1!", "timeframe": "5m", "since_rowid": watermark},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["since_rowid"] == watermark
+    # Only the candidate saved AFTER the watermark counts -- the pre-watermark
+    # one must be invisible to this call no matter how the population is sliced.
+    assert body["candidates_since_watermark"] == 1
+    assert body["population"]["coordinator_traded_population"] == 1
+    assert body["arms"] == ["none", "solo_veto_only", "overlap_only"]
+    assert body["results"]["none"]["candidates_in_arm"] == 1
+
+
+def test_veto_prospective_comparison_endpoint_rejects_oversized_population(client, monkeypatch):
+    import app.main as main
+    import app.storage as storage
+
+    monkeypatch.setattr(main, "PROSPECTIVE_POPULATION_SAFETY_CAP", 1)
+
+    watermark = client.get(
+        "/candidates/history/current-rowid", params={"symbol": "MNQ1!", "timeframe": "5m"},
+    ).json()["current_rowid"]
+
+    _save_veto_candidate(storage, "cand-cap-1", "MNQ1!", "5m", "2026-08-11T14:00:00Z", "2026-08-11")
+    _save_veto_candidate(storage, "cand-cap-2", "MNQ1!", "5m", "2026-08-11T14:05:00Z", "2026-08-11")
+
+    r = client.get(
+        "/candidates/history/veto-prospective-comparison",
+        params={"symbol": "MNQ1!", "timeframe": "5m", "since_rowid": watermark},
+    )
+    assert r.status_code == 400
+    assert "safety cap" in r.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
 # Tier 3.18: day/session reporting
 # ---------------------------------------------------------------------------
 

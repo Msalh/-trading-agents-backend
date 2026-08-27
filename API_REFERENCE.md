@@ -2743,6 +2743,145 @@ registering new synthetic sources.
 
 ---
 
+### `GET /candidates/history/current-rowid?symbol=MNQ1!&timeframe=5m`
+
+Tier 3.42, fifteenth external review. A trivial read-only wrapper
+around the internal `get_max_candidate_rowid()` helper `app.experiments`
+already uses at registration time. Exists purely so a **watermark
+rowid can be looked up and recorded exactly once**, then reused as
+`since_rowid` on every future call to `veto-prospective-comparison`
+below. Calling it again later returns a larger number as history
+accumulates — that's expected, and exactly why the first value read
+must be the one saved and reused, never re-fetched to "refresh" the
+boundary.
+
+Query params: `symbol`, `timeframe` (both required). Response:
+
+```json
+{ "symbol": "MNQ1!", "timeframe": "5m", "current_rowid": 4218 }
+```
+
+Nothing is written anywhere; this endpoint has no side effects.
+
+---
+
+### `GET /candidates/history/veto-prospective-comparison?symbol=MNQ1!&timeframe=5m&since_rowid=4218`
+
+Tier 3.42, fifteenth external review. The **frozen prospective**
+counterpart to `veto-incremental-pnl`'s retrospective `both_excluded_
+overlap` finding above. Both the fourteenth and fifteenth reviews
+landed on the same conclusion independently: that finding (63
+candidates, only 3 distinct trading days / 8 distinct joint News+Macro
+opinion pairs behind it) cannot be trusted for any decision no matter
+how it's re-sliced retrospectively — it's time for a forward-looking
+test that cannot have been curve-fit to the history that produced it.
+
+**Why not the experiment registry** (`app.experiments`): read in full
+before this tier was scoped. It is strictly single-arm — one
+`direction_source` column, one `target_metrics` triple per row — and
+already has two live registrations (`analysis_risk_filtered` at
+watermark 950, `coordinator` at watermark 588). Extending it to
+genuine N-arm comparisons would be a real schema/logic redesign
+touching both live rows, not a light lift, so this tier deliberately
+leaves `app/experiments.py` untouched.
+
+**Why not `run_paired_barrier_backtest`** (already N-source capable,
+and the first approach considered): its eligibility rule requires a
+candidate be resolvable under EVERY requested source simultaneously —
+applied to a no-veto arm, a solo-veto arm, and an overlap-only arm,
+that intersection would collapse all three arms down to just the tiny
+overlap population, defeating the entire point of comparing arms of
+different sizes. This endpoint instead follows the exact independent-
+population pattern `veto-incremental-pnl` already established: each
+arm gets its own independently-filtered subset and its own
+independently-scheduled `non_overlapping` backtest pass.
+`DIRECTION_SOURCES` is unchanged — every arm still uses
+`direction_source="coordinator"`.
+
+Query params: `symbol`, `timeframe` (required); **`since_rowid`
+(required, no default on purpose** — there is no sane default
+watermark for a prospective test; pass the value recorded from
+`current-rowid` above, and reuse the exact same value on every future
+call — a caller that widens or shifts the window between calls is no
+longer running a frozen prospective test); `atr_stop_mult`/
+`atr_target_mult`/`expiry_bars` (same defaults and meaning as
+`/backtest-lite`).
+
+Population size is safety-checked (via the existing `count_candidates_
+after_rowid`) **before** any candidate is pulled into memory: if the
+count since `since_rowid` exceeds `PROSPECTIVE_POPULATION_SAFETY_CAP`
+(5000), this returns **HTTP 400** rather than silently running an
+unbounded number of backtest passes.
+
+**Three arms** (`arms` in the response, exact meaning): `none` (no veto
+at all — this arm's own frozen baseline, over this arm's own window;
+deliberately not the same number as the wider retrospective baseline
+reported elsewhere, since that covers a different window); `solo_veto_
+only` (skip trading only when EXACTLY ONE of `news_urgent`/`macro_
+risk_off` fires — both-flagged and neither-flagged candidates still
+trade; tests the "solo bad, overlap fine" half of the hypothesis);
+`overlap_only` (trade ONLY when BOTH flags fire together — the
+opposite of a veto, a requirement; tests whether the retrospective
+overlap finding replicates on a population that had no way to have
+been curve-fit to it). Each arm reports `decision_level`/`portfolio_
+level` × `overall`/`short`/`long`, with the same per-summary `distinct_
+trading_days`/`distinct_news_opinions`/`distinct_macro_opinions`/
+`distinct_joint_news_macro_opinions`/`max_drawdown_usd` fields as
+`veto-incremental-pnl`, for the identical reason — a prospective sample
+can still be too thin to trust, and burying that would defeat the
+purpose of running a prospective test at all.
+
+```json
+{
+  "symbol": "MNQ1!",
+  "timeframe": "5m",
+  "since_rowid": 4218,
+  "candidates_since_watermark": 37,
+  "config": { "stop_mult": 1.5, "target_mult": 2.5, "expiry_bars": 24 },
+  "population": {
+    "candidates_considered": 37,
+    "coordinator_traded_population": 33,
+    "short": 18,
+    "long": 15
+  },
+  "arms": ["none", "solo_veto_only", "overlap_only"],
+  "results": {
+    "none": {
+      "candidates_in_arm": 33,
+      "decision_level": {
+        "overall": { "trades_taken": 33, "win_rate": 0.48, "total_pnl_usd": -210.0, "candidates_in_subset": 33, "max_drawdown_usd": -640.0, "distinct_trading_days": 6, "distinct_news_opinions": 9, "distinct_macro_opinions": 7, "distinct_joint_news_macro_opinions": 10 },
+        "short": { "trades_taken": 18, "win_rate": 0.44, "total_pnl_usd": -180.0, "candidates_in_subset": 18 },
+        "long": { "trades_taken": 15, "win_rate": 0.53, "total_pnl_usd": -30.0, "candidates_in_subset": 15 }
+      },
+      "portfolio_level": {
+        "overall": { "trades_taken": 12, "win_rate": 0.50, "total_pnl_usd": -40.0, "candidates_in_subset": 33 }
+      }
+    },
+    "overlap_only": {
+      "candidates_in_arm": 4,
+      "decision_level": {
+        "overall": { "trades_taken": 4, "win_rate": 0.50, "total_pnl_usd": 15.0, "candidates_in_subset": 4, "max_drawdown_usd": -60.0, "distinct_trading_days": 2, "distinct_news_opinions": 2, "distinct_macro_opinions": 2, "distinct_joint_news_macro_opinions": 2 }
+      }
+    }
+  }
+}
+```
+
+(Illustrative shape only, fabricated numbers — this is exactly the
+kind of result that must NOT be trusted until the sample is much
+larger than 4 candidates / 2 days, which is the whole reason this test
+is frozen and prospective rather than another retrospective re-slice.)
+
+Entirely read-only: no candidate mutated, nothing written to any trade
+table, `COORDINATOR_THRESHOLD`/`WEIGHTS`/`MIN_AVAILABLE_WEIGHT`/
+`AUTO_EXECUTE_ENABLED` all untouched, `app.experiments` untouched. The
+watermark itself is **not frozen by this code** — freezing it is an
+operational step (calling `current-rowid` once against production and
+recording the value outside the API) that happens after this tier
+ships, not something this tier can enforce in software.
+
+---
+
 ### `opinion_level_day_blocked` (Tier 3.29 — present in all five endpoints above)
 
 Sixth external review, ranked backlog item #3. Every field documented

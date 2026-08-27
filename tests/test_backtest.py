@@ -1664,3 +1664,86 @@ def test_data_range_metadata_handles_empty_candidate_list(fresh_env):
     assert meta["earliest_candidate_timestamp"] is None
     assert meta["latest_candidate_timestamp"] is None
     assert meta["distinct_trading_days_in_window"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Tier 3.42: frozen prospective 3-arm comparison (fifteenth external review)
+# ---------------------------------------------------------------------------
+
+def test_prospective_arm_included_partitions_none_solo_and_overlap():
+    # none: everyone. solo_veto_only: keeps both-flagged AND neither-flagged,
+    # drops only the exactly-one-flag cases. overlap_only: keeps only the
+    # both-flagged case.
+    from app import backtest
+
+    cases = [
+        (False, False),  # neither flag
+        (True, False),   # solo urgent
+        (False, True),   # solo risk_off
+        (True, True),    # both (overlap)
+    ]
+    for news_urgent, macro_risk_off in cases:
+        assert backtest._prospective_arm_included("none", news_urgent, macro_risk_off) is True
+
+    included_solo = [backtest._prospective_arm_included("solo_veto_only", u, r) for u, r in cases]
+    assert included_solo == [True, False, False, True]
+
+    included_overlap = [backtest._prospective_arm_included("overlap_only", u, r) for u, r in cases]
+    assert included_overlap == [False, False, False, True]
+
+
+def test_prospective_arm_included_rejects_unknown_arm():
+    from app import backtest
+
+    with pytest.raises(ValueError):
+        backtest._prospective_arm_included("not_a_real_arm", True, True)
+
+
+def test_prospective_overlap_comparison_partitions_population_by_arm(fresh_env):
+    storage, backtest = fresh_env
+    anchor = datetime(2026, 8, 11, 14, 0, tzinfo=timezone.utc)
+
+    clean = _veto_candidate("clean", "TEST", "5m", anchor, atr=2.0, decision="enter_long", direction="bullish")
+    urgent_only = _veto_candidate(
+        "urgent", "TEST", "5m", anchor, atr=2.0, decision="enter_long", direction="bullish", news_urgent=True,
+    )
+    risk_off_only = _veto_candidate(
+        "risk_off", "TEST", "5m", anchor, atr=2.0, decision="enter_short", direction="bearish", macro_risk_off=True,
+    )
+    both_flags = _veto_candidate(
+        "both", "TEST", "5m", anchor, atr=2.0, decision="enter_short", direction="bearish",
+        news_urgent=True, macro_risk_off=True,
+    )
+    _save_bar(storage, "TEST", "5m", anchor + timedelta(minutes=5), open_=100.0, high=106.0, low=99.5, close=105.5)
+
+    result = backtest.compute_prospective_overlap_comparison([clean, urgent_only, risk_off_only, both_flags])
+    assert result["arms"] == ["none", "solo_veto_only", "overlap_only"]
+    assert result["population"]["coordinator_traded_population"] == 4
+
+    # none: everyone.
+    assert result["results"]["none"]["candidates_in_arm"] == 4
+    # solo_veto_only: drops the two solo-flagged (urgent, risk_off) -> clean + both remain.
+    assert result["results"]["solo_veto_only"]["candidates_in_arm"] == 2
+    # overlap_only: only the both-flagged candidate.
+    assert result["results"]["overlap_only"]["candidates_in_arm"] == 1
+
+    overlap_overall = result["results"]["overlap_only"]["decision_level"]["overall"]
+    assert overlap_overall["candidates_in_subset"] == 1
+    assert "distinct_trading_days" in overlap_overall
+    assert "distinct_joint_news_macro_opinions" in overlap_overall
+
+
+def test_prospective_overlap_comparison_short_long_splits_reuse_same_arm_ids(fresh_env):
+    storage, backtest = fresh_env
+    anchor = datetime(2026, 8, 11, 14, 0, tzinfo=timezone.utc)
+    long_clean = _veto_candidate("long", "TEST", "5m", anchor, atr=2.0, decision="enter_long", direction="bullish")
+    short_clean = _veto_candidate(
+        "short", "TEST", "5m", anchor, atr=2.0, decision="enter_short", direction="bearish",
+    )
+    _save_bar(storage, "TEST", "5m", anchor + timedelta(minutes=5), open_=100.0, high=106.0, low=99.5, close=105.5)
+
+    result = backtest.compute_prospective_overlap_comparison([long_clean, short_clean])
+    none_arm = result["results"]["none"]
+    assert none_arm["decision_level"]["overall"]["candidates_in_subset"] == 2
+    assert none_arm["decision_level"]["long"]["candidates_in_subset"] == 1
+    assert none_arm["decision_level"]["short"]["candidates_in_subset"] == 1

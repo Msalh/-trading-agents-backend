@@ -1307,6 +1307,51 @@ and read-only: no live policy/weight/threshold touched, no existing
 field's shape changed, COORDINATOR_THRESHOLD/WEIGHTS/
 MIN_AVAILABLE_WEIGHT/AUTO_EXECUTE_ENABLED all untouched.
 
+Tier 3.42 (fifteenth external review, 2026-08-27, prospective 3-arm
+comparison): both the fourteenth and fifteenth reviews landed on the
+same conclusion — the retrospective `both_excluded_overlap` finding
+(63 candidates, only 3 distinct trading days / 8 distinct joint
+News+Macro opinion pairs behind it) cannot be trusted for any decision
+no matter how it's re-sliced, and it's time to move from retrospective
+mining to a frozen prospective test, "for the second time" per the
+fifteenth review. Two architectures were considered before building:
+extending app.experiments' registry to genuine N-arm comparisons was
+rejected after reading it in full — it is strictly single-arm (one
+direction_source column, one target_metrics triple) and already has
+two live registrations (analysis_risk_filtered at watermark 950,
+coordinator at watermark 588), so extending it would be a real schema
+redesign touching both, not a light lift. Using run_paired_barrier_
+backtest (already N-source capable) was also rejected after reading its
+source: its eligible-for-every-requested-source intersection semantics
+would silently collapse a no-veto arm, a solo-veto arm, and an
+overlap-only arm down to just the tiny overlap population, defeating
+the comparison. Instead, this tier adds a bespoke
+compute_prospective_overlap_comparison() to app/backtest.py that
+replicates compute_veto_incremental_pnl's own proven pattern — each of
+three fixed arms (`none`/`solo_veto_only`/`overlap_only`) gets its own
+independently-filtered population and independently-scheduled
+non_overlapping backtest pass, DIRECTION_SOURCES itself untouched
+(still direction_source="coordinator" throughout).
+
+Two new read-only endpoints: GET /candidates/history/current-rowid (a
+trivial wrapper around the existing get_max_candidate_rowid(), exposed
+so a watermark can be looked up and recorded exactly once) and GET
+/candidates/history/veto-prospective-comparison (since_rowid required
+with no default on purpose — there is no sane default watermark for a
+prospective test; population size safety-checked against the new
+PROSPECTIVE_POPULATION_SAFETY_CAP=5000 via the existing count_
+candidates_after_rowid() BEFORE pulling any candidate into memory, per
+that function's own "cheap COUNT-only pre-check" docstring). Same
+per-summary diversity fields and max_drawdown_usd as veto-incremental-
+pnl, for the same reason. Purely additive and read-only: no live
+policy/weight/threshold touched, no existing endpoint's response shape
+changed, COORDINATOR_THRESHOLD/WEIGHTS/MIN_AVAILABLE_WEIGHT/
+AUTO_EXECUTE_ENABLED all untouched, app.experiments untouched. The
+watermark itself is NOT frozen by this code — freezing it is an
+operational step (calling current-rowid once against production and
+recording the value) that happens after this tier ships, not something
+this tier can enforce in software.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -1331,8 +1376,10 @@ from app.backtest import (
     EXPIRY_BARS,
     compute_backtest_comparison,
     compute_champion_challenger_report,
+    PROSPECTIVE_POPULATION_SAFETY_CAP,
     compute_data_range_metadata,
     compute_day_session_breakdown,
+    compute_prospective_overlap_comparison,
     compute_trading_date_integrity_report,
     compute_veto_incremental_pnl,
     run_paired_barrier_backtest,
@@ -1409,6 +1456,7 @@ from app.storage import (
     get_all_closed_trades_chronological,
     get_by_event_id,
     get_candidate_by_id,
+    get_candidates_after_rowid,
     get_experiment_by_id,
     get_last_opinion_timestamps,
     get_last_webhook_received,
@@ -1416,6 +1464,7 @@ from app.storage import (
     get_latest_candidate,
     get_latest_opinion,
     get_llm_call_summary,
+    get_max_candidate_rowid,
     get_open_or_pending_trades,
     get_recent,
     get_recent_as_of,
@@ -3509,6 +3558,109 @@ def candidates_history_veto_incremental_pnl(
         candidates, stop_mult=atr_stop_mult, target_mult=atr_target_mult, expiry_bars=expiry_bars,
     )
     return {"symbol": symbol, "timeframe": timeframe, "data_range": data_range, **result}
+
+
+@app.get("/candidates/history/current-rowid")
+def candidates_history_current_rowid(
+    symbol: str = Query(...),
+    timeframe: str = Query(...),
+) -> dict:
+    """Tier 3.42 (fifteenth external review) — a trivial read-only
+    wrapper around app.storage.get_max_candidate_rowid(), which
+    app.experiments already calls internally at experiment
+    registration time. Exposed as its own endpoint specifically so a
+    watermark can be looked up and RECORDED ONCE, then passed as
+    since_rowid to GET /candidates/history/veto-prospective-comparison
+    on every subsequent call — never re-looked-up and never backdated,
+    which is what keeps that comparison a frozen prospective test
+    instead of retrospective mining with extra steps. Nothing is
+    written anywhere; calling this twice in a row is harmless and, as
+    history accumulates, will return two different numbers — that is
+    expected, and exactly why the caller must save the FIRST value it
+    ever reads and reuse it, not call this endpoint again to "refresh"
+    the boundary."""
+    current_rowid = get_max_candidate_rowid(symbol=symbol, timeframe=timeframe)
+    return {"symbol": symbol, "timeframe": timeframe, "current_rowid": current_rowid}
+
+
+@app.get("/candidates/history/veto-prospective-comparison")
+def candidates_history_veto_prospective_comparison(
+    symbol: str = Query(...),
+    timeframe: str = Query(...),
+    since_rowid: int = Query(..., description="Required, no default on purpose — the frozen watermark rowid from GET /candidates/history/current-rowid, recorded once and reused on every call. Only candidates with rowid strictly greater than this are included."),
+    atr_stop_mult: float = Query(default=ATR_STOP_MULT),
+    atr_target_mult: float = Query(default=ATR_TARGET_MULT),
+    expiry_bars: int = Query(default=EXPIRY_BARS, le=200),
+) -> dict:
+    """Tier 3.42 (fifteenth external review) — the frozen PROSPECTIVE
+    counterpart to GET /candidates/history/veto-incremental-pnl's
+    retrospective `both_excluded_overlap` finding. See app/backtest.py's
+    Tier 3.42 module comment block (directly above _PROSPECTIVE_ARMS)
+    for the full design rationale, including why this reuses the
+    independent-population pattern compute_veto_incremental_pnl already
+    established rather than the experiment registry (strictly
+    single-arm, already has two live registrations) or run_paired_
+    barrier_backtest (its eligible-for-every-source intersection
+    semantics would collapse all three arms down to the tiny overlap
+    population).
+
+    `since_rowid` is REQUIRED with no default, deliberately — there is
+    no sane default watermark for a prospective test; the caller must
+    have already called GET /candidates/history/current-rowid once,
+    recorded that value outside this API, and pass the SAME value on
+    every subsequent call. Passing a different since_rowid on a later
+    call silently redefines the test population and defeats the entire
+    point of freezing it.
+
+    Population size is safety-checked via count_candidates_after_rowid
+    BEFORE any candidate is pulled into memory: if the count exceeds
+    PROSPECTIVE_POPULATION_SAFETY_CAP, this returns HTTP 400 rather than
+    silently running an unbounded number of backtest passes — get_
+    candidates_after_rowid() itself has no LIMIT (see its docstring in
+    app/storage.py: a "newest N" query is the wrong tool for a
+    prospective window, since it would silently drop the OLDEST
+    prospective candidates rather than failing loudly).
+
+    Three arms (`arms` in the response, exact meaning): `none` (no veto
+    at all — this arm's own frozen baseline), `solo_veto_only` (skip
+    only when EXACTLY ONE of news_urgent/macro_risk_off fires; both-
+    flagged and neither-flagged candidates still trade), `overlap_only`
+    (trade ONLY when BOTH flags fire together — a requirement, not a
+    veto). Each arm reports `decision_level`/`portfolio_level` ×
+    `overall`/`short`/`long`, with the same per-summary diversity
+    fields (`distinct_trading_days`/`distinct_news_opinions`/`distinct_
+    macro_opinions`/`distinct_joint_news_macro_opinions`) and `max_
+    drawdown_usd` as veto-incremental-pnl, for the identical reason: a
+    prospective sample can still be too thin to trust, and this makes
+    that visible rather than assumed.
+
+    Entirely read-only: no candidate mutated, nothing written to any
+    trade table, COORDINATOR_THRESHOLD/WEIGHTS/MIN_AVAILABLE_WEIGHT/
+    AUTO_EXECUTE_ENABLED all untouched — this only ever simulates
+    HYPOTHETICAL arms against real historical price bars, it never
+    places or affects a real trade."""
+    candidates_since_watermark = count_candidates_after_rowid(symbol=symbol, timeframe=timeframe, min_rowid=since_rowid)
+    if candidates_since_watermark > PROSPECTIVE_POPULATION_SAFETY_CAP:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{candidates_since_watermark} candidates since rowid {since_rowid} exceeds the "
+                f"safety cap of {PROSPECTIVE_POPULATION_SAFETY_CAP} — refusing to run an unbounded "
+                "number of backtest passes. Raise PROSPECTIVE_POPULATION_SAFETY_CAP if this window "
+                "is intentional."
+            ),
+        )
+    candidates = get_candidates_after_rowid(symbol=symbol, timeframe=timeframe, min_rowid=since_rowid)
+    result = compute_prospective_overlap_comparison(
+        candidates, stop_mult=atr_stop_mult, target_mult=atr_target_mult, expiry_bars=expiry_bars,
+    )
+    return {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "since_rowid": since_rowid,
+        "candidates_since_watermark": candidates_since_watermark,
+        **result,
+    }
 
 
 @app.post("/experiments")

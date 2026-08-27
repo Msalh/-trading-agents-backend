@@ -314,6 +314,19 @@ ATR_STOP_MULT = float(os.environ.get("BACKTEST_ATR_STOP_MULT", "1.5"))
 ATR_TARGET_MULT = float(os.environ.get("BACKTEST_ATR_TARGET_MULT", "2.5"))
 EXPIRY_BARS = int(os.environ.get("BACKTEST_EXPIRY_BARS", "24"))
 
+# Tier 3.42 (fifteenth external review) — the safety pre-check cap for
+# GET /candidates/history/veto-prospective-comparison. That endpoint
+# takes an unbounded "everything after this rowid" population (see
+# get_candidates_after_rowid's own docstring in app/storage.py, which
+# explicitly recommends count_candidates_after_rowid() as a pre-check
+# for exactly this reason) rather than a "newest N" limit, since a
+# prospective test's population is defined by a frozen watermark, not
+# by a page size. This cap exists purely so a watermark left running
+# for a very long time fails loudly (HTTP 400) instead of pulling an
+# unbounded number of rows into memory and running ~24 backtest passes
+# over all of them.
+PROSPECTIVE_POPULATION_SAFETY_CAP = 5000
+
 # Tier 3.23 (fifth external review — experiment registry hardening): a
 # hand-maintained marker for the barrier-simulation LOGIC itself (fill/
 # stop/target ordering, slippage/commission application, expiry
@@ -1887,4 +1900,158 @@ def compute_veto_incremental_pnl(
         "macro_direction_breakdown": macro_direction_breakdown,
         "day_session_breakdown": day_session_breakdown,
         "conservative_opinion_level": conservative_opinion_level,
+    }
+
+
+# Tier 3.42 (fifteenth external review) — a frozen PROSPECTIVE 3-arm
+# comparison, the direct follow-up to compute_veto_incremental_pnl's
+# retrospective "both_excluded_overlap" finding (63 candidates, only 3
+# distinct trading days / 8 distinct joint News+Macro opinion pairs
+# behind it — not enough to trust for any live decision, per the
+# fourteenth AND fifteenth reviews). Rather than mining more history
+# for the same three days over and over, this runs three fixed
+# counterfactual ARMS going FORWARD from a caller-supplied watermark
+# rowid that must never be backdated once chosen.
+#
+# Why not the experiment registry (app.experiments): read in full
+# before this tier was scoped. It is strictly single-arm — one
+# `direction_source` TEXT column, one `target_metrics` triple per row —
+# and already has two live registrations (analysis_risk_filtered at
+# watermark 950, coordinator at watermark 588). Extending it to
+# genuine N-arm comparisons would be a real schema/logic redesign
+# touching both live rows, not a light lift, so this tier deliberately
+# does NOT touch app/experiments.py.
+#
+# Why not run_paired_barrier_backtest (already N-source capable, and
+# the first thing considered here): its eligibility rule requires a
+# candidate be resolvable under EVERY requested source simultaneously
+# (`if any(d is None for d in directions.values()): continue` — the
+# eligible set is the intersection across sources). Applied to a
+# no-veto arm, a solo-veto arm, and an overlap-only arm, that
+# intersection would collapse ALL THREE arms down to just the tiny
+# overlap population, defeating the entire point of comparing arms of
+# different sizes against each other. This function instead follows
+# the exact independent-population pattern compute_veto_incremental_
+# pnl already established: each arm gets its own independently
+# filtered candidate subset and its own independently scheduled
+# non_overlapping backtest pass — DIRECTION_SOURCES itself is
+# untouched (still direction_source="coordinator" throughout, same as
+# every other function in this module since Tier 3.39).
+_PROSPECTIVE_ARMS = ("none", "solo_veto_only", "overlap_only")
+
+
+def _prospective_arm_included(arm: str, news_urgent: bool, macro_risk_off: bool) -> bool:
+    """The per-candidate inclusion rule for each of the three frozen
+    prospective arms. Applied identically at build time on every call —
+    no arm is ever chosen after seeing results, which is the entire
+    point of a frozen prospective test."""
+    if arm == "none":
+        # No veto at all. This arm's own baseline, over this arm's own
+        # frozen window — deliberately NOT the same number as the wider
+        # retrospective baseline reported elsewhere (different window).
+        return True
+    if arm == "solo_veto_only":
+        # Skip trading only when EXACTLY ONE of the two flags fires;
+        # both-flagged (the overlap) and neither-flagged candidates
+        # still trade under this arm. Tests the "solo bad, overlap
+        # fine" half of the hypothesis the fourteenth review raised.
+        return news_urgent == macro_risk_off
+    if arm == "overlap_only":
+        # The opposite of a veto: a REQUIREMENT to trade only when both
+        # flags fire together. Tests whether the retrospective overlap
+        # finding replicates on a population this function had no way
+        # to have curve-fit to, since the window starts strictly after
+        # the watermark the retrospective analysis was already run on.
+        return news_urgent and macro_risk_off
+    raise ValueError(f"unknown arm {arm!r} — must be one of {_PROSPECTIVE_ARMS}")
+
+
+def compute_prospective_overlap_comparison(
+    candidates: list[dict],
+    stop_mult: float = ATR_STOP_MULT,
+    target_mult: float = ATR_TARGET_MULT,
+    expiry_bars: int = EXPIRY_BARS,
+) -> dict:
+    """Tier 3.42 (fifteenth external review) — see the module comment
+    block directly above _PROSPECTIVE_ARMS for the full design
+    rationale (why not the experiment registry, why not
+    run_paired_barrier_backtest). `candidates` must already be scoped
+    to a single frozen watermark window by the caller (everything
+    strictly after a recorded rowid — see GET /candidates/history/
+    current-rowid and the required since_rowid parameter on GET
+    /candidates/history/veto-prospective-comparison in app.main); this
+    function has no opinion about the window itself, it only runs the
+    three fixed arms over whatever population it is given. The SAME
+    watermark must be reused on every call for the comparison to keep
+    meaning what it's supposed to mean — a caller that silently widens
+    or shifts the window between calls is no longer running a frozen
+    prospective test, it is back to retrospective mining with extra
+    steps.
+
+    Same per-summary diversity fields (distinct_trading_days/
+    distinct_news_opinions/distinct_macro_opinions/distinct_joint_
+    news_macro_opinions) as compute_veto_incremental_pnl, attached for
+    the identical reason: a prospective sample can still be too thin
+    to trust, and burying that would defeat the purpose of running a
+    prospective test in the first place instead of trusting the
+    retrospective one."""
+    population = _veto_pnl_population(candidates)
+    candidates_by_id = {c["candidate_id"]: c for c in population}
+    meta = {cid: _veto_pnl_flags(c) for cid, c in candidates_by_id.items()}
+    all_ids = set(candidates_by_id.keys())
+    short_ids = {cid for cid in all_ids if meta[cid]["direction"] == "bearish"}
+    long_ids = {cid for cid in all_ids if meta[cid]["direction"] == "bullish"}
+
+    def _run(ids: set, non_overlapping: bool) -> dict:
+        subset = [candidates_by_id[cid] for cid in ids]
+        summary = run_barrier_backtest(
+            subset, direction_source="coordinator",
+            stop_mult=stop_mult, target_mult=target_mult, expiry_bars=expiry_bars,
+            non_overlapping=non_overlapping, include_trades=False,
+        )
+        summary.pop("trades", None)
+        summary["candidates_in_subset"] = len(ids)
+        summary["distinct_trading_days"] = _distinct_count(meta, ids, "trading_date")
+        summary["distinct_news_opinions"] = _distinct_count(meta, ids, "news_opinion_timestamp")
+        summary["distinct_macro_opinions"] = _distinct_count(meta, ids, "macro_opinion_timestamp")
+        summary["distinct_joint_news_macro_opinions"] = _distinct_pair_count(
+            meta, ids, ("news_opinion_timestamp", "macro_opinion_timestamp"),
+        )
+        return summary
+
+    arm_ids = {
+        arm: {
+            cid for cid in all_ids
+            if _prospective_arm_included(arm, meta[cid]["news_urgent"], meta[cid]["macro_risk_off"])
+        }
+        for arm in _PROSPECTIVE_ARMS
+    }
+
+    results = {}
+    for arm in _PROSPECTIVE_ARMS:
+        ids = arm_ids[arm]
+        results[arm] = {
+            "candidates_in_arm": len(ids),
+            "decision_level": {
+                "overall": _run(ids, non_overlapping=False),
+                "short": _run(ids & short_ids, non_overlapping=False),
+                "long": _run(ids & long_ids, non_overlapping=False),
+            },
+            "portfolio_level": {
+                "overall": _run(ids, non_overlapping=True),
+                "short": _run(ids & short_ids, non_overlapping=True),
+                "long": _run(ids & long_ids, non_overlapping=True),
+            },
+        }
+
+    return {
+        "config": {"stop_mult": stop_mult, "target_mult": target_mult, "expiry_bars": expiry_bars},
+        "population": {
+            "candidates_considered": len(candidates),
+            "coordinator_traded_population": len(all_ids),
+            "short": len(short_ids),
+            "long": len(long_ids),
+        },
+        "arms": list(_PROSPECTIVE_ARMS),
+        "results": results,
     }
