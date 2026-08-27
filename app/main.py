@@ -1249,6 +1249,33 @@ this tier only ships the measurement; interpreting the resulting
 numbers and any policy recommendation is deferred to the next review
 round once real production data is pulled through this endpoint.
 
+Tier 3.40 (fourteenth external review, 2026-08-27, overlap diagnostic
+extension): the first real production pull through Tier 3.39's endpoint
+(Package #14) mislabeled the "both" counterfactual policy as "(live
+policy)" — the reviewer caught this and it was independently verified
+against source before accepting: the live Coordinator applies News'
+"urgent" as a soft 0.5x score dampener (app/coordinator.py, unconditional
+whenever "urgent" is set), never a hard veto, and never applies Macro's
+"risk_off" at all — it is referenced nowhere in live coordinator/
+execution code, only in macro_agent.py's schema and this diagnostic
+family. None of Tier 3.39's four policies have ever been live; every
+docstring/comment describing them now says so explicitly. The reviewer
+also raised a new, explicitly NOT-yet-adopted hypothesis (urgent+
+risk_off agreement may mark genuinely tradeable moves rather than pure
+risk) and asked for the day/opinion diversity behind it before trusting
+it — specifically a joint (News opinion, Macro opinion) PAIR count for
+the 63-candidate overlap subset, since "16 opinions per flag" counted
+separately doesn't reveal how many distinct combinations those opinions
+actually form. Every summary dict anywhere in compute_veto_incremental_
+pnl's response (policies, attribution, macro_direction_breakdown,
+day_session_breakdown, conservative_opinion_level) now additionally
+reports distinct_trading_days/distinct_news_opinions/distinct_macro_
+opinions/distinct_joint_news_macro_opinions alongside every P&L figure
+— purely additive, no existing field's shape or meaning changed, no
+live policy/weight/threshold touched, DIRECTION_SOURCES unchanged.
+max_drawdown_usd was already computed since Tier 3.39 and is now called
+out explicitly rather than left to be independently rediscovered.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -3415,7 +3442,30 @@ def candidates_history_veto_incremental_pnl(
     any trade table, COORDINATOR_THRESHOLD/WEIGHTS/MIN_AVAILABLE_WEIGHT/
     AUTO_EXECUTE_ENABLED all untouched — this only ever simulates a
     HYPOTHETICAL policy against real historical price bars, it never
-    places or affects a real trade."""
+    places or affects a real trade.
+
+    IMPORTANT — none of the four policies have ever been live: the real
+    Coordinator applies News' "urgent" as a soft 0.5x score dampener
+    (app/coordinator.py), never a hard veto, and never applies Macro's
+    "risk_off" at all (it exists only in this diagnostic family and
+    macro_agent.py's schema). The registered analysis_risk_filtered
+    shadow experiment is a third, separate mechanism (follows Analysis's
+    own direction, bypasses quorum). Do not describe any of `none`/
+    `urgent_only`/`risk_off_only`/`both` as "the live policy" — they are
+    all counterfactuals for comparison only (fourteenth external review's
+    correction after an earlier analysis package mislabeled `both` this
+    way).
+
+    Tier 3.40 (fourteenth review): every summary dict anywhere in this
+    response — every policy/split, every attribution set, every
+    macro_direction_breakdown/day_session_breakdown/conservative_
+    opinion_level entry — additionally reports `distinct_trading_days`,
+    `distinct_news_opinions`, `distinct_macro_opinions`, and `distinct_
+    joint_news_macro_opinions` (distinct (News opinion, Macro opinion)
+    PAIRS, not the two counted separately) alongside every P&L figure,
+    plus `max_drawdown_usd` (computed since Tier 3.39, just wasn't
+    previously highlighted) — so no P&L number can be read without its
+    underlying sample diversity sitting right next to it."""
     candidates = get_candidate_history(symbol=symbol, timeframe=timeframe, limit=limit)
     result = compute_veto_incremental_pnl(
         candidates, stop_mult=atr_stop_mult, target_mult=atr_target_mult, expiry_bars=expiry_bars,

@@ -1547,3 +1547,83 @@ def test_veto_pnl_conservative_view_dedupes_reused_opinion(fresh_env):
     assert conservative["candidates_before_dedup"] == 2
     assert conservative["first_per_day_and_opinion"]["candidates_after_dedup"] == 1
     assert conservative["first_per_opinion_global"]["candidates_after_dedup"] == 1
+
+
+def test_veto_pnl_diversity_fields_report_distinct_days_and_opinions(fresh_env):
+    # Tier 3.40 (fourteenth external review): every summary dict must
+    # report its own day/opinion diversity alongside P&L, not just a
+    # candidate count -- so a reader can't mistake a handful of reused
+    # judgment calls for many independent ones.
+    storage, backtest = fresh_env
+    anchor = datetime(2026, 8, 11, 14, 0, tzinfo=timezone.utc)
+    day1_ts = _iso(anchor)
+    day2_ts = _iso(anchor + timedelta(days=1))
+
+    c1 = _veto_candidate(
+        "c1", "TEST", "5m", anchor, atr=2.0, decision="enter_long", direction="bullish",
+        trading_date="2026-08-11", news_opinion_ts=day1_ts, macro_opinion_ts=day1_ts,
+    )
+    c2 = _veto_candidate(
+        "c2", "TEST", "5m", anchor + timedelta(minutes=5), atr=2.0, decision="enter_long", direction="bullish",
+        trading_date="2026-08-11", news_opinion_ts=day1_ts, macro_opinion_ts=day1_ts,
+    )
+    c3 = _veto_candidate(
+        "c3", "TEST", "5m", anchor + timedelta(days=1), atr=2.0, decision="enter_long", direction="bullish",
+        trading_date="2026-08-12", news_opinion_ts=day2_ts, macro_opinion_ts=day2_ts,
+    )
+    for dt in (anchor + timedelta(minutes=5), anchor + timedelta(minutes=10),
+               anchor + timedelta(days=1, minutes=5)):
+        _save_bar(storage, "TEST", "5m", dt, open_=100.0, high=106.0, low=99.5, close=105.5)
+
+    result = backtest.compute_veto_incremental_pnl([c1, c2, c3])
+    overall = result["decision_level"]["none"]["overall"]
+    assert overall["candidates_in_subset"] == 3
+    # c1/c2 share the same trading_date and the same News/Macro opinion
+    # identity (a reused opinion); c3 is a genuinely separate day/opinion.
+    assert overall["distinct_trading_days"] == 2
+    assert overall["distinct_news_opinions"] == 2
+    assert overall["distinct_macro_opinions"] == 2
+    assert overall["distinct_joint_news_macro_opinions"] == 2
+
+
+def test_veto_pnl_joint_opinion_pairs_distinguishes_from_per_flag_counts(fresh_env):
+    # Tier 3.40: the fourteenth review's specific ask -- "16 opinions per
+    # flag" doesn't say how many distinct (news, macro) PAIRS those 16
+    # actually form. Build 3 overlap candidates where the News opinion is
+    # reused across two different Macro opinions, so distinct_news_
+    # opinions (1) and distinct_joint_news_macro_opinions (2) must differ.
+    storage, backtest = fresh_env
+    anchor = datetime(2026, 8, 11, 14, 0, tzinfo=timezone.utc)
+    shared_news_ts = _iso(anchor)
+    macro_ts_a = _iso(anchor)
+    macro_ts_b = _iso(anchor + timedelta(minutes=30))
+
+    c1 = _veto_candidate(
+        "c1", "TEST", "5m", anchor, atr=2.0, decision="enter_short", direction="bearish",
+        news_urgent=True, macro_risk_off=True,
+        news_opinion_ts=shared_news_ts, macro_opinion_ts=macro_ts_a,
+    )
+    c2 = _veto_candidate(
+        "c2", "TEST", "5m", anchor + timedelta(minutes=5), atr=2.0, decision="enter_short", direction="bearish",
+        news_urgent=True, macro_risk_off=True,
+        news_opinion_ts=shared_news_ts, macro_opinion_ts=macro_ts_a,
+    )
+    c3 = _veto_candidate(
+        "c3", "TEST", "5m", anchor + timedelta(minutes=35), atr=2.0, decision="enter_short", direction="bearish",
+        news_urgent=True, macro_risk_off=True,
+        news_opinion_ts=shared_news_ts, macro_opinion_ts=macro_ts_b,
+    )
+    for dt in (anchor + timedelta(minutes=5), anchor + timedelta(minutes=10),
+               anchor + timedelta(minutes=40)):
+        _save_bar(storage, "TEST", "5m", dt, open_=100.0, high=100.5, low=94.0, close=94.5)
+
+    result = backtest.compute_veto_incremental_pnl([c1, c2, c3])
+    overlap = result["attribution"]["both_excluded_overlap"]["decision_level"]
+    assert overlap["candidates_in_subset"] == 3
+    # Same News opinion reused across all 3 -> only 1 distinct News opinion...
+    assert overlap["distinct_news_opinions"] == 1
+    # ...but 2 distinct Macro opinions (macro_ts_a shared by c1/c2, macro_ts_b for c3)...
+    assert overlap["distinct_macro_opinions"] == 2
+    # ...so the JOINT pair count is 2, not 1 -- the exact distinction the
+    # review asked for, since a per-flag-only count would have hidden this.
+    assert overlap["distinct_joint_news_macro_opinions"] == 2

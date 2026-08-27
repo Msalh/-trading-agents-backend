@@ -1450,6 +1450,57 @@ def test_veto_incremental_pnl_endpoint_returns_shape(client):
     assert cons["first_per_opinion_global"]["candidates_after_dedup"] == 0
 
 
+def test_veto_incremental_pnl_endpoint_reports_diversity_and_drawdown_fields(client):
+    # Tier 3.40 (fourteenth external review): every summary dict must
+    # surface its own day/opinion diversity and max_drawdown_usd
+    # alongside P&L, reachable through the live HTTP endpoint, not just
+    # inside the compute_veto_incremental_pnl() return value in-process.
+    import app.storage as storage
+
+    anchor = "2026-08-11T14:00:00Z"
+    bar = {
+        "event_id": "evt-vpnl-div-1", "symbol": "MNQ1!", "timeframe": "5m", "timestamp": anchor,
+        "atr": 2.0, "trading_date": "2026-08-11",
+    }
+    decision = {
+        "decision": "enter_long",
+        "direction": "bullish",
+        "score": 90.0,
+        "threshold": 25.0,
+        "opinions_used": {
+            "analysis": {"direction": "bullish", "confidence": 90, "timestamp": anchor, "flags": []},
+            "news": {"direction": "bullish", "confidence": 90, "timestamp": anchor, "flags": []},
+            "macro": {"direction": "bullish", "confidence": 90, "timestamp": anchor, "flags": []},
+        },
+        "missing_agents": [],
+        "stale_agents": [],
+        "contributions": {},
+        "conflict_flags": [],
+        "timestamp": anchor,
+    }
+    storage.save_candidate(candidate_id="cand-vpnl-div-1", symbol="MNQ1!", timeframe="5m", bar=bar, decision=decision)
+    _save_market_bar(
+        storage, "MNQ1!", "5m", "2026-08-11T14:05:00Z",
+        open_=20000.0, high=20060.0, low=19995.0, close=20055.0,
+    )
+
+    r = client.get(
+        "/candidates/history/veto-incremental-pnl",
+        params={"symbol": "MNQ1!", "timeframe": "5m"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    overall = body["decision_level"]["none"]["overall"]
+    assert overall["distinct_trading_days"] == 1
+    assert overall["distinct_news_opinions"] == 1
+    assert overall["distinct_macro_opinions"] == 1
+    assert overall["distinct_joint_news_macro_opinions"] == 1
+    assert "max_drawdown_usd" in overall
+    # Empty attribution sets report the same new fields at zero, not omitted.
+    overlap = body["attribution"]["both_excluded_overlap"]["decision_level"]
+    assert overlap["distinct_joint_news_macro_opinions"] == 0
+
+
 def test_veto_incremental_pnl_endpoint_empty_history(client):
     r = client.get(
         "/candidates/history/veto-incremental-pnl",

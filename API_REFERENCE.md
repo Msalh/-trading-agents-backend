@@ -2510,19 +2510,31 @@ filtered`'s own veto scope all untouched).
 
 ### `GET /candidates/history/veto-incremental-pnl?symbol=MNQ1!&timeframe=5m&limit=300`
 
-Tier 3.39, thirteenth external review. Every diagnostic above (Tiers
-3.34-3.38) answers HOW OFTEN or HOW SKEWED the urgent/risk_off veto's
-effect is — none of them answer whether the killed decisions would
-have won or lost money. This endpoint does, by running the exact same
-ATR-barrier simulation as `/backtest-lite` (`app.backtest.
-run_barrier_backtest`, `direction_source="coordinator"` — identical
-stop/target/expiry/slippage/commission mechanics) against pre-filtered
-candidate subsets, across four fixed veto policies. **Not entirely
-offline** — performs real forward-bar lookups and barrier simulations
-per candidate, same performance profile as `/backtest-lite`, and runs
-roughly 40-50 separate backtest passes internally, so it can be
-noticeably slower than the rest of this diagnostic family on a large
-population.
+Tier 3.39, thirteenth external review, extended Tier 3.40 (fourteenth
+review, diversity fields). Every diagnostic above (Tiers 3.34-3.38)
+answers HOW OFTEN or HOW SKEWED the urgent/risk_off veto's effect is —
+none of them answer whether the killed decisions would have won or
+lost money. This endpoint does, by running the exact same ATR-barrier
+simulation as `/backtest-lite` (`app.backtest.run_barrier_backtest`,
+`direction_source="coordinator"` — identical stop/target/expiry/
+slippage/commission mechanics) against pre-filtered candidate subsets,
+across four fixed veto policies. **Not entirely offline** — performs
+real forward-bar lookups and barrier simulations per candidate, same
+performance profile as `/backtest-lite`, and runs roughly 40-50
+separate backtest passes internally, so it can be noticeably slower
+than the rest of this diagnostic family on a large population.
+
+**IMPORTANT — none of these four policies have ever been live** (the
+fourteenth review's correction, after an earlier analysis package
+mislabeled `both` as "the live policy"): the real Coordinator applies
+News' `urgent` as a **soft 0.5x score dampener** (`app/coordinator.py`,
+unconditional whenever `urgent` is set — never a hard veto), and never
+applies Macro's `risk_off` at all — it's referenced nowhere in live
+coordinator/execution code, only in `macro_agent.py`'s prompt schema
+and this diagnostic family. The registered `analysis_risk_filtered`
+shadow experiment (watermark 950) is a third, separate mechanism that
+follows Analysis's own direction and bypasses quorum. Every policy
+below is a **counterfactual** for comparison only.
 
 Query params: `symbol`, `timeframe` (required); `limit` (default 300,
 max 1000); `atr_stop_mult`/`atr_target_mult`/`expiry_bars` (same
@@ -2545,9 +2557,9 @@ decomposition of `overall` — at `portfolio_level` specifically,
 `short.trades_taken + long.trades_taken` can exceed `overall.
 trades_taken`, since real single-position scheduling lets a long and a
 short compete for the same slot but the isolated per-direction subsets
-don't reflect that competition. `overall` is the only "if this policy
-ran live" number at portfolio level. The third view,
-`conservative_opinion_level`, is described below.
+don't reflect that competition. `overall` is the only "if this
+counterfactual policy were applied" number at portfolio level. The
+third view, `conservative_opinion_level`, is described below.
 
 **`attribution`** exists specifically to avoid the double-counting
 mistake the thirteenth review caught in Tier 3.37's headline numbers:
@@ -2586,6 +2598,21 @@ pulled history, ignoring day boundaries entirely. Both are
 decision-level only (a non-overlap schedule on an already-deduped set
 would add a confound, not information, per the review's own reasoning).
 
+**Tier 3.40 (fourteenth review) — diversity fields on every summary:**
+every summary dict anywhere in this response (every policy/split under
+`decision_level`/`portfolio_level`, every `attribution` set, every
+`macro_direction_breakdown`/`day_session_breakdown`/`conservative_
+opinion_level` entry) additionally reports `distinct_trading_days`,
+`distinct_news_opinions`, `distinct_macro_opinions`, and `distinct_
+joint_news_macro_opinions` — the last one is the distinct count of
+**(News opinion, Macro opinion) PAIRS**, not the two counted
+separately, since a shared News opinion can still combine with several
+different Macro opinions (or vice versa) and a per-flag-only count
+would hide that. `max_drawdown_usd` was already computed by
+`run_barrier_backtest` since Tier 3.39 — this tier didn't add it, just
+calls it out so it isn't missed. None of this changes any existing
+field's shape or meaning; it's purely additive.
+
 ```json
 {
   "symbol": "MNQ1!",
@@ -2600,7 +2627,7 @@ would add a confound, not information, per the review's own reasoning).
   "policies": ["none", "urgent_only", "risk_off_only", "both"],
   "decision_level": {
     "none": {
-      "overall": { "trades_taken": 299, "win_rate": 0.51, "total_pnl_usd": -412.0, "candidates_in_subset": 299 },
+      "overall": { "trades_taken": 299, "win_rate": 0.51, "total_pnl_usd": -412.0, "candidates_in_subset": 299, "max_drawdown_usd": -1850.0, "distinct_trading_days": 9, "distinct_news_opinions": 22, "distinct_macro_opinions": 15, "distinct_joint_news_macro_opinions": 24 },
       "short": { "trades_taken": 161, "win_rate": 0.47, "total_pnl_usd": -890.0, "candidates_in_subset": 161 },
       "long": { "trades_taken": 138, "win_rate": 0.56, "total_pnl_usd": 478.0, "candidates_in_subset": 138 }
     },

@@ -1525,6 +1525,46 @@ def run_sensitivity_grid(
 # comparison) — decision-level P&L only; a schedule-level view on an
 # already-deduped, already-sparse set adds a second confound without
 # adding real information.
+#
+# Tier 3.40 (fourteenth external review): Package #14's first production
+# pull mislabeled the "both" counterfactual as "(live policy)" — the
+# review caught this and it was independently confirmed against source
+# as wrong: the live Coordinator applies News' "urgent" as a SOFT 0.5x
+# score dampener (app/coordinator.py, unconditional whenever "urgent" is
+# set), never a hard veto, and "risk_off" is never referenced in live
+# coordinator/execution code at all — it exists only in macro_agent.py's
+# prompt schema and this diagnostic family. The registered
+# analysis_risk_filtered shadow experiment (watermark 950) is a third,
+# separate mechanism (follows Analysis's own direction, bypasses
+# quorum). None of the four policies this module computes have EVER
+# been live in any form — they are all counterfactuals; every summary
+# dict below documents this explicitly rather than implying otherwise.
+#
+# The same review also asked for day/opinion diversity figures across
+# the FULL 4x3 policy matrix (not just the flagged populations
+# day_session_breakdown already covers) and a specific joint-opinion-pair
+# count for the 63-candidate overlap subset, to test the new "urgent+
+# risk_off agreement may mark genuinely tradeable moves" hypothesis
+# without over-trusting a small, possibly low-diversity sample. Every
+# summary dict `_run()` produces (policies, attribution, macro_direction_
+# breakdown, day_session_breakdown's session buckets, conservative_
+# opinion_level) now additionally reports: `distinct_trading_days`,
+# `distinct_news_opinions`, `distinct_macro_opinions` (each computed the
+# same way Tier 3.36 already does elsewhere in this project — count
+# distinct non-null values, never guessing a missing identity into a
+# bucket), and `distinct_joint_news_macro_opinions` (distinct (news_
+# opinion_timestamp, macro_opinion_timestamp) PAIRS — a candidate
+# missing either timestamp is excluded from this count entirely, same
+# convention _first_per_group already uses). For the `both_excluded_
+# overlap` set specifically, `distinct_joint_news_macro_opinions` is the
+# number the review asked for directly: how many genuinely independent
+# (News, Macro) judgment-call PAIRS produced the 63 overlap candidates,
+# as opposed to "16 opinions" counted per-flag separately without
+# knowing how many distinct combinations those 16 actually form.
+# `max_drawdown_usd` was already computed by run_barrier_backtest/
+# _finalize_summary in every summary dict before this tier — it was
+# simply never pulled from production; no code change was needed to
+# expose it, only to remember to ask for it.
 
 _VETO_POLICIES = ("none", "urgent_only", "risk_off_only", "both")
 
@@ -1596,6 +1636,22 @@ def _distinct_count(meta: dict, ids: set, field: str) -> int:
     return len({meta[cid][field] for cid in ids if meta[cid].get(field) is not None})
 
 
+def _distinct_pair_count(meta: dict, ids: set, fields: tuple) -> int:
+    """Tier 3.40 — distinct combinations of `fields` (e.g. (news_opinion_
+    timestamp, macro_opinion_timestamp)) among `ids`. A candidate missing
+    ANY of the given fields is excluded from the count entirely, not
+    guessed into a bucket — same convention _first_per_group already
+    uses for the same reason."""
+    pairs = set()
+    for cid in ids:
+        candidate_meta = meta[cid]
+        key = tuple(candidate_meta.get(f) for f in fields)
+        if any(v is None for v in key):
+            continue
+        pairs.add(key)
+    return len(pairs)
+
+
 def _first_per_group(meta: dict, ids: set, group_fields: tuple) -> set:
     """Dedupes `ids` down to one candidate per distinct combination of
     group_fields, keeping the chronologically EARLIEST candidate (by
@@ -1621,22 +1677,30 @@ def compute_veto_incremental_pnl(
     target_mult: float = ATR_TARGET_MULT,
     expiry_bars: int = EXPIRY_BARS,
 ) -> dict:
-    """Tier 3.39 (thirteenth external review) — see the module comment
-    block above for the full design rationale. Runs the SAME barrier
-    simulation (run_barrier_backtest, direction_source="coordinator")
-    against pre-filtered candidate subsets for each of the four fixed
-    veto policies (`none`/`urgent_only`/`risk_off_only`/`both`), at both
-    `decision_level` (non_overlapping=False) and `portfolio_level`
-    (non_overlapping=True, independently scheduled per policy) — plus a
-    solo/overlap/union `attribution` split, a `macro_direction_
-    breakdown` of the risk_off-flagged population, a `day_session_
-    breakdown`, and a `conservative_opinion_level` view deduped to one
-    candidate per independent opinion. NOT entirely offline — performs
-    real forward-bar lookups and barrier simulations per candidate,
-    same performance profile as any other backtest endpoint (can be
-    slower than this diagnostic family's other, purely-offline
-    endpoints on a large population, since it runs roughly 40-50
-    separate backtest passes internally across all the breakdowns)."""
+    """Tier 3.39 (thirteenth external review), extended Tier 3.40
+    (fourteenth review) — see the module comment block above for the
+    full design rationale. Runs the SAME barrier simulation (run_
+    barrier_backtest, direction_source="coordinator") against
+    pre-filtered candidate subsets for each of the four fixed
+    COUNTERFACTUAL veto policies (`none`/`urgent_only`/`risk_off_only`/
+    `both` — none of these have ever been live; the real Coordinator
+    applies "urgent" as a soft 0.5x score dampener and never applies
+    "risk_off" at all), at both `decision_level` (non_overlapping=False)
+    and `portfolio_level` (non_overlapping=True, independently scheduled
+    per policy) — plus a solo/overlap/union `attribution` split, a
+    `macro_direction_breakdown` of the risk_off-flagged population, a
+    `day_session_breakdown`, and a `conservative_opinion_level` view
+    deduped to one candidate per independent opinion. Every summary dict
+    everywhere in the response also reports `distinct_trading_days`/
+    `distinct_news_opinions`/`distinct_macro_opinions`/`distinct_joint_
+    news_macro_opinions` (Tier 3.40) alongside its P&L figures, so no
+    figure can be read without its underlying sample diversity in the
+    same place. NOT entirely offline — performs real forward-bar
+    lookups and barrier simulations per candidate, same performance
+    profile as any other backtest endpoint (can be slower than this
+    diagnostic family's other, purely-offline endpoints on a large
+    population, since it runs roughly 40-50 separate backtest passes
+    internally across all the breakdowns)."""
     population = _veto_pnl_population(candidates)
     candidates_by_id = {c["candidate_id"]: c for c in population}
     meta = {cid: _veto_pnl_flags(c) for cid, c in candidates_by_id.items()}
@@ -1660,6 +1724,15 @@ def compute_veto_incremental_pnl(
         )
         summary.pop("trades", None)
         summary["candidates_in_subset"] = len(ids)
+        # Tier 3.40 (fourteenth external review): day/opinion diversity
+        # alongside every P&L figure, so a reader never has to guess
+        # whether a result rests on a handful of reused judgment calls.
+        summary["distinct_trading_days"] = _distinct_count(meta, ids, "trading_date")
+        summary["distinct_news_opinions"] = _distinct_count(meta, ids, "news_opinion_timestamp")
+        summary["distinct_macro_opinions"] = _distinct_count(meta, ids, "macro_opinion_timestamp")
+        summary["distinct_joint_news_macro_opinions"] = _distinct_pair_count(
+            meta, ids, ("news_opinion_timestamp", "macro_opinion_timestamp"),
+        )
         return summary
 
     policy_ids = {
