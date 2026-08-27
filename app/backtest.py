@@ -674,6 +674,47 @@ def _candidate_trading_date(candidate: dict) -> str | None:
         return None
 
 
+# Tier 3.41 (fifteenth external review): a real correction to how this
+# session had been reasoning about `limit`-bounded pulls. A limit=700
+# pull earlier this tier returned one attribution subset complete
+# (63/63) and another silently partial (55/58) in the SAME response —
+# this session first mischaracterized that as a WebFetch artifact, but
+# it's ordinary and entirely expected: `limit` restricts which
+# candidates enter the computation at all, and different subsets can be
+# complete or partial independently depending on how their candidates
+# are distributed across the pulled window. The review's real point:
+# there was no way to tell from the response ALONE whether a given pull
+# was complete, short of manually cross-checking against a previously
+# known total — and "limit=850 is reliable" is false as a standing
+# rule, true only because total history happened to be under 850 at
+# pull time. compute_data_range_metadata() makes this self-evident
+# going forward: every response in this diagnostic family that accepts
+# a `limit` param now also reports the TRUE total row count for this
+# symbol/timeframe (a fresh COUNT(*), independent of `limit`), how many
+# rows were actually returned, and an explicit `hit_limit_ceiling` flag
+# — computed by comparing the two counts directly, never inferred from
+# `returned_count == requested_limit` (which can coincide and mislead).
+# This doesn't yet solve pulling more than 1000 candidates in one
+# request (still capped by the endpoint's own `limit<=` constraint,
+# raised this tier from 1000 to 5000 to buy headroom) — genuine
+# pagination (since_rowid-style, matching app.experiments' existing
+# rowid-boundary convention) is deferred until the population actually
+# requires it, per the review's own three-option list.
+def compute_data_range_metadata(candidates: list[dict], total_in_storage: int, requested_limit: int) -> dict:
+    returned_count = len(candidates)
+    timestamps = [t for t in (_candidate_anchor_timestamp(c) for c in candidates) if t]
+    trading_dates = {d for d in (_candidate_trading_date(c) for c in candidates) if d}
+    return {
+        "total_candidates_in_storage": total_in_storage,
+        "requested_limit": requested_limit,
+        "returned_count": returned_count,
+        "hit_limit_ceiling": total_in_storage > returned_count,
+        "earliest_candidate_timestamp": min(timestamps) if timestamps else None,
+        "latest_candidate_timestamp": max(timestamps) if timestamps else None,
+        "distinct_trading_days_in_window": len(trading_dates),
+    }
+
+
 def compute_day_session_breakdown(candidates: list[dict]) -> dict:
     """Tier 3.18: how many genuinely independent trading days/sessions
     a candidate set actually spans — see the module docstring's Tier

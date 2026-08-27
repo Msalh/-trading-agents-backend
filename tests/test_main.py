@@ -1235,6 +1235,13 @@ def test_veto_decision_transitions_endpoint_returns_shape(client):
     assert r.status_code == 200
     body = r.json()
     assert body["symbol"] == "MNQ1!"
+    # Tier 3.41 (fifteenth external review): every limit-bounded pull now
+    # self-reports whether it captured the full available history.
+    assert body["data_range"]["total_candidates_in_storage"] == 1
+    assert body["data_range"]["returned_count"] == 1
+    assert body["data_range"]["requested_limit"] == 300
+    assert body["data_range"]["hit_limit_ceiling"] is False
+    assert body["data_range"]["distinct_trading_days_in_window"] == 1
     assert body["candidates_considered"] == 1
     assert body["analysis_directional_candidates"] == 1
     assert body["transition_summary"] == {"coordinator_trade_veto_survives": 1}
@@ -1364,6 +1371,15 @@ def test_veto_decision_transitions_endpoint_empty_history(client):
     )
     assert r.status_code == 200
     body = r.json()
+    assert body["data_range"] == {
+        "total_candidates_in_storage": 0,
+        "requested_limit": 300,
+        "returned_count": 0,
+        "hit_limit_ceiling": False,
+        "earliest_candidate_timestamp": None,
+        "latest_candidate_timestamp": None,
+        "distinct_trading_days_in_window": 0,
+    }
     assert body["candidates_considered"] == 0
     assert body["analysis_not_directional_excluded"] == 0
     assert body["transition_summary"] == {}
@@ -1375,6 +1391,38 @@ def test_veto_decision_transitions_endpoint_empty_history(client):
     assert body["news_opinion_diversity"] == {}
     assert body["direction_kill_rate_summary"] == {}
     assert body["cases"] == []
+
+
+def test_veto_decision_transitions_endpoint_data_range_flags_truncated_pull(client):
+    # Tier 3.41: build 3 candidates but request limit=2 -- data_range
+    # must show total_candidates_in_storage=3, returned_count=2, and
+    # hit_limit_ceiling=True, so a truncated pull is self-evident from
+    # the response alone rather than requiring a manual cross-check.
+    import app.storage as storage
+
+    for i, day in enumerate(["2026-08-10", "2026-08-11", "2026-08-12"]):
+        anchor = f"2026-08-{10 + i}T14:00:00Z"
+        bar = {
+            "event_id": f"evt-dr-{i}", "symbol": "MNQ1!", "timeframe": "5m", "timestamp": anchor,
+            "trading_date": day,
+        }
+        decision = {
+            "decision": "enter_long", "timestamp": anchor,
+            "opinions_used": {"analysis": {"direction": "bullish", "timestamp": anchor}},
+        }
+        storage.save_candidate(candidate_id=f"cand-dr-{i}", symbol="MNQ1!", timeframe="5m", bar=bar, decision=decision)
+
+    r = client.get(
+        "/candidates/history/veto-decision-transitions",
+        params={"symbol": "MNQ1!", "timeframe": "5m", "limit": 2},
+    )
+    assert r.status_code == 200
+    data_range = r.json()["data_range"]
+    assert data_range["total_candidates_in_storage"] == 3
+    assert data_range["requested_limit"] == 2
+    assert data_range["returned_count"] == 2
+    assert data_range["hit_limit_ceiling"] is True
+    assert data_range["distinct_trading_days_in_window"] == 2
 
 
 # ---------------------------------------------------------------------------
@@ -1418,6 +1466,10 @@ def test_veto_incremental_pnl_endpoint_returns_shape(client):
     body = r.json()
     assert body["symbol"] == "MNQ1!"
     assert body["timeframe"] == "5m"
+    # Tier 3.41 (fifteenth external review): self-describing pull metadata.
+    assert body["data_range"]["total_candidates_in_storage"] == 1
+    assert body["data_range"]["returned_count"] == 1
+    assert body["data_range"]["hit_limit_ceiling"] is False
     assert body["config"] == {"stop_mult": 1.5, "target_mult": 2.5, "expiry_bars": 24}
     assert body["population"] == {
         "candidates_considered": 1,

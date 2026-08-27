@@ -2379,10 +2379,36 @@ population, no replay, no live behavior touched — but it's the piece
 needed before any kill-COUNT claim (like Package #11's raw 128/38) can
 be read as a kill-RATE / propensity claim.
 
+**`data_range` (Tier 3.41, fifteenth external review):** a real gap
+surfaced while pulling production data for this diagnostic family — a
+`limit`-bounded pull can silently return one part of the response
+complete and another part partial in the SAME response (which subsets
+end up complete just depends on how their candidates are distributed
+across the pulled window), with no way to tell from the response alone
+without manually cross-checking against an already-known total. Every
+response now opens with a `data_range` block: `total_candidates_in_
+storage` (a fresh `COUNT(*)` for this symbol/timeframe, independent of
+`limit`), `requested_limit`, `returned_count`, `hit_limit_ceiling`
+(computed by directly comparing the two counts — never inferred from
+`returned_count == requested_limit`, which can coincide and mislead),
+`earliest_candidate_timestamp`/`latest_candidate_timestamp` (within the
+pulled window), and `distinct_trading_days_in_window`. `limit`'s cap
+was also raised from 1000 to 5000 this tier to buy headroom before a
+real pagination mechanism is needed.
+
 ```json
 {
   "symbol": "MNQ1!",
   "timeframe": "5m",
+  "data_range": {
+    "total_candidates_in_storage": 802,
+    "requested_limit": 999,
+    "returned_count": 802,
+    "hit_limit_ceiling": false,
+    "earliest_candidate_timestamp": "2026-08-01T13:35:00Z",
+    "latest_candidate_timestamp": "2026-08-27T09:10:00Z",
+    "distinct_trading_days_in_window": 19
+  },
   "candidates_considered": 300,
   "analysis_not_directional_excluded": 120,
   "analysis_directional_candidates": 180,
@@ -2613,10 +2639,30 @@ would hide that. `max_drawdown_usd` was already computed by
 calls it out so it isn't missed. None of this changes any existing
 field's shape or meaning; it's purely additive.
 
+**`data_range` (Tier 3.41, fifteenth external review):** same
+self-describing pull metadata as `veto-decision-transitions` above —
+see that endpoint's own section for the full rationale (a real
+production near-miss where one part of a `limit`-bounded response was
+complete and another was silently partial in the same pull). `total_
+candidates_in_storage`/`requested_limit`/`returned_count`/`hit_limit_
+ceiling`/`earliest_candidate_timestamp`/`latest_candidate_timestamp`/
+`distinct_trading_days_in_window` — check `hit_limit_ceiling` before
+trusting any figure below as full-population. `limit`'s cap raised from
+1000 to 5000 this tier.
+
 ```json
 {
   "symbol": "MNQ1!",
   "timeframe": "5m",
+  "data_range": {
+    "total_candidates_in_storage": 802,
+    "requested_limit": 999,
+    "returned_count": 802,
+    "hit_limit_ceiling": false,
+    "earliest_candidate_timestamp": "2026-08-01T13:35:00Z",
+    "latest_candidate_timestamp": "2026-08-27T09:10:00Z",
+    "distinct_trading_days_in_window": 19
+  },
   "config": { "stop_mult": 1.5, "target_mult": 2.5, "expiry_bars": 24 },
   "population": {
     "candidates_considered": 299,

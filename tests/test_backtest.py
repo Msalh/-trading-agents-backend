@@ -1627,3 +1627,40 @@ def test_veto_pnl_joint_opinion_pairs_distinguishes_from_per_flag_counts(fresh_e
     # ...so the JOINT pair count is 2, not 1 -- the exact distinction the
     # review asked for, since a per-flag-only count would have hidden this.
     assert overlap["distinct_joint_news_macro_opinions"] == 2
+
+
+def test_data_range_metadata_flags_truncation_by_comparing_against_true_total(fresh_env):
+    # Tier 3.41 (fifteenth external review): compute_data_range_metadata
+    # must report hit_limit_ceiling by comparing returned_count against
+    # a TRUE total (total_in_storage), never by inferring from
+    # returned_count == requested_limit -- the exact trap that let a
+    # partial pull look plausible earlier this tier.
+    _, backtest = fresh_env
+    anchor = datetime(2026, 8, 11, 14, 0, tzinfo=timezone.utc)
+    c1 = _candidate("c1", "TEST", "5m", anchor, atr=2.0, trading_date="2026-08-11")
+    c2 = _candidate("c2", "TEST", "5m", anchor + timedelta(days=1), atr=2.0, trading_date="2026-08-12")
+
+    # Simulates a `limit`-truncated pull: only 2 of 5 "true" rows returned.
+    meta = backtest.compute_data_range_metadata([c1, c2], total_in_storage=5, requested_limit=2)
+    assert meta["total_candidates_in_storage"] == 5
+    assert meta["requested_limit"] == 2
+    assert meta["returned_count"] == 2
+    assert meta["hit_limit_ceiling"] is True
+    assert meta["distinct_trading_days_in_window"] == 2
+    assert meta["earliest_candidate_timestamp"] < meta["latest_candidate_timestamp"]
+
+    # Same 2 candidates, but total_in_storage now says nothing more
+    # exists -- NOT truncated, even though returned_count == requested_limit
+    # would have suggested otherwise if inferred that way.
+    complete = backtest.compute_data_range_metadata([c1, c2], total_in_storage=2, requested_limit=2)
+    assert complete["hit_limit_ceiling"] is False
+
+
+def test_data_range_metadata_handles_empty_candidate_list(fresh_env):
+    _, backtest = fresh_env
+    meta = backtest.compute_data_range_metadata([], total_in_storage=0, requested_limit=300)
+    assert meta["returned_count"] == 0
+    assert meta["hit_limit_ceiling"] is False
+    assert meta["earliest_candidate_timestamp"] is None
+    assert meta["latest_candidate_timestamp"] is None
+    assert meta["distinct_trading_days_in_window"] == 0

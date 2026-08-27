@@ -1276,6 +1276,37 @@ live policy/weight/threshold touched, DIRECTION_SOURCES unchanged.
 max_drawdown_usd was already computed since Tier 3.39 and is now called
 out explicitly rather than left to be independently rediscovered.
 
+Tier 3.41 (fifteenth external review, 2026-08-27, data-range integrity):
+Package #15's pull uncovered a real gap while trying to answer the
+fourteenth review's item #3 — a limit=700 pull returned one attribution
+subset complete (63/63) and another silently partial (55/58) in the SAME
+response, only caught by manually cross-checking against Package #14's
+already-known totals. This session first mischaracterized that as a
+WebFetch artifact; the fifteenth review corrected it — `limit` genuinely
+restricts which candidates enter the computation (expected, not a bug),
+and there was simply no way to tell from the response ALONE whether a
+pull was complete. "limit=850 is reliable" was also flagged as false as
+a standing rule — true only because total history happened to be under
+850 at pull time, with no guarantee once history grows past it (and the
+endpoint's former limit<=1000 cap was being approached). GET /candidates/
+history/veto-decision-transitions and GET /candidates/history/
+veto-incremental-pnl (the only two endpoints in production use across
+this review chain) both gained a `data_range` block in their response:
+`total_candidates_in_storage` (a fresh COUNT(*) for this symbol/
+timeframe, independent of `limit`), `requested_limit`, `returned_count`,
+`hit_limit_ceiling` (computed by directly comparing the two counts —
+never inferred from returned_count==requested_limit, the exact
+coincidence that could mislead), `earliest_candidate_timestamp`/
+`latest_candidate_timestamp`, and `distinct_trading_days_in_window` —
+covering every field the review's self-verification checklist asked
+for. Both endpoints' `limit` cap raised from 1000 to 5000 to buy
+headroom; true rowid-based pagination (matching app.experiments'
+existing since-rowid convention) is deferred until population actually
+requires it, per the review's own three-option list. Purely additive
+and read-only: no live policy/weight/threshold touched, no existing
+field's shape changed, COORDINATOR_THRESHOLD/WEIGHTS/
+MIN_AVAILABLE_WEIGHT/AUTO_EXECUTE_ENABLED all untouched.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -1300,6 +1331,7 @@ from app.backtest import (
     EXPIRY_BARS,
     compute_backtest_comparison,
     compute_champion_challenger_report,
+    compute_data_range_metadata,
     compute_day_session_breakdown,
     compute_trading_date_integrity_report,
     compute_veto_incremental_pnl,
@@ -1373,6 +1405,7 @@ from app.scheduler import (
     stop_scheduler,
 )
 from app.storage import (
+    count_candidates_after_rowid,
     get_all_closed_trades_chronological,
     get_by_event_id,
     get_candidate_by_id,
@@ -2821,7 +2854,7 @@ def candidates_history_risk_filter_veto_attribution(
 def candidates_history_veto_decision_transitions(
     symbol: str = Query(...),
     timeframe: str = Query(...),
-    limit: int = Query(default=300, le=1000),
+    limit: int = Query(default=300, le=5000, description="Tier 3.41 — raised from 1000; see the response's data_range block for whether this pull actually captured the full history"),
     summary_only: bool = Query(default=False),
 ) -> dict:
     """Tier 3.34 (ninth external review), extended Tier 3.35 (tenth
@@ -2995,12 +3028,15 @@ def candidates_history_veto_decision_transitions(
     field's shape or meaning. No live behavior touched, no new
     population, no replay."""
     candidates = get_candidate_history(symbol=symbol, timeframe=timeframe, limit=limit)
+    total_in_storage = count_candidates_after_rowid(symbol=symbol, timeframe=timeframe, min_rowid=0)
+    data_range = compute_data_range_metadata(candidates, total_in_storage, limit)
     result = compute_veto_decision_transitions(candidates)
     if summary_only:
         result = {key: value for key, value in result.items() if key != "cases"}
     return {
         "symbol": symbol,
         "timeframe": timeframe,
+        "data_range": data_range,
         **result,
     }
 
@@ -3371,7 +3407,7 @@ def candidates_history_backtest_lite_sensitivity_grid(
 def candidates_history_veto_incremental_pnl(
     symbol: str = Query(...),
     timeframe: str = Query(...),
-    limit: int = Query(default=300, le=1000),
+    limit: int = Query(default=300, le=5000, description="Tier 3.41 — raised from 1000; see the response's data_range block for whether this pull actually captured the full history"),
     atr_stop_mult: float = Query(default=ATR_STOP_MULT),
     atr_target_mult: float = Query(default=ATR_TARGET_MULT),
     expiry_bars: int = Query(default=EXPIRY_BARS, le=200),
@@ -3467,10 +3503,12 @@ def candidates_history_veto_incremental_pnl(
     previously highlighted) — so no P&L number can be read without its
     underlying sample diversity sitting right next to it."""
     candidates = get_candidate_history(symbol=symbol, timeframe=timeframe, limit=limit)
+    total_in_storage = count_candidates_after_rowid(symbol=symbol, timeframe=timeframe, min_rowid=0)
+    data_range = compute_data_range_metadata(candidates, total_in_storage, limit)
     result = compute_veto_incremental_pnl(
         candidates, stop_mult=atr_stop_mult, target_mult=atr_target_mult, expiry_bars=expiry_bars,
     )
-    return {"symbol": symbol, "timeframe": timeframe, **result}
+    return {"symbol": symbol, "timeframe": timeframe, "data_range": data_range, **result}
 
 
 @app.post("/experiments")
