@@ -157,6 +157,28 @@ CREATE TABLE IF NOT EXISTS prospective_experiments (
 );
 CREATE INDEX IF NOT EXISTS idx_prospective_experiments_symbol_timeframe
     ON prospective_experiments (symbol, timeframe, registered_at DESC);
+
+CREATE TABLE IF NOT EXISTS macro_shadow_opinions_v2 (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    schema_version TEXT NOT NULL,
+    model TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    candidate_id TEXT,
+    timestamp TEXT NOT NULL,
+    directional_bias TEXT NOT NULL,
+    tradeability TEXT NOT NULL,
+    risk_cause TEXT NOT NULL,
+    risk_cause_detail TEXT,
+    data_quality TEXT NOT NULL,
+    confidence INTEGER NOT NULL,
+    reasoning TEXT NOT NULL,
+    key_data_json TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_macro_shadow_opinions_v2_symbol
+    ON macro_shadow_opinions_v2 (symbol, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_macro_shadow_opinions_v2_candidate
+    ON macro_shadow_opinions_v2 (candidate_id);
 """
 
 
@@ -1612,3 +1634,97 @@ def resolve_prospective_experiment(experiment_id: str, resolution: dict) -> Opti
     finally:
         conn.close()
     return get_prospective_experiment_by_id(experiment_id)
+
+
+# Tier 3.44 (sixteenth external review item #5) -- macro_shadow_opinions_v2:
+# a completely separate table from agent_opinions (the table live
+# agents write to and app.replay/candidate-creation read from), so this
+# exploratory shadow data is structurally incapable of being picked up
+# by any existing live query. See app/macro_agent_v2.py's module
+# docstring for the full rationale.
+
+def _row_to_macro_shadow_opinion_v2(row: sqlite3.Row) -> dict:
+    d = dict(row)
+    d["key_data"] = json.loads(d.pop("key_data_json"))
+    return d
+
+
+def save_macro_shadow_opinion_v2(opinion: dict) -> dict:
+    """`opinion` is a MacroShadowOpinionV2.to_dict() payload. Returns
+    the saved row (including the new id and created_at)."""
+    conn = get_connection()
+    try:
+        cursor = conn.execute(
+            """
+            INSERT INTO macro_shadow_opinions_v2
+                (schema_version, model, symbol, candidate_id, timestamp,
+                 directional_bias, tradeability, risk_cause, risk_cause_detail,
+                 data_quality, confidence, reasoning, key_data_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                opinion["schema_version"], opinion["model"], opinion["symbol"],
+                opinion.get("candidate_id"), opinion["timestamp"],
+                opinion["directional_bias"], opinion["tradeability"],
+                opinion["risk_cause"], opinion.get("risk_cause_detail"),
+                opinion["data_quality"], opinion["confidence"], opinion["reasoning"],
+                json.dumps(opinion["key_data"]),
+            ),
+        )
+        conn.commit()
+        new_id = cursor.lastrowid
+    finally:
+        conn.close()
+    return get_macro_shadow_opinion_v2_by_id(new_id)
+
+
+def get_macro_shadow_opinion_v2_by_id(row_id: int) -> Optional[dict]:
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM macro_shadow_opinions_v2 WHERE id = ?", (row_id,)
+        ).fetchone()
+        return _row_to_macro_shadow_opinion_v2(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_latest_macro_shadow_opinion_v2(symbol: str) -> Optional[dict]:
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            """
+            SELECT * FROM macro_shadow_opinions_v2
+            WHERE symbol = ? ORDER BY timestamp DESC, id DESC LIMIT 1
+            """,
+            (symbol,),
+        ).fetchone()
+        return _row_to_macro_shadow_opinion_v2(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_macro_shadow_opinions_v2(
+    symbol: str | None = None, candidate_id: str | None = None, limit: int = 50
+) -> list[dict]:
+    """Newest-first history, optionally filtered by symbol and/or the
+    candidate_id label a caller attached at collection time."""
+    conn = get_connection()
+    try:
+        clauses = []
+        params: list = []
+        if symbol:
+            clauses.append("symbol = ?")
+            params.append(symbol)
+        if candidate_id:
+            clauses.append("candidate_id = ?")
+            params.append(candidate_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        rows = conn.execute(
+            f"SELECT * FROM macro_shadow_opinions_v2 {where} ORDER BY timestamp DESC, id DESC LIMIT ?",
+            params,
+        ).fetchall()
+        return [_row_to_macro_shadow_opinion_v2(r) for r in rows]
+    finally:
+        conn.close()

@@ -2196,3 +2196,144 @@ def test_veto_prospective_comparison_endpoint_and_registered_experiment_are_inde
     assert r.status_code == 200
     assert r.json()["candidates_since_watermark"] == 1
     assert watermark == 1
+
+
+# Tier 3.44 (sixteenth external review item #5) -- exploratory Macro v2
+# shadow schema endpoints. run_macro_shadow_v2 itself is unit-tested
+# against a mocked anthropic client in tests/test_macro_agent_v2.py;
+# here we only need to prove the endpoint wiring (secret guard,
+# candidate_id validation, storage, response shape), so it's
+# monkeypatched at the main module level -- the same pattern already
+# used for run_analysis/plan_execution elsewhere in this file.
+
+def _fake_macro_shadow_opinion(symbol="MNQ1!", candidate_id=None):
+    from app.macro_agent_v2 import MacroShadowOpinionV2
+    return MacroShadowOpinionV2(
+        schema_version="2", model="claude-sonnet-5", timestamp="2026-08-28T12:00:00Z",
+        symbol=symbol, candidate_id=candidate_id, directional_bias="bullish",
+        tradeability="favorable", risk_cause="none", risk_cause_detail=None,
+        data_quality="fresh", confidence=65, reasoning="test",
+        key_data={"dxy_read": "weak", "yields_read": "flat", "spx_ndx_correlation": "in_sync", "notes": None},
+    )
+
+
+def test_macro_shadow_v2_run_endpoint_requires_secret(client):
+    r = client.post("/agents/macro-shadow-v2/run", params={"symbol": "MNQ1!"})
+    assert r.status_code == 401
+
+
+def test_macro_shadow_v2_run_endpoint_404_for_unknown_candidate_id(client, monkeypatch):
+    import app.main as main
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("run_macro_shadow_v2 should never be reached for an unknown candidate_id")
+
+    monkeypatch.setattr(main, "run_macro_shadow_v2", fail_if_called)
+    headers = {"X-Webhook-Secret": "test-secret"}
+    r = client.post(
+        "/agents/macro-shadow-v2/run",
+        params={"symbol": "MNQ1!", "candidate_id": "does-not-exist"},
+        headers=headers,
+    )
+    assert r.status_code == 404
+
+
+def test_macro_shadow_v2_run_endpoint_succeeds_and_stores_opinion(client, monkeypatch):
+    import app.main as main
+    import app.storage as storage
+
+    _save_prospective_endpoint_candidate(storage, "cand-shadow-1", "2026-08-11T14:00:00Z")
+    monkeypatch.setattr(
+        main, "run_macro_shadow_v2",
+        lambda symbol, candidate_id=None: _fake_macro_shadow_opinion(symbol, candidate_id),
+    )
+
+    headers = {"X-Webhook-Secret": "test-secret"}
+    r = client.post(
+        "/agents/macro-shadow-v2/run",
+        params={"symbol": "MNQ1!", "candidate_id": "cand-shadow-1"},
+        headers=headers,
+    )
+    assert r.status_code == 200
+    opinion = r.json()["opinion"]
+    assert opinion["schema_version"] == "2"
+    assert opinion["candidate_id"] == "cand-shadow-1"
+    assert opinion["directional_bias"] == "bullish"
+    assert opinion["tradeability"] == "favorable"
+    assert "id" in opinion  # storage-assigned row id
+
+    latest = client.get("/agents/macro-shadow-v2/latest", params={"symbol": "MNQ1!"})
+    assert latest.status_code == 200
+    assert latest.json()["candidate_id"] == "cand-shadow-1"
+
+
+def test_macro_shadow_v2_run_endpoint_candidate_id_is_optional(client, monkeypatch):
+    import app.main as main
+
+    monkeypatch.setattr(
+        main, "run_macro_shadow_v2",
+        lambda symbol, candidate_id=None: _fake_macro_shadow_opinion(symbol, candidate_id),
+    )
+    headers = {"X-Webhook-Secret": "test-secret"}
+    r = client.post("/agents/macro-shadow-v2/run", params={"symbol": "MNQ1!"}, headers=headers)
+    assert r.status_code == 200
+    assert r.json()["opinion"]["candidate_id"] is None
+
+
+def test_macro_shadow_v2_run_endpoint_maps_agent_error_to_502(client, monkeypatch):
+    import app.main as main
+    from app.macro_agent_v2 import MacroAgentV2Error
+
+    def boom(symbol, candidate_id=None):
+        raise MacroAgentV2Error("model did not return valid JSON")
+
+    monkeypatch.setattr(main, "run_macro_shadow_v2", boom)
+    headers = {"X-Webhook-Secret": "test-secret"}
+    r = client.post("/agents/macro-shadow-v2/run", params={"symbol": "MNQ1!"}, headers=headers)
+    assert r.status_code == 502
+
+
+def test_macro_shadow_v2_latest_endpoint_404_when_none_stored(client):
+    r = client.get("/agents/macro-shadow-v2/latest", params={"symbol": "MNQ1!"})
+    assert r.status_code == 404
+
+
+def test_macro_shadow_v2_history_endpoint_filters_by_symbol_and_candidate_id(client, monkeypatch):
+    import app.main as main
+
+    headers = {"X-Webhook-Secret": "test-secret"}
+
+    monkeypatch.setattr(
+        main, "run_macro_shadow_v2",
+        lambda symbol, candidate_id=None: _fake_macro_shadow_opinion(symbol, candidate_id),
+    )
+    client.post("/agents/macro-shadow-v2/run", params={"symbol": "MNQ1!"}, headers=headers)
+    client.post("/agents/macro-shadow-v2/run", params={"symbol": "ES1!"}, headers=headers)
+
+    r = client.get("/agents/macro-shadow-v2/history", params={"symbol": "MNQ1!"})
+    assert r.status_code == 200
+    body = r.json()["opinions"]
+    assert len(body) == 1
+    assert body[0]["symbol"] == "MNQ1!"
+
+    r_all = client.get("/agents/macro-shadow-v2/history")
+    assert len(r_all.json()["opinions"]) == 2
+
+
+def test_macro_shadow_v2_endpoints_never_touch_live_agent_opinions_table(client, monkeypatch):
+    """The whole point of the separate macro_shadow_opinions_v2 table:
+    a shadow run must be invisible to the live agent_opinions feed
+    (get_recent_opinions/get_latest_opinion) that candidate creation
+    and app.replay actually read from."""
+    import app.main as main
+    import app.storage as storage
+
+    monkeypatch.setattr(
+        main, "run_macro_shadow_v2",
+        lambda symbol, candidate_id=None: _fake_macro_shadow_opinion(symbol, candidate_id),
+    )
+    headers = {"X-Webhook-Secret": "test-secret"}
+    client.post("/agents/macro-shadow-v2/run", params={"symbol": "MNQ1!"}, headers=headers)
+
+    assert storage.get_latest_opinion(agent="macro", symbol="MNQ1!", timeframe="global") is None
+    assert storage.get_latest_opinion(agent="macro_shadow_v2", symbol="MNQ1!", timeframe="global") is None

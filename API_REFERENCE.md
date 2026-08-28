@@ -3054,6 +3054,86 @@ registrations untouched.
 
 ---
 
+## Macro v2 shadow schema (Tier 3.44, sixteenth external review item #5)
+
+**Exploratory only — never wired into any live trading decision.**
+Gated by the review to start only after the prospective-experiment
+registry above (items 1-4) shipped and the real overlap-vs-baseline
+experiment was registered on production. See
+`app/macro_agent_v2.py`'s module docstring for the full rationale.
+
+Four axes, deliberately named differently from the live Macro v1
+schema's `direction`/`flags` so they can never be confused with or
+substituted for the fields the Coordinator and the registered
+prospective experiment already depend on:
+
+- `directional_bias`: `"bullish" | "bearish" | "neutral"`
+- `tradeability`: `"favorable" | "choppy" | "avoid"` — is the macro
+  backdrop supportive of acting on ANY directional signal right now,
+  independent of which direction it points
+- `risk_cause`: `"none" | "monetary_policy" | "geopolitical" |
+  "liquidity" | "data_release" | "positioning_flows" | "other"` —
+  classifies WHY when `tradeability` is impaired
+- `data_quality`: `"fresh" | "degraded" | "stale"`
+
+Stored in its own `macro_shadow_opinions_v2` table — never the shared
+`agent_opinions` table live agents write to — so shadow data is
+structurally invisible to candidate creation, `get_recent_opinions`,
+and `app.replay.replay_candidate`. Carries its own
+`MACRO_V2_SCHEMA_VERSION="2"`, independent of
+`app.macro_agent.PROMPT_VERSION`.
+
+On-demand only (explicit choice over an automatic per-live-call
+shadow, to avoid doubling Macro LLM cost before the schema is
+validated) — nothing in the webhook/candidate pipeline calls it.
+
+### `POST /agents/macro-shadow-v2/run?symbol=MNQ1!&candidate_id=cand-123` (secret required)
+
+Runs a real, billed LLM call (same guard as `POST /agents/macro/run`).
+`candidate_id` is optional — a label for later joining this read
+against a specific existing candidate's actual outcome; 404s if the
+candidate_id doesn't exist. 502 if the model response is malformed or
+uses an invalid axis value.
+
+```json
+{
+  "opinion": {
+    "id": 14,
+    "schema_version": "2",
+    "model": "claude-sonnet-5",
+    "symbol": "MNQ1!",
+    "candidate_id": "cand-123",
+    "timestamp": "2026-08-28T13:00:00Z",
+    "directional_bias": "bullish",
+    "tradeability": "favorable",
+    "risk_cause": "none",
+    "risk_cause_detail": null,
+    "data_quality": "fresh",
+    "confidence": 65,
+    "reasoning": "DXY weak, yields flat, SPX/NDX in sync.",
+    "key_data": { "dxy_read": "...", "yields_read": "...", "spx_ndx_correlation": "in_sync", "notes": null },
+    "created_at": "2026-08-28T13:00:01Z"
+  }
+}
+```
+
+### `GET /agents/macro-shadow-v2/latest?symbol=MNQ1!`
+
+Most recent shadow read for a symbol. 404 if none stored yet.
+
+### `GET /agents/macro-shadow-v2/history?symbol=MNQ1!&candidate_id=cand-123&limit=50`
+
+Newest-first history, for building a dataset to later evaluate this
+schema against real outcomes. `symbol`/`candidate_id` both optional —
+omit either (or both) to widen the filter.
+
+Entirely additive: `app/macro_agent.py` (`SYSTEM_PROMPT`,
+`MacroOpinion`, `run_macro()`, `MODEL`, `PROMPT_VERSION="1"`) is
+completely untouched, `app.coordinator`/`app.experiments` untouched,
+`DIRECTION_SOURCES` unchanged.
+
+---
+
 ### `opinion_level_day_blocked` (Tier 3.29 — present in all five endpoints above)
 
 Sixth external review, ranked backlog item #3. Every field documented

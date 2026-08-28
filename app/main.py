@@ -1408,6 +1408,27 @@ Tier 3.42 calculator endpoint remains available for genuinely
 exploratory ad-hoc questions — its docstring now says plainly that it
 is NOT this pre-registered experiment.
 
+Tier 3.44 (sixteenth external review item #5 — "only after items 1-4
+are done, start Macro v2 as a separate shadow") adds an exploratory
+four-axis Macro shadow schema: POST /agents/macro-shadow-v2/run, GET
+/agents/macro-shadow-v2/latest, GET /agents/macro-shadow-v2/history.
+See app/macro_agent_v2.py's module docstring for the full design.
+On-demand only (per explicit choice over an automatic per-live-call
+shadow, to avoid doubling Macro LLM cost before the schema is
+validated) — nothing in the webhook/candidate pipeline calls it.
+Stored in its own macro_shadow_opinions_v2 table, never the shared
+agent_opinions table, so it cannot be picked up by any existing query
+(candidate creation, get_recent_opinions, app.replay.replay_candidate).
+app/macro_agent.py (SYSTEM_PROMPT, MacroOpinion, run_macro(), MODEL,
+PROMPT_VERSION="1") is completely untouched — the live "direction"/
+"flags" fields (risk_off in particular) stay exactly as they were when
+the Tier 3.43 prospective experiment (51c4fadb-5a90-408e-a106-b41117417c1d)
+locked them into its locked_config. The new schema's four axes
+(directional_bias/tradeability/risk_cause/data_quality) are
+deliberately named differently from v1's fields so they can never be
+confused with or substituted into the live ones, and carry their own
+MACRO_V2_SCHEMA_VERSION="2", independent of macro_agent.PROMPT_VERSION.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -1471,6 +1492,7 @@ from app.candidates import (
 from app.coordinator import compute_decision
 from app.execution_agent import ExecutionAgentError, plan_execution
 from app.macro_agent import MacroAgentError, run_macro
+from app.macro_agent_v2 import MacroAgentV2Error, run_macro_shadow_v2
 from app.models import MarketStateOut, MarketStatePayload, WebhookAck
 from app.news_agent import NewsAgentError, run_news
 from app.outcomes import (
@@ -1527,7 +1549,9 @@ from app.storage import (
     get_latest,
     get_latest_candidate,
     get_latest_opinion,
+    get_latest_macro_shadow_opinion_v2,
     get_llm_call_summary,
+    get_macro_shadow_opinions_v2,
     get_max_candidate_rowid,
     get_open_or_pending_trades,
     get_prospective_experiment_by_id,
@@ -1541,6 +1565,7 @@ from app.storage import (
     init_db,
     save_decision,
     save_event,
+    save_macro_shadow_opinion_v2,
     save_opinion,
     delete_market_state_event,
     wipe_all_data,
@@ -2196,6 +2221,62 @@ def read_latest_macro(
     if opinion is None:
         raise HTTPException(status_code=404, detail="no macro opinion stored yet")
     return opinion
+
+
+@app.post("/agents/macro-shadow-v2/run")
+def trigger_macro_shadow_v2(
+    symbol: str = Query(default=MACRO_SYMBOL),
+    candidate_id: str | None = Query(
+        default=None,
+        description="optional label to join this read against a specific existing candidate later — 404s if the candidate_id doesn't exist",
+    ),
+    x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret"),
+) -> dict:
+    """Tier 3.44 (sixteenth external review item #5) — runs the
+    EXPLORATORY four-axis Macro v2 shadow schema (directional_bias/
+    tradeability/risk_cause/data_quality). See app/macro_agent_v2.py's
+    module docstring for the full rationale: on-demand only (never
+    wired into the live trading pipeline or Coordinator scoring),
+    stored in its own separate table, carries its own
+    MACRO_V2_SCHEMA_VERSION independent of app.macro_agent.PROMPT_VERSION.
+
+    Secret-protected: this is a real, billed LLM call, same guard as
+    POST /agents/macro/run."""
+    _check_secret(x_webhook_secret)
+    if candidate_id is not None and get_candidate_by_id(candidate_id) is None:
+        raise HTTPException(status_code=404, detail=f"no candidate found with id={candidate_id}")
+    try:
+        opinion = run_macro_shadow_v2(symbol=symbol, candidate_id=candidate_id)
+    except MacroAgentV2Error as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    saved = save_macro_shadow_opinion_v2(opinion.to_dict())
+    return {"opinion": saved}
+
+
+@app.get("/agents/macro-shadow-v2/latest")
+def read_latest_macro_shadow_v2(
+    symbol: str = Query(default=MACRO_SYMBOL),
+) -> dict:
+    opinion = get_latest_macro_shadow_opinion_v2(symbol=symbol)
+    if opinion is None:
+        raise HTTPException(status_code=404, detail="no macro shadow v2 opinion stored yet")
+    return opinion
+
+
+@app.get("/agents/macro-shadow-v2/history")
+def read_macro_shadow_v2_history(
+    symbol: str | None = Query(default=None),
+    candidate_id: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=500),
+) -> dict:
+    """Newest-first history of shadow reads, for building a dataset to
+    later evaluate this schema against real outcomes. Filter by
+    symbol and/or the candidate_id label a caller attached at
+    collection time; omit both to see everything collected so far."""
+    return {
+        "opinions": get_macro_shadow_opinions_v2(symbol=symbol, candidate_id=candidate_id, limit=limit)
+    }
 
 
 @app.get("/coordinator/decide")
