@@ -1939,6 +1939,14 @@ def compute_veto_incremental_pnl(
 # every other function in this module since Tier 3.39).
 _PROSPECTIVE_ARMS = ("none", "solo_veto_only", "overlap_only")
 
+# Tier 3.43 (sixteenth external review): public alias so app.
+# prospective_experiments (a new, separate small immutable-record
+# module for PRE-REGISTERING this comparison, per the review's own
+# "small permanent record, no registry redesign needed" recommendation)
+# can validate against the same fixed arm set without reaching into a
+# private name.
+PROSPECTIVE_ARMS = _PROSPECTIVE_ARMS
+
 
 def _prospective_arm_included(arm: str, news_urgent: bool, macro_risk_off: bool) -> bool:
     """The per-candidate inclusion rule for each of the three frozen

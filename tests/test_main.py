@@ -11,6 +11,7 @@ Run with: pytest tests/test_main.py -v
 """
 
 import importlib
+import json
 import os
 import tempfile
 
@@ -1956,3 +1957,242 @@ def test_resolve_experiment_endpoint_succeeds_once_stopping_rule_met(client):
     r2 = client.post(f"/experiments/{registered['experiment_id']}/resolve", headers=headers)
     assert r2.status_code == 200
     assert r2.json()["resolution"] == body["resolution"]
+
+
+# ---------------------------------------------------------------------------
+# Tier 3.43: prospective-experiment registry (sixteenth external review)
+# ---------------------------------------------------------------------------
+
+_INCREMENTAL_TARGET_PARAMS = {
+    "treatment_arm": "overlap_only", "baseline_arm": "none", "metric": "total_pnl_usd",
+    "comparison_mode": "incremental", "comparator": ">", "success_threshold": -1e9,
+}
+
+
+def _save_prospective_endpoint_candidate(storage, candidate_id, anchor, direction="bullish", decision="enter_long", trading_date="2026-08-11"):
+    """Analysis+News, both directional and matching (confidence 90/80) --
+    the exact combination tests/test_main.py's own veto-incremental-pnl
+    tests already established as genuinely coordinator-sufficient under
+    real live weights/threshold, needed here because app.
+    prospective_experiments always rescores under the locked config
+    before computing arms."""
+    bar = {
+        "event_id": f"evt-{candidate_id}", "symbol": "MNQ1!", "timeframe": "5m", "timestamp": anchor,
+        "atr": 2.0, "trading_date": trading_date,
+    }
+    decision_body = {
+        "decision": decision, "direction": direction, "score": 90.0, "threshold": 25.0,
+        "opinions_used": {
+            "analysis": {"direction": direction, "confidence": 90, "timestamp": anchor, "flags": []},
+            "news": {"direction": direction, "confidence": 80, "timestamp": anchor, "flags": []},
+        },
+        "missing_agents": [], "stale_agents": [], "contributions": {}, "conflict_flags": [], "timestamp": anchor,
+    }
+    storage.save_candidate(candidate_id=candidate_id, symbol="MNQ1!", timeframe="5m", bar=bar, decision=decision_body)
+
+
+def test_register_prospective_experiment_endpoint_requires_secret(client):
+    r = client.post(
+        "/prospective-experiments",
+        params={
+            "symbol": "MNQ1!", "timeframe": "5m", "hypothesis": "h",
+            **_INCREMENTAL_TARGET_PARAMS, "min_distinct_trading_days": 1,
+        },
+    )
+    assert r.status_code == 401
+
+
+def test_register_prospective_experiment_endpoint_freezes_arms_and_config(client):
+    headers = {"X-Webhook-Secret": "test-secret"}
+    r = client.post(
+        "/prospective-experiments",
+        params={
+            "symbol": "MNQ1!", "timeframe": "5m", "hypothesis": "urgent+risk_off overlap beats baseline",
+            **_INCREMENTAL_TARGET_PARAMS, "min_distinct_trading_days": 20, "min_overlap_joint_opinion_pairs": 10,
+        },
+        headers=headers,
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "active"
+    assert body["arms"] == ["none", "solo_veto_only", "overlap_only"]
+    assert body["target_metrics"]["treatment_arm"] == "overlap_only"
+    assert body["target_metrics"]["baseline_arm"] == "none"
+    assert body["stopping_rule"] == {"min_distinct_trading_days": 20, "min_overlap_joint_opinion_pairs": 10}
+    assert "coordinator_threshold" in body["locked_config"]
+    assert "news_agent" in body["locked_config"]
+    assert "macro_agent" in body["locked_config"]
+    assert "model" in body["locked_config"]["news_agent"]
+    assert "prompt_version" in body["locked_config"]["news_agent"]
+    assert "registered_watermark_rowid" in body
+
+
+def test_register_prospective_experiment_endpoint_rejects_missing_stopping_rule(client):
+    headers = {"X-Webhook-Secret": "test-secret"}
+    r = client.post(
+        "/prospective-experiments",
+        params={"symbol": "MNQ1!", "timeframe": "5m", "hypothesis": "h", **_INCREMENTAL_TARGET_PARAMS},
+        headers=headers,
+    )
+    assert r.status_code == 400
+
+
+def test_register_prospective_experiment_endpoint_rejects_same_treatment_and_baseline(client):
+    headers = {"X-Webhook-Secret": "test-secret"}
+    bad_params = {**_INCREMENTAL_TARGET_PARAMS, "baseline_arm": "overlap_only"}  # same as treatment_arm
+    r = client.post(
+        "/prospective-experiments",
+        params={"symbol": "MNQ1!", "timeframe": "5m", "hypothesis": "h", **bad_params, "min_distinct_trading_days": 1},
+        headers=headers,
+    )
+    assert r.status_code == 400
+
+
+def test_prospective_experiments_list_and_detail_endpoints(client):
+    headers = {"X-Webhook-Secret": "test-secret"}
+    registered = client.post(
+        "/prospective-experiments",
+        params={
+            "symbol": "MNQ1!", "timeframe": "5m", "hypothesis": "h",
+            **_INCREMENTAL_TARGET_PARAMS, "min_distinct_trading_days": 5,
+        },
+        headers=headers,
+    ).json()
+    experiment_id = registered["experiment_id"]
+
+    listed = client.get("/prospective-experiments", params={"symbol": "MNQ1!", "timeframe": "5m"})
+    assert listed.status_code == 200
+    assert [e["experiment_id"] for e in listed.json()["prospective_experiments"]] == [experiment_id]
+
+    detail = client.get(f"/prospective-experiments/{experiment_id}")
+    assert detail.status_code == 200
+    body = detail.json()
+    assert body["experiment_id"] == experiment_id
+    # detail does NOT include a live stopping-rule check -- that's a
+    # separate endpoint (status), deliberately kept apart.
+    assert "stopping_rule_status" not in body
+
+
+def test_prospective_experiment_detail_endpoint_404_for_unknown_id(client):
+    r = client.get("/prospective-experiments/does-not-exist")
+    assert r.status_code == 404
+
+
+def test_prospective_experiment_status_endpoint_never_reveals_pnl(client):
+    import app.storage as storage
+
+    headers = {"X-Webhook-Secret": "test-secret"}
+    registered = client.post(
+        "/prospective-experiments",
+        params={
+            "symbol": "MNQ1!", "timeframe": "5m", "hypothesis": "h",
+            **_INCREMENTAL_TARGET_PARAMS, "min_distinct_trading_days": 5,
+        },
+        headers=headers,
+    ).json()
+    _save_prospective_endpoint_candidate(storage, "cand-status-1", "2026-08-11T14:00:00Z")
+    _save_market_bar(storage, "MNQ1!", "5m", "2026-08-11T14:05:00Z", open_=20000.0, high=20060.0, low=19995.0, close=20055.0)
+
+    r = client.get(f"/prospective-experiments/{registered['experiment_id']}/status")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["experiment_id"] == registered["experiment_id"]
+    assert body["status"] == "active"
+    serialized = json.dumps(body)
+    for forbidden in ("total_pnl_usd", "win_rate", "profit_factor", "max_drawdown_usd"):
+        assert forbidden not in serialized
+    assert "checks" in body["stopping_rule_status"]
+    assert body["stopping_rule_status"]["stopping_rule_met"] is False
+
+
+def test_prospective_experiment_status_endpoint_404_for_unknown_id(client):
+    r = client.get("/prospective-experiments/does-not-exist/status")
+    assert r.status_code == 404
+
+
+def test_resolve_prospective_experiment_endpoint_requires_secret(client):
+    headers = {"X-Webhook-Secret": "test-secret"}
+    registered = client.post(
+        "/prospective-experiments",
+        params={
+            "symbol": "MNQ1!", "timeframe": "5m", "hypothesis": "h",
+            **_INCREMENTAL_TARGET_PARAMS, "min_distinct_trading_days": 1,
+        },
+        headers=headers,
+    ).json()
+
+    r = client.post(f"/prospective-experiments/{registered['experiment_id']}/resolve")
+    assert r.status_code == 401
+
+
+def test_resolve_prospective_experiment_endpoint_409_when_stopping_rule_not_met(client):
+    headers = {"X-Webhook-Secret": "test-secret"}
+    registered = client.post(
+        "/prospective-experiments",
+        params={
+            "symbol": "MNQ1!", "timeframe": "5m", "hypothesis": "h",
+            **_INCREMENTAL_TARGET_PARAMS, "min_distinct_trading_days": 5,
+        },
+        headers=headers,
+    ).json()
+
+    r = client.post(f"/prospective-experiments/{registered['experiment_id']}/resolve", headers=headers)
+    assert r.status_code == 409
+
+
+def test_resolve_prospective_experiment_endpoint_404_for_unknown_id(client):
+    headers = {"X-Webhook-Secret": "test-secret"}
+    r = client.post("/prospective-experiments/does-not-exist/resolve", headers=headers)
+    assert r.status_code == 404
+
+
+def test_resolve_prospective_experiment_endpoint_succeeds_and_is_idempotent(client):
+    import app.storage as storage
+
+    headers = {"X-Webhook-Secret": "test-secret"}
+    registered = client.post(
+        "/prospective-experiments",
+        params={
+            "symbol": "MNQ1!", "timeframe": "5m", "hypothesis": "h",
+            **_INCREMENTAL_TARGET_PARAMS, "min_distinct_trading_days": 1,
+        },
+        headers=headers,
+    ).json()
+
+    _save_prospective_endpoint_candidate(storage, "cand-resolve-1", "2026-08-11T14:00:00Z")
+    _save_market_bar(storage, "MNQ1!", "5m", "2026-08-11T14:05:00Z", open_=20000.0, high=20060.0, low=19995.0, close=20055.0)
+
+    r = client.post(f"/prospective-experiments/{registered['experiment_id']}/resolve", headers=headers)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "resolved"
+    assert body["resolution"]["resolved_from_candidates_considered"] == 1
+    assert "none" in body["resolution"]["arms_results"]
+    assert "overlap_only" in body["resolution"]["arms_results"]
+    assert "target_metrics_result" in body["resolution"]
+
+    r2 = client.post(f"/prospective-experiments/{registered['experiment_id']}/resolve", headers=headers)
+    assert r2.status_code == 200
+    assert r2.json()["resolution"] == body["resolution"]
+
+
+def test_veto_prospective_comparison_endpoint_and_registered_experiment_are_independent(client):
+    """The Tier 3.42 exploratory calculator (since_rowid/atr_stop_mult
+    accepted per call) and the Tier 3.43 registered experiment (locked
+    config, no overrides) coexist -- registering an experiment must not
+    change the calculator endpoint's behavior or require it."""
+    import app.storage as storage
+
+    _save_prospective_endpoint_candidate(storage, "cand-coexist-1", "2026-08-11T14:00:00Z")
+
+    watermark = client.get(
+        "/candidates/history/current-rowid", params={"symbol": "MNQ1!", "timeframe": "5m"},
+    ).json()["current_rowid"]
+
+    r = client.get(
+        "/candidates/history/veto-prospective-comparison",
+        params={"symbol": "MNQ1!", "timeframe": "5m", "since_rowid": 0},
+    )
+    assert r.status_code == 200
+    assert r.json()["candidates_since_watermark"] == 1
+    assert watermark == 1

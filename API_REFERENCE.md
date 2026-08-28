@@ -2767,6 +2767,16 @@ Nothing is written anywhere; this endpoint has no side effects.
 
 ### `GET /candidates/history/veto-prospective-comparison?symbol=MNQ1!&timeframe=5m&since_rowid=4218`
 
+**EXPLORATORY / ad-hoc calculator — NOT the pre-registered frozen
+experiment (Tier 3.43, sixteenth external review).** This endpoint
+accepts a caller-supplied `since_rowid`/`atr_stop_mult`/`atr_target_
+mult`/`expiry_bars` on every call — exactly what makes it useful for
+genuinely exploratory questions, and exactly why it can never itself BE
+a pre-registered test (nothing stops a later call from quietly using a
+different watermark or geometry, or reporting only the best-looking of
+several tries). For the actual frozen, audit-trailed, config-drift-
+checked experiment, see **Prospective experiment registry** below.
+
 Tier 3.42, fifteenth external review. The **frozen prospective**
 counterpart to `veto-incremental-pnl`'s retrospective `both_excluded_
 overlap` finding above. Both the fourteenth and fifteenth reviews
@@ -2879,6 +2889,168 @@ watermark itself is **not frozen by this code** — freezing it is an
 operational step (calling `current-rowid` once against production and
 recording the value outside the API) that happens after this tier
 ships, not something this tier can enforce in software.
+
+---
+
+## Prospective experiment registry (Tier 3.43, sixteenth external review)
+
+A small, separate, immutable pre-registration record for the 3-arm
+prospective overlap comparison above — closing the gap the sixteenth
+review identified in Tier 3.42: a manually-recorded watermark reported
+in an untracked package is not an enforceable freeze. **Deliberately
+NOT a redesign of the existing [Experiment registry](#experiment-
+registry-tier-320-hardened-tier-323)** above — that registry is
+genuinely single-arm shaped (one `direction_source` column) and already
+has two live registrations; this is a new, independent table with the
+same append-only / write-once-resolution shape, copied deliberately
+rather than merged in. See `app/prospective_experiments.py`'s module
+docstring for the full design rationale.
+
+### `POST /prospective-experiments?symbol=MNQ1!&timeframe=5m&hypothesis=...&treatment_arm=overlap_only&baseline_arm=none&metric=total_pnl_usd&comparison_mode=incremental&comparator=%3E&success_threshold=0&min_distinct_trading_days=25&min_baseline_portfolio_trades=30&min_overlap_joint_opinion_pairs=10` (secret required)
+
+Freezes, in one write: the fixed 3 arms (`none`/`solo_veto_only`/
+`overlap_only` — **not a parameter**, always the same set), the current
+live Coordinator scoring config + backtest geometry + News/Macro
+`model`+`prompt_version` (new this tier — see `app/news_agent.
+PROMPT_VERSION`/`app/macro_agent.PROMPT_VERSION`), the `target_metrics`
+comparison, the `stopping_rule`, and `registered_watermark_rowid` (via
+the same `get_max_candidate_rowid()` monotonic-integer boundary
+`app.experiments` already uses).
+
+`target_metrics` params: `treatment_arm`/`baseline_arm` (one of `none`/
+`solo_veto_only`/`overlap_only` each, must differ), `metric` (one of
+the same `VALID_TARGET_METRIC_KEYS` the existing registry uses —
+`win_rate`/`profit_factor`/`avg_pnl_usd`/`median_pnl_usd`/`total_pnl_
+usd`/`max_drawdown_usd`/`trades_taken`/`wins`/`losses`), `comparison_
+mode` (`incremental` — treatment's metric minus baseline's, e.g. "the
+overlap arm's incremental portfolio P&L over baseline", the review's
+own first example; or `treatment_only` — the treatment arm's metric
+alone, e.g. a `profit_factor` floor), `comparator`/`success_threshold`.
+**Always evaluated at `portfolio_level.overall` for both arms — never
+`decision_level`, and not configurable** — per the review's own
+explicit "the primary result must be portfolio-level, since decision-
+level schedules overlap and repeat the same underlying days" reading of
+the three arms. `secondary_metrics` (optional list) are reported at
+resolution for both arms but not gated.
+
+`stopping_rule` params — **at least one required**, exactly the three
+components the review named rather than a raw candidate count (the
+overlap arm is rare by construction, so a candidate-count-only rule
+could be satisfied by one arm alone): `min_distinct_trading_days`
+(checked against the `none` arm's full-window day coverage — i.e. the
+whole prospective window's day diversity), `min_baseline_portfolio_
+trades` (checked against `baseline_arm`'s `portfolio_level` trade
+count — so the comparison itself has a real sample), `min_overlap_
+joint_opinion_pairs` (checked against `overlap_only`'s `distinct_
+joint_news_macro_opinions` specifically, not a raw candidate count).
+
+### `GET /prospective-experiments?symbol=MNQ1!&timeframe=5m`
+
+Every registered prospective experiment, newest first — append-only
+history. Filter by symbol/timeframe, or omit both to see every
+experiment across every symbol/timeframe.
+
+### `GET /prospective-experiments/{experiment_id}`
+
+Full experiment record — `hypothesis`, `arms`, `locked_config`,
+`target_metrics`, `stopping_rule`, `status`, `resolution` once
+resolved. **Takes ONLY `experiment_id`** — no `since_rowid`/geometry
+override accepted, closing the "anyone could change the watermark
+tomorrow" gap the review flagged against the Tier 3.42 calculator.
+Does **not** include a live stopping-rule check — that's the separate
+`/status` endpoint below, kept apart deliberately (see next section).
+
+### `GET /prospective-experiments/{experiment_id}/status`
+
+Live, read-only, non-consuming stopping-rule progress check — call this
+as many times as you like, it never resolves the experiment or affects
+the eventual outcome.
+
+**This response NEVER contains a P&L/win-rate/profit-factor/max-
+drawdown figure for any arm — only counts and met/not-met booleans**,
+even though the full comparison is computed internally to extract those
+counts. This is the review's item #6 ("don't publish early results
+daily, show progress counts only until checkpoint") enforced at the API
+shape level, not left to restraint — the only place any arm's actual
+result ever appears anywhere in this API is the one-time `POST
+.../resolve` response, and only after the stopping rule is already met.
+
+```json
+{
+  "experiment_id": "b6e2b9b0-...",
+  "status": "active",
+  "stopping_rule_status": {
+    "prospective_candidates_considered": 41,
+    "clean_candidates_considered": 39,
+    "config_drift": { "drifted_excluded_count": 2, "unversioned_count": 0 },
+    "checks": {
+      "min_distinct_trading_days": { "required": 25, "actual": 7, "met": false },
+      "min_baseline_portfolio_trades": { "required": 30, "actual": 14, "met": false },
+      "min_overlap_joint_opinion_pairs": { "required": 10, "actual": 3, "met": false }
+    },
+    "stopping_rule_met": false,
+    "geometry_drift": null
+  }
+}
+```
+
+`config_drift.drifted_excluded_count` — candidates whose News or Macro
+opinion carries a `model`/`prompt_version` that no longer matches what
+was locked at registration; these are excluded from every count and
+check above (and, at resolution, from the arms computation itself).
+`unversioned_count` — candidates predating this tier's `model`/
+`prompt_version` fields entirely; kept in every count (excluding them
+would leave zero data until versioning fully propagates) but always
+reported separately so a reader can see how much of the window predates
+versioning. `geometry_drift` — same meaning as the existing Experiment
+registry's field: `null` unless `slippage_points`/`commission_per_
+contract`/`backtest_logic_version` have changed live since registration.
+
+500 (not an unhandled crash) if the prospective window has grown past
+`PROSPECTIVE_POPULATION_SAFETY_CAP` — an unusual condition, not a
+normal 4xx, same convention as `GET /experiments/{id}`.
+
+### `POST /prospective-experiments/{experiment_id}/resolve` (secret required)
+
+The one-time outcome recording — **the only place any arm's actual
+P&L/win-rate/profit-factor ever appears for this experiment.** 409 if
+the stopping rule isn't met yet (check `.../status` first — no forcing
+an early look, the exact discipline the review's "optional stopping"
+warning is about). If already resolved, returns the SAME resolution
+recorded the first time this succeeded — calling this again after more
+data accumulates never recomputes it.
+
+```json
+{
+  "experiment_id": "b6e2b9b0-...",
+  "status": "resolved",
+  "resolved_at": "2026-09-30T12:00:00Z",
+  "resolution": {
+    "resolved_from_candidates_considered": 210,
+    "resolved_from_clean_candidates": 204,
+    "config_drift": { "drifted_excluded_count": 6, "unversioned_count": 0 },
+    "population": { "candidates_considered": 204, "coordinator_traded_population": 190, "short": 100, "long": 90 },
+    "arms_results": { "none": { "...": "full per-arm decision_level/portfolio_level breakdown, same shape as the calculator endpoint above" } },
+    "target_metrics_result": {
+      "treatment_arm": "overlap_only", "baseline_arm": "none", "metric": "total_pnl_usd",
+      "comparison_mode": "incremental", "treatment_value": 640.0, "baseline_value": -210.0,
+      "comparator": ">", "success_threshold": 0, "actual": 850.0, "met": true,
+      "secondary_metrics": { "profit_factor": { "treatment": 1.8, "baseline": 0.6 } }
+    },
+    "geometry_drift": null
+  }
+}
+```
+
+(Illustrative shape only, fabricated numbers.) 500 (not 409) if the
+prospective window has grown past `PROSPECTIVE_POPULATION_SAFETY_CAP` —
+a safety ceiling tripping, not "the stopping rule isn't met yet."
+
+Entirely additive: no existing endpoint's behavior or response shape
+changed, `COORDINATOR_THRESHOLD`/`WEIGHTS`/`MIN_AVAILABLE_WEIGHT`/
+`AUTO_EXECUTE_ENABLED` all untouched (only read and snapshotted),
+`DIRECTION_SOURCES` unchanged, `app.experiments` and its two live
+registrations untouched.
 
 ---
 

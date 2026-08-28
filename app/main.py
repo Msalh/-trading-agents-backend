@@ -1352,6 +1352,62 @@ operational step (calling current-rowid once against production and
 recording the value) that happens after this tier ships, not something
 this tier can enforce in software.
 
+Tier 3.43 (sixteenth external review, 2026-08-27, pre-registered
+prospective experiment): the sixteenth review's core objection to Tier
+3.42's manually-recorded watermark (rowid 1183, reported in an
+untracked package): "on-demand prospective-window calculator with a
+manually recorded intended watermark" is not "a frozen registered
+prospective experiment" — GET /candidates/history/veto-prospective-
+comparison accepts a caller-supplied since_rowid/geometry on every
+call, so nothing stops a future call from quietly changing the
+watermark, trying several stop/target combinations, or reporting only
+the best-looking run. This tier adds app/prospective_experiments.py, a
+new module with its own small, separate, immutable `prospective_
+experiments` table (app.storage) — deliberately NOT a redesign of
+app.experiments' existing single-arm registry, per the review's own
+explicit "small permanent record, no registry redesign needed"
+recommendation; app.experiments and its two live registrations
+(watermarks 950/588) are completely untouched.
+
+Four things now locked at registration and enforced, not just recorded,
+answering the review's four listed gaps: (1) an immutable record — the
+fixed 3 arms (app.backtest.PROSPECTIVE_ARMS, new public alias — not a
+parameter), locked Coordinator config + backtest geometry + News/Macro
+model+prompt versions, and registered_watermark_rowid, all in one row;
+new endpoints GET /prospective-experiments/{id}(/status) take ONLY an
+experiment_id and read locked settings, no override accepted; (2) a
+stopping rule REQUIRED at registration (min_distinct_trading_days/
+min_baseline_portfolio_trades/min_overlap_joint_opinion_pairs — the
+exact three the review named, not a raw candidate count, since the
+overlap arm is rare by construction) and a single primary metric always
+read at portfolio_level.overall (never decision_level, per the review's
+own "primary result must be portfolio-level" note) — GET .../status is
+read-only/repeatable and reports ONLY counts and met/not-met checks,
+NEVER a P&L/win-rate/profit-factor figure (review item #6, "no daily
+early results" enforced architecturally, not left to restraint); POST
+.../resolve is the one-time action, refuses until the rule is met; (3)
+no silent overrides — arms fixed, watermark/geometry always read from
+the stored row; (4) config-drift detection — app.news_agent.PROMPT_
+VERSION and app.macro_agent.PROMPT_VERSION (new this tier, same
+hand-maintained-marker convention as BACKTEST_LOGIC_VERSION) plus each
+agent's MODEL are locked and compared per-candidate at evaluation time;
+Coordinator-side drift is corrected by construction (every candidate is
+re-scored via app.replay.replay_candidate() under the locked config
+before any arm is computed, exactly like app.experiments already does);
+News/Macro opinion drift can't be corrected the same way (LLM judgment,
+not a pure function of stored inputs) so it's DETECTED and SEPARATED
+instead — "drifted" candidates are excluded from the primary
+computation, "unversioned" ones (predating this tier) stay in but are
+always counted separately.
+
+Purely additive: no existing endpoint's behavior or response shape
+changed, COORDINATOR_THRESHOLD/WEIGHTS/MIN_AVAILABLE_WEIGHT/
+AUTO_EXECUTE_ENABLED all untouched (only read and snapshotted),
+DIRECTION_SOURCES unchanged, app.experiments untouched. The original
+Tier 3.42 calculator endpoint remains available for genuinely
+exploratory ad-hoc questions — its docstring now says plainly that it
+is NOT this pre-registered experiment.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -1374,6 +1430,7 @@ from app.backtest import (
     DEFAULT_HOLDOUT_FRACTION,
     DIRECTION_SOURCES,
     EXPIRY_BARS,
+    PROSPECTIVE_ARMS,
     compute_backtest_comparison,
     compute_champion_challenger_report,
     PROSPECTIVE_POPULATION_SAFETY_CAP,
@@ -1394,6 +1451,13 @@ from app.experiments import (
 )
 from app.experiments import register_experiment as register_new_experiment
 from app.experiments import resolve_experiment as resolve_existing_experiment
+from app.prospective_experiments import (
+    ProspectiveExperimentError,
+    evaluate_prospective_stopping_rule,
+    list_prospective_experiments,
+)
+from app.prospective_experiments import register_prospective_experiment as register_new_prospective_experiment
+from app.prospective_experiments import resolve_prospective_experiment as resolve_existing_prospective_experiment
 from app.candidates import (
     CandidateError,
     CandidateLockedError,
@@ -1466,6 +1530,7 @@ from app.storage import (
     get_llm_call_summary,
     get_max_candidate_rowid,
     get_open_or_pending_trades,
+    get_prospective_experiment_by_id,
     get_recent,
     get_recent_as_of,
     get_recent_decisions,
@@ -3592,7 +3657,22 @@ def candidates_history_veto_prospective_comparison(
     atr_target_mult: float = Query(default=ATR_TARGET_MULT),
     expiry_bars: int = Query(default=EXPIRY_BARS, le=200),
 ) -> dict:
-    """Tier 3.42 (fifteenth external review) — the frozen PROSPECTIVE
+    """EXPLORATORY / ad-hoc calculator — NOT the pre-registered frozen
+    experiment (Tier 3.43, sixteenth external review). This endpoint
+    accepts a caller-supplied since_rowid/atr_stop_mult/atr_target_mult/
+    expiry_bars on every call, which is exactly what makes it useful for
+    genuinely exploratory questions and exactly why it can never itself
+    BE a pre-registered test — nothing stops a future call from quietly
+    using a different watermark or geometry, or from trying several
+    combinations and only reporting the best-looking one. For the actual
+    frozen, audit-trailed, config-drift-checked prospective experiment,
+    see POST /prospective-experiments / GET /prospective-experiments/
+    {id} / GET /prospective-experiments/{id}/status / POST
+    /prospective-experiments/{id}/resolve below, which take only an
+    experiment_id and read locked settings from a permanent database
+    row rather than accepting overrides.
+
+    Tier 3.42 (fifteenth external review) — the frozen PROSPECTIVE
     counterpart to GET /candidates/history/veto-incremental-pnl's
     retrospective `both_excluded_overlap` finding. See app/backtest.py's
     Tier 3.42 module comment block (directly above _PROSPECTIVE_ARMS)
@@ -3784,6 +3864,162 @@ def resolve_experiment_endpoint(
     except ExperimentError as e:
         message = str(e)
         if message.startswith("no experiment with id"):
+            status_code = 404
+        elif "not yet met" in message:
+            status_code = 409
+        else:
+            status_code = 500
+        raise HTTPException(status_code=status_code, detail=message)
+
+
+@app.post("/prospective-experiments")
+def register_prospective_experiment_endpoint(
+    symbol: str = Query(...),
+    timeframe: str = Query(...),
+    hypothesis: str = Query(..., description="what this experiment is testing, in plain language"),
+    treatment_arm: str = Query(..., description=f"one of {PROSPECTIVE_ARMS} — the arm the primary metric evaluates"),
+    baseline_arm: str = Query(default="none", description=f"one of {PROSPECTIVE_ARMS}, must differ from treatment_arm"),
+    metric: str = Query(..., description=f"one of {VALID_TARGET_METRIC_KEYS} — always read at portfolio_level.overall, never decision_level"),
+    comparison_mode: str = Query(default="incremental", description="'incremental' (treatment_metric - baseline_metric, e.g. incremental portfolio P&L) or 'treatment_only' (treatment_metric alone, e.g. a profit_factor floor)"),
+    comparator: str = Query(..., description=f"one of {VALID_COMPARATORS}"),
+    success_threshold: float = Query(..., description="e.g. treatment_arm=overlap_only&baseline_arm=none&metric=total_pnl_usd&comparison_mode=incremental&comparator=>&success_threshold=0"),
+    secondary_metrics: list[str] = Query(default=[], description="reported at resolution but not gated — repeat this param once per metric"),
+    min_distinct_trading_days: int | None = Query(default=None, description="checked against the 'none' arm's full-window day coverage"),
+    min_baseline_portfolio_trades: int | None = Query(default=None, description="checked against baseline_arm's portfolio_level trade count"),
+    min_overlap_joint_opinion_pairs: int | None = Query(default=None, description="checked against overlap_only's distinct (News, Macro) opinion-pair count specifically, not a raw candidate count — the overlap arm is rare by construction"),
+    x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret"),
+) -> dict:
+    """Tier 3.43 (sixteenth external review) — pre-registers the 3-arm
+    prospective overlap comparison as a genuine immutable record, closing
+    the gap the review identified in Tier 3.42: a manually-recorded
+    watermark in an untracked package is not an enforceable freeze. See
+    app/prospective_experiments.py's module docstring for the full
+    rationale (why a separate small table rather than extending
+    app.experiments, why arms are fixed rather than a parameter, why the
+    primary metric is always portfolio-level).
+
+    Freezes, in one write: the fixed 3 arms (`none`/`solo_veto_only`/
+    `overlap_only` — not a parameter here), the current live Coordinator
+    scoring config + backtest geometry + News/Macro model+prompt
+    versions, the target_metrics comparison, the stopping_rule, and
+    registered_watermark_rowid (via storage.get_max_candidate_rowid(),
+    the same monotonic-integer no-peeking boundary app.experiments
+    already uses). At least one of min_distinct_trading_days/
+    min_baseline_portfolio_trades/min_overlap_joint_opinion_pairs is
+    required — an experiment with no stopping rule could never
+    legitimately be resolved.
+
+    Secret-protected: this writes to the database and, once resolved,
+    the record is permanent — same guard as POST /experiments."""
+    _check_secret(x_webhook_secret)
+    stopping_rule = {}
+    if min_distinct_trading_days is not None:
+        stopping_rule["min_distinct_trading_days"] = min_distinct_trading_days
+    if min_baseline_portfolio_trades is not None:
+        stopping_rule["min_baseline_portfolio_trades"] = min_baseline_portfolio_trades
+    if min_overlap_joint_opinion_pairs is not None:
+        stopping_rule["min_overlap_joint_opinion_pairs"] = min_overlap_joint_opinion_pairs
+    target_metrics = {
+        "treatment_arm": treatment_arm,
+        "baseline_arm": baseline_arm,
+        "metric": metric,
+        "comparison_mode": comparison_mode,
+        "comparator": comparator,
+        "success_threshold": success_threshold,
+        "secondary_metrics": secondary_metrics,
+    }
+    try:
+        return register_new_prospective_experiment(
+            symbol=symbol, timeframe=timeframe, hypothesis=hypothesis,
+            target_metrics=target_metrics, stopping_rule=stopping_rule,
+        )
+    except ProspectiveExperimentError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/prospective-experiments")
+def list_prospective_experiments_endpoint(
+    symbol: str | None = Query(default=None),
+    timeframe: str | None = Query(default=None),
+) -> dict:
+    """Every registered prospective experiment, newest first —
+    append-only history. Filter by symbol/timeframe, or omit both to see
+    every experiment across every symbol/timeframe."""
+    return {"prospective_experiments": list_prospective_experiments(symbol=symbol, timeframe=timeframe)}
+
+
+@app.get("/prospective-experiments/{experiment_id}")
+def prospective_experiment_by_id_endpoint(experiment_id: str) -> dict:
+    """Full experiment record (hypothesis, arms, locked_config,
+    target_metrics, stopping_rule, status, resolution once resolved).
+    Deliberately takes ONLY experiment_id — no since_rowid/geometry
+    override accepted here, closing the "anyone could change the
+    watermark tomorrow" gap the sixteenth review flagged against Tier
+    3.42's original calculator endpoint. Does NOT include the live
+    stopping-rule progress check — see GET /prospective-experiments/
+    {id}/status for that (kept separate deliberately, see that
+    endpoint's docstring)."""
+    experiment = get_prospective_experiment_by_id(experiment_id)
+    if experiment is None:
+        raise HTTPException(status_code=404, detail=f"no prospective experiment found with id={experiment_id}")
+    return experiment
+
+
+@app.get("/prospective-experiments/{experiment_id}/status")
+def prospective_experiment_status_endpoint(experiment_id: str) -> dict:
+    """Live, read-only, non-consuming stopping-rule progress check —
+    checking this as many times as you like never resolves the
+    experiment or affects the eventual outcome.
+
+    Tier 3.43 (sixteenth review, item #6 — "don't publish early results
+    daily, show progress counts only until checkpoint"): this response
+    deliberately contains ONLY candidate/day/opinion-pair COUNTS and
+    met/not-met booleans — NEVER a P&L, win_rate, profit_factor, or
+    max_drawdown figure for any arm, even though the full comparison is
+    computed internally to extract those counts. This is an
+    architectural "no peeking" guarantee, not a request for restraint —
+    the only place any arm's actual result ever appears in this API is
+    the one-time POST .../resolve response, and only after the stopping
+    rule is already met.
+
+    500 (not an unhandled crash) if the prospective window has grown
+    past PROSPECTIVE_POPULATION_SAFETY_CAP — an unusual condition, not a
+    normal 4xx, same convention as GET /experiments/{id}."""
+    experiment = get_prospective_experiment_by_id(experiment_id)
+    if experiment is None:
+        raise HTTPException(status_code=404, detail=f"no prospective experiment found with id={experiment_id}")
+    try:
+        return {
+            "experiment_id": experiment["experiment_id"],
+            "status": experiment["status"],
+            "stopping_rule_status": evaluate_prospective_stopping_rule(experiment),
+        }
+    except ProspectiveExperimentError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/prospective-experiments/{experiment_id}/resolve")
+def resolve_prospective_experiment_endpoint(
+    experiment_id: str,
+    x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret"),
+) -> dict:
+    """The one-time outcome recording — the only place any arm's actual
+    P&L/win-rate/profit-factor ever appears for this experiment. 409 if
+    the stopping rule isn't met yet (check GET /prospective-experiments/
+    {id}/status first — no forcing an early look). If already resolved,
+    returns the SAME resolution recorded the first time this succeeded —
+    calling this again after more data accumulates never recomputes it.
+    Secret-protected, same guard as registration.
+
+    500 (not 409) if the prospective window has grown past
+    PROSPECTIVE_POPULATION_SAFETY_CAP — that's a safety ceiling
+    tripping, not "the stopping rule isn't met yet.\""""
+    _check_secret(x_webhook_secret)
+    try:
+        return resolve_existing_prospective_experiment(experiment_id)
+    except ProspectiveExperimentError as e:
+        message = str(e)
+        if message.startswith("no prospective experiment with id"):
             status_code = 404
         elif "not yet met" in message:
             status_code = 409

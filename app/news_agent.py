@@ -24,6 +24,18 @@ from app.text_utils import clean_opinion_text_fields
 
 MODEL = "claude-sonnet-5"
 
+# Tier 3.43 (sixteenth external review — prospective-experiment config
+# drift detection): a hand-maintained marker for THIS PROMPT/schema,
+# same "explicit env var absent, bump-by-hand" convention as
+# app.backtest.BACKTEST_LOGIC_VERSION. Bump this whenever SYSTEM_PROMPT
+# or the required response shape changes in a way that could alter
+# what "urgent"/direction/confidence actually mean for a candidate
+# scored before vs after the change. app.prospective_experiments locks
+# this value (and MODEL) at registration and reports/excludes drift
+# rather than silently blending two different News regimes into one
+# prospective comparison.
+PROMPT_VERSION = "1"
+
 SYSTEM_PROMPT = """You track news and the economic calendar relevant to Nasdaq/tech and US macro data (Fed, CPI, NFP, jobless claims, PCE, and similar releases).
 
 Your job only: assess near-term news risk or sentiment impact — not chart analysis, not price levels.
@@ -57,6 +69,10 @@ class NewsOpinion:
     reasoning: str
     key_data: dict
     flags: list[str]
+    # Tier 3.43: defaulted so existing callers/tests that construct this
+    # dataclass without these two keywords are unaffected.
+    model: str = MODEL
+    prompt_version: str = PROMPT_VERSION
 
     def to_dict(self) -> dict:
         return {
@@ -68,6 +84,8 @@ class NewsOpinion:
             "reasoning": self.reasoning,
             "key_data": self.key_data,
             "flags": self.flags,
+            "model": self.model,
+            "prompt_version": self.prompt_version,
         }
 
 
@@ -139,4 +157,6 @@ def run_news(symbol: str) -> NewsOpinion:
         reasoning=parsed["reasoning"],
         key_data=parsed["key_data"],
         flags=parsed["flags"],
+        model=MODEL,
+        prompt_version=PROMPT_VERSION,
     )

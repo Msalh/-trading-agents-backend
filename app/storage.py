@@ -139,6 +139,24 @@ CREATE TABLE IF NOT EXISTS experiments (
 );
 CREATE INDEX IF NOT EXISTS idx_experiments_symbol_timeframe
     ON experiments (symbol, timeframe, registered_at DESC);
+
+CREATE TABLE IF NOT EXISTS prospective_experiments (
+    experiment_id TEXT PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    timeframe TEXT NOT NULL,
+    hypothesis TEXT NOT NULL,
+    arms_json TEXT NOT NULL,
+    locked_config_json TEXT NOT NULL,
+    target_metrics_json TEXT NOT NULL,
+    stopping_rule_json TEXT NOT NULL,
+    registered_at TEXT NOT NULL DEFAULT (datetime('now')),
+    registered_watermark_rowid INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'active',
+    resolved_at TEXT,
+    resolution_json TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_prospective_experiments_symbol_timeframe
+    ON prospective_experiments (symbol, timeframe, registered_at DESC);
 """
 
 
@@ -1475,3 +1493,122 @@ def resolve_experiment(experiment_id: str, resolution: dict) -> Optional[dict]:
     finally:
         conn.close()
     return get_experiment_by_id(experiment_id)
+
+
+# ---------------------------------------------------------------------------
+# Tier 3.43 (sixteenth external review) — prospective_experiments: a
+# SEPARATE small immutable-record table for the multi-arm prospective
+# comparison app.prospective_experiments manages, deliberately not a
+# redesign of the single-arm `experiments` table above (see that
+# module's docstring for why: the two have genuinely different shapes
+# — one direction_source vs a fixed set of arms — and the review itself
+# recommended a small dedicated record rather than a registry
+# redesign). Same append-only, write-once-resolution pattern as
+# experiments above, copied deliberately rather than re-derived.
+# ---------------------------------------------------------------------------
+
+def _row_to_prospective_experiment(row: sqlite3.Row) -> dict:
+    return {
+        "experiment_id": row["experiment_id"],
+        "symbol": row["symbol"],
+        "timeframe": row["timeframe"],
+        "hypothesis": row["hypothesis"],
+        "arms": json.loads(row["arms_json"]),
+        "locked_config": json.loads(row["locked_config_json"]),
+        "target_metrics": json.loads(row["target_metrics_json"]),
+        "stopping_rule": json.loads(row["stopping_rule_json"]),
+        "registered_at": row["registered_at"],
+        "registered_watermark_rowid": row["registered_watermark_rowid"],
+        "status": row["status"],
+        "resolved_at": row["resolved_at"],
+        "resolution": json.loads(row["resolution_json"]) if row["resolution_json"] else None,
+    }
+
+
+def save_prospective_experiment(
+    experiment_id: str,
+    symbol: str,
+    timeframe: str,
+    hypothesis: str,
+    arms: list,
+    locked_config: dict,
+    target_metrics: dict,
+    stopping_rule: dict,
+    registered_watermark_rowid: int,
+) -> dict:
+    """Inserts one new prospective-experiment row, status='active'. Same
+    registered_watermark_rowid no-peeking-boundary convention as
+    save_experiment() above -- computed by the caller via
+    get_max_candidate_rowid() immediately before this call."""
+    conn = get_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO prospective_experiments
+                (experiment_id, symbol, timeframe, hypothesis, arms_json,
+                 locked_config_json, target_metrics_json, stopping_rule_json,
+                 registered_watermark_rowid)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                experiment_id, symbol, timeframe, hypothesis, json.dumps(arms),
+                json.dumps(locked_config), json.dumps(target_metrics),
+                json.dumps(stopping_rule), registered_watermark_rowid,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return get_prospective_experiment_by_id(experiment_id)
+
+
+def get_prospective_experiment_by_id(experiment_id: str) -> Optional[dict]:
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM prospective_experiments WHERE experiment_id = ?", (experiment_id,)
+        ).fetchone()
+        return _row_to_prospective_experiment(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_prospective_experiments(symbol: str | None = None, timeframe: str | None = None) -> list[dict]:
+    """Every registered prospective experiment, newest first --
+    append-only, so this is the complete history. Optionally filtered
+    by symbol/timeframe."""
+    conn = get_connection()
+    try:
+        if symbol and timeframe:
+            rows = conn.execute(
+                "SELECT * FROM prospective_experiments WHERE symbol = ? AND timeframe = ? ORDER BY registered_at DESC, rowid DESC",
+                (symbol, timeframe),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM prospective_experiments ORDER BY registered_at DESC, rowid DESC"
+            ).fetchall()
+        return [_row_to_prospective_experiment(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def resolve_prospective_experiment(experiment_id: str, resolution: dict) -> Optional[dict]:
+    """Write-once, identical guarantee to resolve_experiment() above:
+    the UPDATE only matches a row that's still status='active', so a
+    retried call never overwrites an existing resolution_json. Returns
+    None if experiment_id doesn't exist at all."""
+    conn = get_connection()
+    try:
+        conn.execute(
+            """
+            UPDATE prospective_experiments
+            SET status = 'resolved', resolved_at = datetime('now'), resolution_json = ?
+            WHERE experiment_id = ? AND status = 'active'
+            """,
+            (json.dumps(resolution), experiment_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return get_prospective_experiment_by_id(experiment_id)

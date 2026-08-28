@@ -19,6 +19,14 @@ from app.text_utils import clean_opinion_text_fields
 
 MODEL = "claude-sonnet-5"
 
+# Tier 3.43 (sixteenth external review — prospective-experiment config
+# drift detection): same hand-maintained marker convention as
+# app.news_agent.PROMPT_VERSION / app.backtest.BACKTEST_LOGIC_VERSION.
+# Bump whenever SYSTEM_PROMPT or the required response shape changes in
+# a way that could alter what "risk_off"/direction/confidence actually
+# mean for a candidate scored before vs after the change.
+PROMPT_VERSION = "1"
+
 SYSTEM_PROMPT = """You monitor the broader macro context relevant to Nasdaq-100 futures (NQ/MNQ): the US Dollar Index (DXY), US 10-Year Treasury yields, and the correlation/behavior between SPX and NDX (Nasdaq-100).
 
 Your job only: does the current macro backdrop support or contradict an expected move in NQ — not chart pattern analysis, not news events.
@@ -53,6 +61,10 @@ class MacroOpinion:
     reasoning: str
     key_data: dict
     flags: list[str]
+    # Tier 3.43: defaulted so existing callers/tests that construct this
+    # dataclass without these two keywords are unaffected.
+    model: str = MODEL
+    prompt_version: str = PROMPT_VERSION
 
     def to_dict(self) -> dict:
         return {
@@ -64,6 +76,8 @@ class MacroOpinion:
             "reasoning": self.reasoning,
             "key_data": self.key_data,
             "flags": self.flags,
+            "model": self.model,
+            "prompt_version": self.prompt_version,
         }
 
 
@@ -132,4 +146,6 @@ def run_macro(symbol: str) -> MacroOpinion:
         reasoning=parsed["reasoning"],
         key_data=parsed["key_data"],
         flags=parsed["flags"],
+        model=MODEL,
+        prompt_version=PROMPT_VERSION,
     )
