@@ -95,8 +95,17 @@ from then on, directly answering the review's four listed gaps:
      fully propagates) but their count is always reported alongside
      every result so a reader can see how much of the window predates
      versioning. Backtest geometry/slippage/commission/logic-version
-     drift is reported the same way app.experiments already does
-     (geometry_drift, loud flag, not silently applied).
+     drift is detected the same way app.experiments already does
+     (geometry_drift), but unlike app.experiments' read-only flag, it
+     also BLOCKS resolve_prospective_experiment() outright (Tier 3.45,
+     seventeenth external review) -- resolving with drifted costs would
+     silently price this experiment's P&L under numbers it was never
+     registered against, and the review explicitly rejected accepting a
+     final result under cost drift. GET .../status still only ever
+     surfaces the geometry_drift field for a caller to notice ahead of
+     time; app.experiments itself is untouched, so its own two live
+     registrations keep their existing (report-only) geometry_drift
+     behavior.
 
 Entirely additive: no existing endpoint's behavior changes, no
 COORDINATOR_THRESHOLD/WEIGHTS/MIN_AVAILABLE_WEIGHT touched (only read
@@ -521,10 +530,13 @@ def _evaluate_prospective_target_metrics(comparison: dict, experiment: dict) -> 
 
 def resolve_prospective_experiment(experiment_id: str) -> dict:
     """The one-time outcome recording. Raises ProspectiveExperimentError
-    if the experiment doesn't exist or its stopping rule isn't met yet
+    if the experiment doesn't exist, its stopping rule isn't met yet
     (no forcing an early look -- the exact discipline the sixteenth
-    review's "optional stopping" warning is about). If already resolved,
-    returns the existing row completely untouched."""
+    review's "optional stopping" warning is about), or trading cost/
+    backtest geometry has drifted since registration (Tier 3.45,
+    seventeenth review -- never resolve under costs this experiment
+    wasn't registered against). If already resolved, returns the
+    existing row completely untouched."""
     experiment = get_prospective_experiment_by_id(experiment_id)
     if experiment is None:
         raise ProspectiveExperimentError(f"no prospective experiment with id {experiment_id!r}")
@@ -535,6 +547,23 @@ def resolve_prospective_experiment(experiment_id: str) -> dict:
     if not status_check["stopping_rule_met"]:
         raise ProspectiveExperimentError(
             f"stopping rule not yet met for prospective experiment {experiment_id!r}: {status_check['checks']}"
+        )
+    if status_check["geometry_drift"] is not None:
+        # Tier 3.45 (seventeenth external review): resolving now would
+        # silently price this experiment's P&L under trading costs it
+        # was never registered against, with only a warning field to
+        # notice it -- the review's own "I don't accept a final result
+        # with cost drift" objection. Refuse outright instead of
+        # computing anything; a status check (GET .../status) already
+        # surfaces this same geometry_drift field before any caller
+        # would reach this point. Not auto-recoverable: whoever changed
+        # SLIPPAGE_POINTS/COMMISSION_PER_CONTRACT/BACKTEST_LOGIC_VERSION
+        # live would need to either revert it or accept this experiment
+        # can never be resolved as originally registered.
+        raise ProspectiveExperimentError(
+            f"cannot resolve prospective experiment {experiment_id!r}: trading cost/backtest geometry has "
+            f"drifted since registration -- resolving now would silently price this experiment's P&L under "
+            f"costs it was never registered against: {status_check['geometry_drift']}"
         )
 
     prospective = _prospective_candidates(experiment)

@@ -3016,9 +3016,17 @@ The one-time outcome recording — **the only place any arm's actual
 P&L/win-rate/profit-factor ever appears for this experiment.** 409 if
 the stopping rule isn't met yet (check `.../status` first — no forcing
 an early look, the exact discipline the review's "optional stopping"
-warning is about). If already resolved, returns the SAME resolution
-recorded the first time this succeeded — calling this again after more
-data accumulates never recomputes it.
+warning is about), **or** (Tier 3.45, seventeenth external review) if
+trading cost/backtest geometry (`SLIPPAGE_POINTS`/
+`COMMISSION_PER_CONTRACT`/`BACKTEST_LOGIC_VERSION`) has drifted since
+registration — `.../status`'s `geometry_drift` field already shows this
+ahead of time. Resolving under drifted costs would silently price the
+experiment's P&L against numbers it was never registered against, so
+this refuses outright rather than only warning; not a permanent
+lockout — if the live constant is reverted to what was locked,
+resolution proceeds normally. If already resolved, returns the SAME
+resolution recorded the first time this succeeded — calling this again
+after more data accumulates never recomputes it.
 
 ```json
 {

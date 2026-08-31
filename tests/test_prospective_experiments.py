@@ -357,6 +357,48 @@ def test_resolve_refuses_when_stopping_rule_not_met(fresh_env):
     assert reloaded["resolution"] is None
 
 
+def test_resolve_refuses_when_cost_drift_detected(fresh_env, monkeypatch):
+    """Tier 3.45 (seventeenth external review): even once the stopping
+    rule is fully met, resolve must still refuse if trading cost/
+    backtest geometry has drifted since registration -- resolving would
+    silently price the experiment's P&L under different costs than it
+    was registered against."""
+    storage, _, prospective = fresh_env
+    experiment = prospective.register_prospective_experiment(
+        symbol="TEST", timeframe="5m", hypothesis="h",
+        target_metrics=dict(_INCREMENTAL_PNL_METRICS), stopping_rule={"min_distinct_trading_days": 1},
+    )
+    _save_prospective_candidate(storage, "c1", "TEST", "5m", datetime(2026, 8, 11, 14, 0, tzinfo=timezone.utc))
+    monkeypatch.setattr(prospective, "SLIPPAGE_POINTS", prospective.SLIPPAGE_POINTS + 5.0)
+
+    with pytest.raises(prospective.ProspectiveExperimentError, match="geometry has drifted"):
+        prospective.resolve_prospective_experiment(experiment["experiment_id"])
+
+    reloaded = prospective.get_prospective_experiment_by_id(experiment["experiment_id"])
+    assert reloaded["status"] == "active"
+    assert reloaded["resolution"] is None
+
+
+def test_resolve_succeeds_once_drift_reverts(fresh_env, monkeypatch):
+    """Not a permanent lockout -- if the live constant is reverted back
+    to what was locked, resolution proceeds normally."""
+    storage, _, prospective = fresh_env
+    experiment = prospective.register_prospective_experiment(
+        symbol="TEST", timeframe="5m", hypothesis="h",
+        target_metrics=dict(_INCREMENTAL_PNL_METRICS), stopping_rule={"min_distinct_trading_days": 1},
+    )
+    _save_prospective_candidate(storage, "c1", "TEST", "5m", datetime(2026, 8, 11, 14, 0, tzinfo=timezone.utc))
+    original = prospective.COMMISSION_PER_CONTRACT
+    monkeypatch.setattr(prospective, "COMMISSION_PER_CONTRACT", original + 50.0)
+    with pytest.raises(prospective.ProspectiveExperimentError, match="geometry has drifted"):
+        prospective.resolve_prospective_experiment(experiment["experiment_id"])
+
+    monkeypatch.setattr(prospective, "COMMISSION_PER_CONTRACT", original)
+    resolved = prospective.resolve_prospective_experiment(experiment["experiment_id"])
+    assert resolved["status"] == "resolved"
+    assert resolved["resolution"]["geometry_drift"] is None
+
+
 def test_resolve_raises_for_unknown_id(fresh_env):
     _, _, prospective = fresh_env
     with pytest.raises(prospective.ProspectiveExperimentError, match="no prospective experiment"):

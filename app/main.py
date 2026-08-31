@@ -1429,6 +1429,22 @@ deliberately named differently from v1's fields so they can never be
 confused with or substituted into the live ones, and carry their own
 MACRO_V2_SCHEMA_VERSION="2", independent of macro_agent.PROMPT_VERSION.
 
+Tier 3.45 (seventeenth external review) closes one gap the review found
+in Tier 3.43's drift detection: POST /prospective-experiments/
+{id}/resolve now REFUSES (409) if trading cost/backtest geometry
+(SLIPPAGE_POINTS/COMMISSION_PER_CONTRACT/BACKTEST_LOGIC_VERSION) has
+drifted since registration, instead of only reporting a geometry_drift
+warning field as before. Resolving under drifted costs would have
+silently priced the experiment's P&L against numbers it was never
+registered against — the review's own "I don't accept a final result
+with cost drift" objection. Not a permanent lockout: if the live
+constant reverts to what was locked, resolution proceeds normally.
+GET .../status is unaffected (still read-only, still only ever surfaces
+geometry_drift as a field, never blocks anything). Scoped entirely to
+app/prospective_experiments.py — app.experiments and its two live
+registrations keep their existing report-only geometry_drift behavior,
+untouched.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -4087,9 +4103,12 @@ def resolve_prospective_experiment_endpoint(
     """The one-time outcome recording — the only place any arm's actual
     P&L/win-rate/profit-factor ever appears for this experiment. 409 if
     the stopping rule isn't met yet (check GET /prospective-experiments/
-    {id}/status first — no forcing an early look). If already resolved,
-    returns the SAME resolution recorded the first time this succeeded —
-    calling this again after more data accumulates never recomputes it.
+    {id}/status first — no forcing an early look), OR (Tier 3.45,
+    seventeenth external review) if trading cost/backtest geometry has
+    drifted since registration — status.geometry_drift will already show
+    this before you get here. If already resolved, returns the SAME
+    resolution recorded the first time this succeeded — calling this
+    again after more data accumulates never recomputes it.
     Secret-protected, same guard as registration.
 
     500 (not 409) if the prospective window has grown past
@@ -4102,7 +4121,7 @@ def resolve_prospective_experiment_endpoint(
         message = str(e)
         if message.startswith("no prospective experiment with id"):
             status_code = 404
-        elif "not yet met" in message:
+        elif "not yet met" in message or "geometry has drifted" in message:
             status_code = 409
         else:
             status_code = 500

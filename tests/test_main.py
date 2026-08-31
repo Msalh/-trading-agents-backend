@@ -2140,6 +2140,36 @@ def test_resolve_prospective_experiment_endpoint_409_when_stopping_rule_not_met(
     assert r.status_code == 409
 
 
+def test_resolve_prospective_experiment_endpoint_409_when_cost_drift_detected(client, monkeypatch):
+    """Tier 3.45 (seventeenth external review): stopping rule met is not
+    enough -- a drifted SLIPPAGE_POINTS/COMMISSION_PER_CONTRACT/
+    BACKTEST_LOGIC_VERSION must also 409, not silently resolve under
+    different costs than were registered."""
+    import app.prospective_experiments as prospective_experiments
+    import app.storage as storage
+
+    headers = {"X-Webhook-Secret": "test-secret"}
+    registered = client.post(
+        "/prospective-experiments",
+        params={
+            "symbol": "MNQ1!", "timeframe": "5m", "hypothesis": "h",
+            **_INCREMENTAL_TARGET_PARAMS, "min_distinct_trading_days": 1,
+        },
+        headers=headers,
+    ).json()
+    _save_prospective_endpoint_candidate(storage, "cand-drift-1", "2026-08-11T14:00:00Z")
+    monkeypatch.setattr(
+        prospective_experiments, "SLIPPAGE_POINTS", prospective_experiments.SLIPPAGE_POINTS + 5.0
+    )
+
+    r = client.post(f"/prospective-experiments/{registered['experiment_id']}/resolve", headers=headers)
+    assert r.status_code == 409
+    assert "geometry has drifted" in r.json()["detail"]
+
+    reloaded = client.get(f"/prospective-experiments/{registered['experiment_id']}").json()
+    assert reloaded["status"] == "active"
+
+
 def test_resolve_prospective_experiment_endpoint_404_for_unknown_id(client):
     headers = {"X-Webhook-Secret": "test-secret"}
     r = client.post("/prospective-experiments/does-not-exist/resolve", headers=headers)
