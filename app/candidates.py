@@ -52,6 +52,7 @@ from app.storage import (
     attach_execution_result,
     attach_risk_result,
     get_candidate_by_id,
+    get_candidates_page,
     get_latest,
     get_latest_candidate,
     get_recent_candidates,
@@ -191,3 +192,13 @@ def get_committed_trade(candidate_id: str) -> dict | None:
 
 def get_candidate_history(symbol: str, timeframe: str, limit: int = 20) -> list[dict]:
     return get_recent_candidates(symbol=symbol, timeframe=timeframe, limit=limit)
+
+
+def get_candidate_history_page(
+    symbol: str, timeframe: str, after_rowid: int = 0, limit: int = 200
+) -> dict:
+    """Tier 3.48: thin wrapper over storage.get_candidates_page(), same
+    role as get_candidate_history() above but for real cursor-based
+    pagination instead of a newest-N pull -- see that function's
+    docstring for why the two aren't interchangeable."""
+    return get_candidates_page(symbol=symbol, timeframe=timeframe, after_rowid=after_rowid, limit=limit)

@@ -804,6 +804,47 @@ def get_candidates_after_rowid(symbol: str, timeframe: str, min_rowid: int) -> l
         conn.close()
 
 
+def get_candidates_page(
+    symbol: str, timeframe: str, after_rowid: int = 0, limit: int = 200
+) -> dict:
+    """Tier 3.48 (eighteenth external review, item #3): real cursor-based
+    pagination, built on the same rowid primitive Tier 3.23 introduced for
+    the prospective-experiment watermark. get_recent_candidates() above
+    (DESC + LIMIT, "newest N") is the wrong tool for walking a whole
+    history in order -- if the true row count ever exceeds the cap, it
+    silently keeps the newest rows and drops the oldest ones, and calling
+    it again later returns an overlapping/shifted window as new rows
+    arrive, not "the next page." This instead returns every row with
+    rowid > after_rowid, ASC, capped at `limit`: paging forward by
+    feeding each response's next_cursor back in as the next call's
+    after_rowid visits every row exactly once, in order, with no gaps
+    and no duplicates -- newly-inserted rows always land after whatever
+    cursor position a caller has already reached, so concurrent writes
+    (the live scheduler saving new candidates) can never shift a page
+    boundary already returned. Start a fresh walk with after_rowid=0.
+
+    Fetches limit+1 rows to detect has_more without a second COUNT
+    query; the (limit+1)-th row, if present, is trimmed before
+    returning and never included in `items`."""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT rowid, * FROM trade_candidates
+            WHERE symbol = ? AND timeframe = ? AND rowid > ?
+            ORDER BY rowid ASC
+            LIMIT ?
+            """,
+            (symbol, timeframe, after_rowid, limit + 1),
+        ).fetchall()
+        has_more = len(rows) > limit
+        items = [{**_row_to_candidate(r), "rowid": r["rowid"]} for r in rows[:limit]]
+        next_cursor = items[-1]["rowid"] if has_more else None
+        return {"items": items, "count": len(items), "has_more": has_more, "next_cursor": next_cursor}
+    finally:
+        conn.close()
+
+
 def _attach_candidate_result(
     candidate_id: str, opinion: dict, current_column: str, history_column: str
 ) -> str:

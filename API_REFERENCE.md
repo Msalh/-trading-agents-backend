@@ -325,6 +325,28 @@ the user's own judgment (same status as the still-open
 Analysis-load-bearing design question) — not decided or silently
 changed here.
 
+### `GET /candidates/history?symbol=MNQ1!&timeframe=5m` — read-only, no secret needed
+Two modes in one endpoint, selected by whether `after_rowid` is passed:
+
+- **Default (no `after_rowid`)**: unchanged since before Tier 3.48 — newest-first,
+  `limit`-bounded (default 20, max 200), returned as a bare JSON list. Fine for "show me
+  the last N," wrong tool for walking a whole history (a DESC+LIMIT pull can silently drop
+  older rows once the true count exceeds `limit`, and re-querying later returns a shifted
+  window as new candidates arrive, not "the next page").
+- **`after_rowid` set (Tier 3.48, eighteenth external review item #3)**: real cursor-based
+  pagination, built on the same rowid primitive Tier 3.23 introduced for the prospective-
+  experiment watermark. `limit` is ignored; `page_size` (default 200, max 1000) governs page
+  size instead. Returns every candidate with `rowid > after_rowid`, oldest first, as
+  `{"items": [...], "count": N, "has_more": bool, "next_cursor": int|null}`. Start a fresh
+  walk with `after_rowid=0`; feed each response's `next_cursor` back in as the next call's
+  `after_rowid` to walk forward. Deterministic and gap/duplicate-free even under concurrent
+  writes — a candidate saved between two page fetches always lands after whatever cursor
+  position has already been paged past, never inside an already-returned page. Scoped to
+  this one endpoint plus a new `app.storage.get_candidates_page()` primitive; the ~19 other
+  `/candidates/history/*` diagnostic endpoints below are unchanged by this tier and keep
+  Tier 3.41's raised-limit-to-5000 stopgap (with `data_range` reporting the true total, so a
+  truncated pull is at least visible even though it can't yet be paged around).
+
 ### Outcomes (Tier 2.4 rebuild) — read-only, no secret needed
 Prefers a real closed paper trade's actual P&L over the original
 Sprint 14 hypothetical price-horizon estimate — the estimate is now

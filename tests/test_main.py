@@ -2367,3 +2367,100 @@ def test_macro_shadow_v2_endpoints_never_touch_live_agent_opinions_table(client,
 
     assert storage.get_latest_opinion(agent="macro", symbol="MNQ1!", timeframe="global") is None
     assert storage.get_latest_opinion(agent="macro_shadow_v2", symbol="MNQ1!", timeframe="global") is None
+
+
+# ---------------------------------------------------------------------------
+# Tier 3.48 (eighteenth external review, item #3): GET /candidates/history's
+# new opt-in after_rowid cursor pagination.
+# ---------------------------------------------------------------------------
+
+def _save_min_history_candidate(storage, candidate_id, symbol="MNQ1!", timeframe="5m"):
+    storage.save_candidate(
+        candidate_id=candidate_id, symbol=symbol, timeframe=timeframe,
+        bar=None, decision={"decision": "no_trade"},
+    )
+
+
+def test_candidates_history_without_after_rowid_is_unchanged_bare_list(client):
+    """Existing callers that never pass after_rowid must see byte-for-
+    byte the same response shape/behavior as before Tier 3.48."""
+    import app.storage as storage
+
+    _save_min_history_candidate(storage, "c1")
+    _save_min_history_candidate(storage, "c2")
+
+    r = client.get("/candidates/history", params={"symbol": "MNQ1!", "timeframe": "5m"})
+    assert r.status_code == 200
+    body = r.json()
+    assert isinstance(body, list)
+    assert [c["candidate_id"] for c in body] == ["c2", "c1"]  # newest-first, same as always
+
+
+def test_candidates_history_with_after_rowid_returns_paginated_envelope(client):
+    import app.storage as storage
+
+    _save_min_history_candidate(storage, "c1")
+    _save_min_history_candidate(storage, "c2")
+    _save_min_history_candidate(storage, "c3")
+
+    r = client.get(
+        "/candidates/history",
+        params={"symbol": "MNQ1!", "timeframe": "5m", "after_rowid": 0, "page_size": 2},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert [c["candidate_id"] for c in body["items"]] == ["c1", "c2"]
+    assert body["count"] == 2
+    assert body["has_more"] is True
+    assert body["next_cursor"] is not None
+
+    r2 = client.get(
+        "/candidates/history",
+        params={"symbol": "MNQ1!", "timeframe": "5m", "after_rowid": body["next_cursor"], "page_size": 2},
+    )
+    body2 = r2.json()
+    assert [c["candidate_id"] for c in body2["items"]] == ["c3"]
+    assert body2["has_more"] is False
+    assert body2["next_cursor"] is None
+
+
+def test_candidates_history_after_rowid_walk_visits_every_row_exactly_once(client):
+    import app.storage as storage
+
+    ids = [f"c{i}" for i in range(7)]
+    for cid in ids:
+        _save_min_history_candidate(storage, cid)
+
+    seen = []
+    cursor = 0
+    for _ in range(20):  # generous loop bound; must terminate well before this
+        r = client.get(
+            "/candidates/history",
+            params={"symbol": "MNQ1!", "timeframe": "5m", "after_rowid": cursor, "page_size": 3},
+        )
+        body = r.json()
+        seen.extend(c["candidate_id"] for c in body["items"])
+        if not body["has_more"]:
+            break
+        cursor = body["next_cursor"]
+    else:
+        pytest.fail("pagination never terminated (has_more stayed true)")
+
+    assert seen == ids  # every candidate exactly once, in insertion order
+
+
+def test_candidates_history_after_rowid_ignores_limit_param(client):
+    """`limit` governs the legacy newest-N path only; page_size governs
+    the cursor path. Passing both must not let `limit` silently cap the
+    paginated response smaller than page_size asked for."""
+    import app.storage as storage
+
+    for i in range(5):
+        _save_min_history_candidate(storage, f"c{i}")
+
+    r = client.get(
+        "/candidates/history",
+        params={"symbol": "MNQ1!", "timeframe": "5m", "after_rowid": 0, "limit": 1, "page_size": 5},
+    )
+    body = r.json()
+    assert len(body["items"]) == 5

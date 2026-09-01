@@ -1445,6 +1445,18 @@ app/prospective_experiments.py — app.experiments and its two live
 registrations keep their existing report-only geometry_drift behavior,
 untouched.
 
+Tier 3.48 (eighteenth external review, item #3) adds real rowid-based
+pagination to GET /candidates/history as an opt-in after_rowid cursor,
+replacing (for callers that opt in) the newest-N/limit pull that Tier
+3.41 could only make honest about, not fix. Walking forward via
+after_rowid/next_cursor visits every candidate exactly once, oldest
+first, with no gaps or duplicates even as new candidates are inserted
+between page fetches. Existing callers that never pass after_rowid are
+unaffected — same bare-list newest-N response as before. Scoped to this
+one endpoint plus a new app.storage.get_candidates_page() primitive;
+the other diagnostic endpoints under /candidates/history/* are
+untouched and keep Tier 3.41's raised-limit-to-5000 stopgap.
+
 This backend is intentionally standalone — no dependency on any
 other existing project.
 """
@@ -1500,6 +1512,7 @@ from app.candidates import (
     CandidateLockedError,
     create_candidate,
     get_candidate_history,
+    get_candidate_history_page,
     get_committed_trade,
     get_current_candidate,
     record_execution_result,
@@ -2336,8 +2349,35 @@ def candidates_latest(
 def candidates_history(
     symbol: str = Query(...),
     timeframe: str = Query(...),
-    limit: int = Query(default=20, le=200),
-) -> list[dict]:
+    limit: int = Query(default=20, le=200, description="Newest-N behavior, unchanged since before Tier 3.48 -- ignored when after_rowid is set."),
+    after_rowid: int | None = Query(
+        default=None,
+        ge=0,
+        description="Tier 3.48 -- opt-in real cursor pagination. When set, `limit` above is "
+        "ignored and every candidate with rowid > after_rowid is walked oldest-first, "
+        "page_size at a time, deterministic and gap/duplicate-free across repeated calls "
+        "even as new candidates are inserted concurrently. Pass 0 to start a fresh walk; "
+        "feed each response's next_cursor back in as the next call's after_rowid. Response "
+        "shape becomes {items, count, has_more, next_cursor} instead of a bare list.",
+    ),
+    page_size: int = Query(default=200, ge=1, le=1000, description="Tier 3.48 -- page size, only used when after_rowid is set."),
+) -> list[dict] | dict:
+    """Tier 3.48 (eighteenth external review, item #3): adds real
+    rowid-based pagination as an opt-in path on the one endpoint
+    literally named for this, alongside app.storage.get_candidates_page
+    (the same rowid primitive Tier 3.23 built for the prospective-
+    experiment watermark). Existing callers that never pass after_rowid
+    see byte-for-byte unchanged behavior -- the original newest-N/limit
+    bare-list response. Passing after_rowid switches to the new
+    deterministic forward walk and returns {items, count, has_more,
+    next_cursor}. The other ~19 /candidates/history/* diagnostic
+    endpoints (risk-filter-veto-attribution, veto-decision-transitions,
+    etc.) are UNCHANGED by this tier -- they keep Tier 3.41's raised-
+    limit-to-5000 stopgap plus data_range's true-total reporting;
+    threading this same primitive through each of them is left as
+    future, smaller-scoped work rather than one large rollout."""
+    if after_rowid is not None:
+        return get_candidate_history_page(symbol=symbol, timeframe=timeframe, after_rowid=after_rowid, limit=page_size)
     return get_candidate_history(symbol=symbol, timeframe=timeframe, limit=limit)
 
 

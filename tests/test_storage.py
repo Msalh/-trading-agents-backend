@@ -364,6 +364,80 @@ def test_count_candidates_after_rowid_matches_get_candidates_after_rowid_length(
     )
 
 
+def test_get_candidates_page_first_page_starts_at_zero(fresh_storage):
+    storage = fresh_storage
+    _save_min_candidate(storage, "c1")
+    _save_min_candidate(storage, "c2")
+    page = storage.get_candidates_page("TEST", "5m", after_rowid=0, limit=200)
+    assert [c["candidate_id"] for c in page["items"]] == ["c1", "c2"]
+    assert page["count"] == 2
+    assert page["has_more"] is False
+    assert page["next_cursor"] is None
+
+
+def test_get_candidates_page_paginates_forward_with_no_gap_or_duplicate(fresh_storage):
+    storage = fresh_storage
+    for i in range(5):
+        _save_min_candidate(storage, f"c{i}")
+
+    seen = []
+    cursor = 0
+    for _ in range(10):  # generous loop bound; must terminate well before this
+        page = storage.get_candidates_page("TEST", "5m", after_rowid=cursor, limit=2)
+        seen.extend(c["candidate_id"] for c in page["items"])
+        if not page["has_more"]:
+            assert page["next_cursor"] is None
+            break
+        cursor = page["next_cursor"]
+    else:
+        pytest.fail("pagination never terminated (has_more stayed true)")
+
+    assert seen == ["c0", "c1", "c2", "c3", "c4"]  # every row exactly once, in order
+
+
+def test_get_candidates_page_has_more_true_when_rows_remain(fresh_storage):
+    storage = fresh_storage
+    _save_min_candidate(storage, "c1")
+    _save_min_candidate(storage, "c2")
+    _save_min_candidate(storage, "c3")
+    page = storage.get_candidates_page("TEST", "5m", after_rowid=0, limit=2)
+    assert [c["candidate_id"] for c in page["items"]] == ["c1", "c2"]
+    assert page["has_more"] is True
+    watermark = storage.get_max_candidate_rowid("TEST", "5m")
+    # next_cursor must be the rowid of the last returned item (c2), not c3's
+    assert page["next_cursor"] == page["items"][-1]["rowid"] < watermark
+
+
+def test_get_candidates_page_a_concurrent_insert_after_a_page_is_fetched_does_not_shift_it(fresh_storage):
+    """The property real cursor pagination needs that DESC+LIMIT never
+    had: a page already returned to a caller must not change meaning
+    when new rows arrive later. Inserting c3 after paging through
+    c1/c2 must not appear in a page re-fetched with the same cursor."""
+    storage = fresh_storage
+    _save_min_candidate(storage, "c1")
+    _save_min_candidate(storage, "c2")
+    page = storage.get_candidates_page("TEST", "5m", after_rowid=0, limit=200)
+    assert [c["candidate_id"] for c in page["items"]] == ["c1", "c2"]
+    cursor_after_page_one = storage.get_max_candidate_rowid("TEST", "5m")
+
+    _save_min_candidate(storage, "c3")  # arrives after the page above was already read
+
+    # Re-fetching the SAME first page (after_rowid=0) is unaffected in its first two items --
+    # a real cursor walk continuing from cursor_after_page_one only ever sees c3, never a
+    # reshuffled view of c1/c2.
+    next_page = storage.get_candidates_page("TEST", "5m", after_rowid=cursor_after_page_one, limit=200)
+    assert [c["candidate_id"] for c in next_page["items"]] == ["c3"]
+    assert next_page["has_more"] is False
+
+
+def test_get_candidates_page_scoped_to_symbol_and_timeframe(fresh_storage):
+    storage = fresh_storage
+    _save_min_candidate(storage, "c1", symbol="TEST", timeframe="5m")
+    _save_min_candidate(storage, "c2", symbol="OTHER", timeframe="5m")
+    page = storage.get_candidates_page("TEST", "5m", after_rowid=0, limit=200)
+    assert [c["candidate_id"] for c in page["items"]] == ["c1"]
+
+
 def test_experiments_migration_backfills_registered_watermark_rowid(fresh_storage):
     """Simulates a Tier 3.20-era experiment row (no
     registered_watermark_rowid, the column's DEFAULT 0) alongside real
