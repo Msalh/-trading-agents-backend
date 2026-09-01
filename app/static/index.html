@@ -259,6 +259,14 @@
   .history-wrap { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
   .history-wrap .scroll { max-height: 340px; overflow-y: auto; }
 
+  /* ---- prospective experiments (Tier 3.46) ---- */
+  .card.pexp-card { min-height: unset; }
+  .pexp-id { cursor: help; }
+  .pexp-check { display: flex; flex-direction: column; gap: 3px; }
+  .pexp-check-row { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); font-family: var(--font-mono); }
+  .pexp-check-row b { color: var(--text); font-weight: 500; }
+  .pexp-meta { font-size: 10.5px; color: var(--muted); font-weight: 400; margin-left: 8px; }
+
   footer { margin-top: 26px; font-size: 10.5px; color: var(--muted); text-align: center; }
 
   @media (max-width: 820px) {
@@ -401,6 +409,13 @@
       </table>
     </div>
   </div>
+
+  <div class="section-title">
+    Prospective Experiments <span class="pexp-meta">progress only — no P&amp;L, no resolve action, no verdict</span>
+    <button class="secondary small" id="pexpRefreshBtn" style="float:right;">↻</button>
+    <span id="pexpLastObserved" class="pexp-meta" style="float:right; margin-right:8px;"></span>
+  </div>
+  <div class="grid" id="pexpGrid"><span class="empty">Loading…</span></div>
 
   <footer>
     Reads-only dashboard for the <code>-trading-agents-backend</code> API · agent "Run" actions call the LLM/web-search endpoints directly, costs apply.
@@ -1195,6 +1210,91 @@ async function refreshTradeHistory() {
   `).join('');
 }
 
+// ---- Prospective Experiments (Tier 3.46) ----
+// Strictly read-only, and deliberately NOT part of the main 30s
+// refreshAll() cycle — the eighteenth external review's spec for this
+// panel: manual refresh plus its own 60s auto-refresh while the page
+// is visible, calling ONLY the existing GET /prospective-experiments
+// (list) and GET /prospective-experiments/{id}/status endpoints. Never
+// renders a P&L/win-rate/profit-factor field, a resolve button, or any
+// pass/fail verdict — the checks/met booleans below are echoed
+// straight from what /status itself already computed, never
+// re-derived or re-interpreted client-side.
+const PEXP_CHECK_LABELS = {
+  min_distinct_trading_days: 'Distinct trading days',
+  min_baseline_portfolio_trades: 'Baseline portfolio trades',
+  min_overlap_joint_opinion_pairs: 'Overlap joint-opinion pairs',
+};
+
+function pexpGeometryDriftText(geometryDrift) {
+  if (!geometryDrift) return 'none';
+  return Object.entries(geometryDrift)
+    .map(([k, v]) => `${k}: locked ${v.locked} → live ${v.live}`)
+    .join('; ');
+}
+
+function pexpCardHtml(exp) {
+  const s = exp.stopping_rule_status || {};
+  const checks = s.checks || {};
+  const drift = s.config_drift || {};
+
+  const checkRows = Object.entries(checks).map(([key, c]) => {
+    const label = PEXP_CHECK_LABELS[key] || key;
+    const pct = c.required ? Math.max(0, Math.min(100, (c.actual / c.required) * 100)) : 0;
+    return `
+      <div class="pexp-check">
+        <div class="pexp-check-row"><span>${escapeHtml(label)}</span><b>${c.actual} / ${c.required}</b></div>
+        <div class="score-bar-track"><div class="score-bar-fill" style="left:0;width:${pct}%;background:${c.met ? 'var(--bull)' : 'var(--accent)'}"></div></div>
+      </div>`;
+  }).join('');
+
+  const unmet = Object.entries(checks).filter(([, c]) => !c.met).map(([key]) => PEXP_CHECK_LABELS[key] || key);
+  const unmetChips = unmet.length
+    ? unmet.map(u => `<span class="chip warn">unmet: ${escapeHtml(u)}</span>`).join('')
+    : `<span class="chip">all stopping conditions met</span>`;
+
+  return `
+    <div class="card pexp-card">
+      <div class="card-head">
+        <div class="card-title pexp-id" title="${escapeHtml(exp.experiment_id)}">🧪 ${escapeHtml(exp.experiment_id.slice(0, 8))}…</div>
+        <span class="badge ${exp.status === 'resolved' ? 'approve' : 'no_action'}">${escapeHtml(exp.status)}</span>
+      </div>
+      <div class="kv">
+        <div><span>candidates</span><b>${s.prospective_candidates_considered ?? '—'} (${s.clean_candidates_considered ?? '—'} clean)</b></div>
+        <div><span>config drift</span><b>${drift.drifted_excluded_count ?? 0} excluded, ${drift.unversioned_count ?? 0} unversioned</b></div>
+        <div><span>geometry drift</span><b>${escapeHtml(pexpGeometryDriftText(s.geometry_drift))}</b></div>
+      </div>
+      ${checkRows}
+      <div class="card-flags">${unmetChips}</div>
+    </div>`;
+}
+
+async function refreshProspectiveExperiments() {
+  const symbol = symbolEl.value, timeframe = timeframeEl.value;
+  const grid = $('pexpGrid');
+  const listRes = await api('GET', `/prospective-experiments?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}`);
+  if (!listRes.ok) {
+    grid.innerHTML = `<div class="err">${escapeHtml((listRes.data && listRes.data.detail) || ('error ' + listRes.status))}</div>`;
+    return;
+  }
+  const experiments = (listRes.data && listRes.data.prospective_experiments) || [];
+  if (!experiments.length) {
+    grid.innerHTML = `<span class="empty">No prospective experiments registered for this symbol/timeframe.</span>`;
+    $('pexpLastObserved').textContent = 'last observed ' + new Date().toLocaleTimeString();
+    return;
+  }
+  const statusResults = await Promise.all(
+    experiments.map(e => api('GET', `/prospective-experiments/${encodeURIComponent(e.experiment_id)}/status`))
+  );
+  grid.innerHTML = statusResults.map((res, i) => {
+    if (!res.ok) {
+      return `<div class="card pexp-card"><div class="err">${escapeHtml(experiments[i].experiment_id)}: ${escapeHtml((res.data && res.data.detail) || ('error ' + res.status))}</div></div>`;
+    }
+    return pexpCardHtml(res.data);
+  }).join('');
+  $('pexpLastObserved').textContent = 'last observed ' + new Date().toLocaleTimeString();
+}
+
 async function refreshAll() {
   // Agent cards first: renderSessionClock reads lastTimingData, which the
   // Timing card's fetch sets as a side effect. The four charts are fully
@@ -1263,7 +1363,10 @@ $('decisionPanel').addEventListener('click', (e) => {
   if (btn) toggleReadMore(btn.dataset.key);
 });
 
-[symbolEl, timeframeEl, apiBaseEl].forEach(el => el.addEventListener('change', refreshAll));
+[symbolEl, timeframeEl, apiBaseEl].forEach(el => el.addEventListener('change', () => {
+  refreshAll();
+  refreshProspectiveExperiments();
+}));
 
 let autoTimer = null;
 function setupAutoRefresh() {
@@ -1274,11 +1377,27 @@ function setupAutoRefresh() {
 }
 $('autoRefresh').addEventListener('change', setupAutoRefresh);
 
+// Prospective Experiments panel: manual refresh button + its own 60s
+// timer, gated on the tab actually being visible (per the eighteenth
+// review's spec) — deliberately separate from refreshAll()'s 30s
+// cycle above, since this panel is a slow-moving progress check, not
+// something that needs the same cadence as live agent opinions.
+$('pexpRefreshBtn').addEventListener('click', refreshProspectiveExperiments);
+let pexpTimer = null;
+function setupPexpAutoRefresh() {
+  if (pexpTimer) clearInterval(pexpTimer);
+  pexpTimer = setInterval(() => {
+    if (document.visibilityState === 'visible') refreshProspectiveExperiments();
+  }, 60000);
+}
+
 // ---- boot ----
 initCharts();
 initGrid();
 refreshAll();
+refreshProspectiveExperiments();
 setupAutoRefresh();
+setupPexpAutoRefresh();
 </script>
 </body>
 </html>
