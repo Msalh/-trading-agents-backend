@@ -56,6 +56,11 @@
     letter-spacing: .01em;
   }
   header h1 span { color: var(--muted); font-weight: 400; font-family: var(--font-mono); font-size: 12px; }
+  /* display:contents keeps the wrapped .field children laid out by
+     header's own flexbox exactly as if unwrapped — this div exists
+     purely so JS can hide the whole group in one line when the page
+     is configured via URL query params instead of by hand. */
+  .field-controls { display: contents; }
   .field { display: flex; flex-direction: column; gap: 1px; }
   .field label { font-size: 9px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
   .field input {
@@ -280,21 +285,23 @@
 
   <header>
     <h1>Trading Agents <span id="symTfLabel"></span></h1>
-    <div class="field">
-      <label>API</label>
-      <input id="apiBase" class="wide" value="https://web-production-c67aa.up.railway.app" spellcheck="false">
-    </div>
-    <div class="field">
-      <label>Secret</label>
-      <input id="webhookSecret" type="password" spellcheck="false" autocomplete="off">
-    </div>
-    <div class="field">
-      <label>Symbol</label>
-      <input id="symbol" value="MNQ1!" spellcheck="false">
-    </div>
-    <div class="field">
-      <label>TF</label>
-      <input id="timeframe" value="5m" spellcheck="false">
+    <div class="field-controls" id="fieldControls">
+      <div class="field">
+        <label>API</label>
+        <input id="apiBase" class="wide" value="https://web-production-c67aa.up.railway.app" spellcheck="false">
+      </div>
+      <div class="field">
+        <label>Secret</label>
+        <input id="webhookSecret" type="password" spellcheck="false" autocomplete="off">
+      </div>
+      <div class="field">
+        <label>Symbol</label>
+        <input id="symbol" value="MNQ1!" spellcheck="false">
+      </div>
+      <div class="field">
+        <label>TF</label>
+        <input id="timeframe" value="5m" spellcheck="false">
+      </div>
     </div>
     <button class="secondary small" id="refreshBtn">↻</button>
     <label class="toggle"><input type="checkbox" id="autoRefresh" checked>Auto 30s</label>
@@ -432,6 +439,31 @@ function apiBase() { return apiBaseEl.value.replace(/\/+$/, ''); }
 // X-Webhook-Secret header the backend's protected endpoints require.
 secretEl.value = localStorage.getItem('webhookSecret') || '';
 secretEl.addEventListener('change', () => localStorage.setItem('webhookSecret', secretEl.value));
+
+// Optional URL-driven config: open the dashboard as e.g.
+// /dashboard/?api=...&secret=...&symbol=MNQ1!&tf=5m and skip typing
+// any of these in by hand. Present, each query param simply overwrites
+// the matching field's value (secret also gets persisted to
+// localStorage, same as typing it in would) — omitted params keep
+// their existing default/localStorage value untouched. If ANY of the
+// four params is present, the whole API/Secret/Symbol/TF row is
+// hidden entirely (nothing left to configure by hand once a link
+// already carries it); visiting the plain URL with no query string
+// leaves the row visible exactly as before, unaffected.
+(function applyUrlConfig() {
+  const params = new URLSearchParams(window.location.search);
+  const api = params.get('api'), secret = params.get('secret'),
+        symbol = params.get('symbol'), tf = params.get('tf');
+  if (api === null && secret === null && symbol === null && tf === null) return;
+  if (api !== null) apiBaseEl.value = api;
+  if (symbol !== null) symbolEl.value = symbol;
+  if (tf !== null) timeframeEl.value = tf;
+  if (secret !== null) {
+    secretEl.value = secret;
+    localStorage.setItem('webhookSecret', secret);
+  }
+  $('fieldControls').style.display = 'none';
+})();
 
 async function api(method, path) {
   const url = apiBase() + path;
