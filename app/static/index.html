@@ -303,6 +303,7 @@
         <input id="timeframe" value="5m" spellcheck="false">
       </div>
     </div>
+    <button class="secondary small" id="configToggleBtn" title="Show/edit API config" style="display:none">⚙</button>
     <button class="secondary small" id="refreshBtn">↻</button>
     <label class="toggle"><input type="checkbox" id="autoRefresh" checked>Auto 30s</label>
     <span id="lastUpdated">—</span>
@@ -450,11 +451,11 @@ secretEl.addEventListener('change', () => localStorage.setItem('webhookSecret', 
 // hidden entirely (nothing left to configure by hand once a link
 // already carries it); visiting the plain URL with no query string
 // leaves the row visible exactly as before, unaffected.
-(function applyUrlConfig() {
+const urlConfigApplied = (function applyUrlConfig() {
   const params = new URLSearchParams(window.location.search);
   const api = params.get('api'), secret = params.get('secret'),
         symbol = params.get('symbol'), tf = params.get('tf');
-  if (api === null && secret === null && symbol === null && tf === null) return;
+  if (api === null && secret === null && symbol === null && tf === null) return false;
   if (api !== null) apiBaseEl.value = api;
   if (symbol !== null) symbolEl.value = symbol;
   if (tf !== null) timeframeEl.value = tf;
@@ -463,7 +464,24 @@ secretEl.addEventListener('change', () => localStorage.setItem('webhookSecret', 
     localStorage.setItem('webhookSecret', secret);
   }
   $('fieldControls').style.display = 'none';
+  return true;
 })();
+
+// Once a secret has been typed in once in this browser (persisted to
+// localStorage above, never sent anywhere but this API), a plain
+// revisit has nothing left to configure by hand — auto-collapse the
+// row instead of showing four filled-in fields every time, with a
+// small toggle to bring it back for editing. Never auto-fills the
+// secret itself from anywhere but what was typed in previously —
+// the server never hands this out, unlike the URL-param path above.
+if (!urlConfigApplied && secretEl.value) {
+  $('fieldControls').style.display = 'none';
+  $('configToggleBtn').style.display = '';
+}
+$('configToggleBtn').addEventListener('click', () => {
+  const hidden = $('fieldControls').style.display === 'none';
+  $('fieldControls').style.display = hidden ? '' : 'none';
+});
 
 async function api(method, path) {
   const url = apiBase() + path;
